@@ -7,6 +7,12 @@ description: "Use when writing, placing or running tests in SolidCraft: a regres
 
 The long form is `docs/book/src/dev/testing.md`.
 
+## Every feature has tests
+- A new command, operation or option lands with its tests in the same commit; without them it is not finished.
+- Test the result: compare with a value worked out independently (closed form, hand calculation, a fixture such as `tests/cam/features.json`), never the code's own output pasted back.
+- Cover the normal case, the edges (zero, limits) and hostile input (an error, never a panic).
+- A change of behaviour updates its tests in the same commit.
+
 ## Placement
 - A regression test goes into the existing test file for its area (booleans, blends, shell, sweep, STEP, naming, ...), never a new file named after the bug (#3226).
 - Engine tests sit next to the code or in `*_tests.rs` files; they measure the result (volume, area, face/edge/vertex counts) against a value you can derive.
