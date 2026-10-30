@@ -111,3 +111,116 @@ mod region_tests {
         assert!(Area::from_rings(&[vec![[0.0, 0.0], [1.0, 1.0]]]).unwrap().is_empty(), "two points enclose nothing");
     }
 }
+
+mod part_tests {
+    use std::f64::consts::PI;
+
+    use solidcraft_geom::Vec3;
+    use solidcraft_kernel::{Body, BoolOp, boolean, box_solid, cylinder};
+
+    use crate::part::read_part;
+
+    fn v(x: f64, y: f64, z: f64) -> Vec3 {
+        Vec3::new(x, y, z)
+    }
+
+    fn cut(a: Body, b: Body) -> Body {
+        boolean(&a, &b, BoolOp::Cut).unwrap().unwrap()
+    }
+
+    /// A 40 × 30 × 10 plate: a Ø6 through hole at (10, 10); a counterbore (Ø10 × 4 deep over a
+    /// Ø5 through hole) at (−10, 5); a 10 × 8 pocket 3 deep centred on (0, −8).
+    fn plate() -> Body {
+        let mut b = box_solid(v(-20.0, -15.0, 0.0), v(20.0, 15.0, 10.0)).unwrap();
+        b = cut(b, cylinder(v(10.0, 10.0, -1.0), v(0.0, 0.0, 1.0), 3.0, 12.0).unwrap());
+        b = cut(b, cylinder(v(-10.0, 5.0, 6.0), v(0.0, 0.0, 1.0), 5.0, 5.0).unwrap());
+        b = cut(b, cylinder(v(-10.0, 5.0, -1.0), v(0.0, 0.0, 1.0), 2.5, 12.0).unwrap());
+        cut(b, box_solid(v(-5.0, -12.0, 7.0), v(5.0, -4.0, 11.0)).unwrap())
+    }
+
+    fn close(a: f64, b: f64, tol: f64) -> bool {
+        (a - b).abs() <= tol
+    }
+
+    /// Most a circle of radius `r` drawn as chords within AREA_TOL loses in area: 2/3 · tol · 2πr.
+    fn chord_loss(r: f64) -> f64 {
+        2.0 / 3.0 * crate::part::AREA_TOL * 2.0 * PI * r
+    }
+
+    #[test]
+    fn plate_heights_outline_and_silhouette() {
+        let p = read_part(&plate()).unwrap();
+        assert!(close(p.top_z, 10.0, 1e-6) && close(p.bottom_z, 0.0, 1e-6));
+        assert!(close(p.outline_area, 1200.0, 1e-3), "outline {}", p.outline_area);
+        // Seen from above, only the two through holes are open.
+        let open = PI * 9.0 + PI * 6.25;
+        assert!(close(p.silhouette_area, 1200.0 - open, 0.05), "silhouette {} vs {}", p.silhouette_area, 1200.0 - open);
+        let b = p.bounds;
+        assert!(close(b[0][0], -20.0, 1e-9) && close(b[0][1], -15.0, 1e-9) && close(b[1][0], 20.0, 1e-9) && close(b[1][1], 15.0, 1e-9), "{b:?}");
+        assert!(p.unsupported.is_empty(), "{:?}", p.unsupported);
+        assert!(p.chamfers.is_empty() && p.cutouts.is_empty());
+    }
+
+    #[test]
+    fn plate_holes() {
+        let p = read_part(&plate()).unwrap();
+        assert_eq!(p.holes.len(), 2, "{:#?}", p.holes);
+        let cb = p.holes.iter().find(|h| close(h.center[0], -10.0, 1e-6) && close(h.center[1], 5.0, 1e-6)).unwrap();
+        assert_eq!(cb.kind, "counterbore");
+        assert!(cb.through && close(cb.diameter, 5.0, 1e-6));
+        assert_eq!(cb.steps.len(), 2);
+        assert!(close(cb.steps[0].r_top, 5.0, 1e-6) && close(cb.steps[0].z_bottom, 6.0, 1e-6) && close(cb.steps[0].z_top, 10.0, 1e-6));
+        assert!(close(cb.steps[1].r_top, 2.5, 1e-6) && close(cb.steps[1].z_top, 6.0, 1e-6) && close(cb.steps[1].z_bottom, 0.0, 1e-6));
+        let h = p.holes.iter().find(|h| close(h.center[0], 10.0, 1e-6)).unwrap();
+        assert_eq!(h.kind, "hole");
+        assert!(h.through && close(h.diameter, 6.0, 1e-6) && close(h.z_top, 10.0, 1e-6));
+    }
+
+    #[test]
+    fn plate_floors() {
+        let p = read_part(&plate()).unwrap();
+        let mut z: Vec<f64> = p.floors.iter().map(|f| (f.z * 1e6).round() / 1e6).collect();
+        z.sort_by(f64::total_cmp);
+        assert_eq!(z, vec![6.0, 7.0, 10.0]);
+        let top = p.floors.iter().find(|f| f.top).unwrap();
+        // The holes in the top face are drawn as chords inside their circles (AREA_TOL), which
+        // understates their area by at most 2/3 · tol · circumference: 2/3 · 0.002 · 2π(3 + 5).
+        let top_area = 1200.0 - PI * 9.0 - PI * 25.0 - 80.0;
+        let chord = 2.0 / 3.0 * crate::part::AREA_TOL * 2.0 * PI * 8.0;
+        assert!(top.area >= top_area - 1e-6 && top.area <= top_area + chord + 1e-6, "top {} vs {top_area}", top.area);
+        let seat = p.floors.iter().find(|f| close(f.z, 6.0, 1e-6)).unwrap();
+        assert!(seat.in_hole && close(seat.area, PI * (25.0 - 6.25), chord_loss(5.0) + 1e-6), "seat {}", seat.area);
+        let pocket = p.floors.iter().find(|f| close(f.z, 7.0, 1e-6)).unwrap();
+        assert!(!pocket.in_hole && close(pocket.area, 80.0, 1e-3));
+        let b = pocket.bounds;
+        assert!(close(b[0][0], -5.0, 1e-9) && close(b[0][1], -12.0, 1e-9) && close(b[1][0], 5.0, 1e-9) && close(b[1][1], -4.0, 1e-9), "{b:?}");
+    }
+
+    /// A rectangular through cutout is a cutout, not a hole; a blind round recess is a hole stack
+    /// that does not go through.
+    #[test]
+    fn cutouts_and_blind_holes() {
+        let mut b = box_solid(v(0.0, 0.0, 0.0), v(50.0, 40.0, 5.0)).unwrap();
+        b = cut(b, box_solid(v(10.0, 10.0, -1.0), v(30.0, 20.0, 6.0)).unwrap());
+        b = cut(b, cylinder(v(40.0, 30.0, 2.0), v(0.0, 0.0, 1.0), 4.0, 4.0).unwrap());
+        let p = read_part(&b).unwrap();
+        assert_eq!(p.cutouts.len(), 1);
+        assert!(close(p.cutouts[0].area, 200.0, 1e-3));
+        let b = p.cutouts[0].bounds;
+        assert!(close(b[0][0], 10.0, 1e-9) && close(b[0][1], 10.0, 1e-9) && close(b[1][0], 30.0, 1e-9) && close(b[1][1], 20.0, 1e-9), "{b:?}");
+        assert_eq!(p.holes.len(), 1);
+        let h = &p.holes[0];
+        assert!(!h.through && close(h.z_bottom, 2.0, 1e-6) && close(h.diameter, 8.0, 1e-6));
+        assert!(p.floors.iter().any(|f| close(f.z, 2.0, 1e-6) && f.in_hole && close(f.area, PI * 16.0, chord_loss(4.0) + 1e-6)));
+    }
+
+    /// A ball (or any face a 3-axis job from the top cannot finish with flat tools) is reported,
+    /// not skipped silently.
+    #[test]
+    fn unsupported_faces_are_reported() {
+        let b = solidcraft_kernel::sphere(v(0.0, 0.0, 0.0), 5.0).unwrap();
+        let p = read_part(&b).unwrap();
+        assert!(!p.unsupported.is_empty());
+        assert!(p.unsupported.iter().all(|n| !n.reason.is_empty()));
+    }
+}

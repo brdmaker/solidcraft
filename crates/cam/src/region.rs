@@ -68,6 +68,24 @@ impl Area {
         Ok(Area { shapes })
     }
 
+    /// The union of many polygons, each taken as filled whatever its direction (overlaps count
+    /// once): the shadow of a set of triangles, say.
+    pub fn union_of(polygons: &[Ring]) -> Result<Area> {
+        let rings: Vec<Ring> = polygons
+            .iter()
+            .filter(|r| r.len() >= 3 && signed_area(r).abs() > GRID * GRID)
+            .map(|r| if signed_area(r) < 0.0 { r.iter().rev().copied().collect() } else { r.clone() })
+            .collect();
+        if rings.is_empty() {
+            return Ok(Area::empty());
+        }
+        check_rings(&rings)?;
+        let shapes = rings
+            .overlay_with_fixed_scale_as::<i64>(&Vec::<Ring>::new(), OverlayRule::Subject, FillRule::NonZero, 1.0 / GRID)
+            .map_err(|e| CamError::Geometry(format!("union of polygons: {e:?}")))?;
+        Ok(Area { shapes })
+    }
+
     /// A sketch or face region, its curves drawn within chord tolerance `tol`.
     pub fn from_region(region: &Region2, tol: f64) -> Result<Area> {
         let mut rings = vec![ring_of(&region.outer.polyline(tol).into_vec())];
