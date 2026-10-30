@@ -86,6 +86,10 @@ commands:
   web-offline-test [--site DIR]
                   check in headless Chrome that the web app works offline and updates to a new
                   build (a stand-in app, or the web build in DIR such as dist/web)
+  cam [--engine]  the quick gate for CAM-only work (skills/solidcraft-cam/SKILL.md): fmt, assets,
+                  licences, lists, skills and layers, then clippy, the tests and the wasm check of
+                  crates/cam; --engine adds the engine's CAM commands (clippy, their tests and the
+                  command schema checks)
   ci              fmt --check, assets, icons, licences --check, lists, skills, layers, ui-containers, clippy -D warnings, then the tests
                   with the wasm check alongside, then web-offline-test when Chrome is installed
                   (stops at the first failing step)
@@ -118,6 +122,7 @@ fn main() -> ExitCode {
             test::run(cargo_args, test_args, vec![test::doc_tests(cargo_args, test_args)])
         }
         Some("ci") => cmd_ci(),
+        Some("cam") => cmd_cam(rest.contains(&"--engine")),
         Some("wasm") => cmd_wasm(),
         Some("web-offline") => web_offline::run(&root(), rest.first().copied()),
         Some("web-offline-test") => {
@@ -387,6 +392,50 @@ fn wasm_check() -> Result<(Command, usize), String> {
         c.args(["-p", p]);
     }
     Ok((c, set.len()))
+}
+
+/// The gate for work inside the CAM crate (and, with `engine`, the engine's CAM commands): the
+/// repository checks that are quick, then only the CAM crates' clippy, tests and wasm check.
+fn cmd_cam(engine: bool) -> Result<(), String> {
+    let mut packages = vec!["solidcraft-cam"];
+    if engine {
+        packages.push("solidcraft-engine");
+    }
+    let with_packages = |c: &mut Command| {
+        for p in &packages {
+            c.args(["-p", p]);
+        }
+    };
+    let mut c = cargo();
+    c.arg("fmt");
+    with_packages(&mut c);
+    c.args(["--", "--check"]);
+    run(c, "cargo fmt --check (CAM)")?;
+    assets::run(&root())?;
+    licences::run(&root(), true)?;
+    lists::run(&root(), false)?;
+    skills::run(&root())?;
+    cmd_layers()?;
+    let mut c = cargo();
+    c.arg("clippy");
+    with_packages(&mut c);
+    c.args(["--all-targets", "--profile", "ci", "--", "-D", "warnings"]);
+    run(c, "cargo clippy -D warnings (CAM)")?;
+    let mut c = cargo();
+    c.args(["test", "--profile", "ci", "-p", "solidcraft-cam"]);
+    run(c, "cargo test -p solidcraft-cam")?;
+    if engine {
+        for filter in ["cmd::cam::", "schema::"] {
+            let mut c = cargo();
+            c.args(["test", "--profile", "ci", "-p", "solidcraft-engine", "--lib", "--", filter]);
+            run(c, &format!("cargo test -p solidcraft-engine -- {filter}"))?;
+        }
+    }
+    let mut c = cargo();
+    c.args(["check", "--target", "wasm32-unknown-unknown", "--profile", "ci", "-p", "solidcraft-cam"]);
+    run(c, "cargo check --target wasm32-unknown-unknown -p solidcraft-cam")?;
+    eprintln!("cam: all CAM gates passed (the full suite runs in CI: cargo xtask ci)");
+    Ok(())
 }
 
 /// The quick gates first, so they fail fast; the wasm check (and doc tests) run while the test

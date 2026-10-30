@@ -24,7 +24,7 @@ Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelle
 - A regression test goes in the area's existing test file, never a per-bug file (#3226).
 - Look at open PRs first, claim with a draft PR (lowest number wins), one topic per PR, never force-push `main`, no pushes just to catch up with `main`: `skills/solidcraft-contributing/SKILL.md`.
 - Show observable changes with real screenshots or a recording, captured yourself.
-- Run `cargo xtask ci` before every commit, without switching branches while it runs. `cargo xtask skills` keeps this file and `skills/` honest.
+- Run `cargo xtask ci` before every commit (CAM-only commits: `cargo xtask cam`, see the CAM skill), without switching branches while it runs. `cargo xtask skills` keeps this file and `skills/` honest.
 
 ## Working on X: read the skill first
 | Working on | Read |
@@ -46,3 +46,4 @@ Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelle
 | A bug report, a crash, a wrong result | `skills/solidcraft-reporting/SKILL.md` |
 | Checking, porting, designs in git | `skills/solidcraft-checking/SKILL.md` |
 | Assemblies, joints, motion | `skills/solidcraft-mechanisms/SKILL.md` |
+| CAM: router toolpaths, G-code, `crates/cam` | `skills/solidcraft-cam/SKILL.md` |

@@ -24,4 +24,6 @@ pub enum CamError {
 pub type Result<T> = std::result::Result<T, CamError>;
 
 #[cfg(test)]
+mod fixture_tests;
+#[cfg(test)]
 mod tests;
