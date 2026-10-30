@@ -13,11 +13,14 @@ authors = ["SolidCraft contributors"]
 repository = "https://github.com/bherbruck/solidcraft"
 
 [workspace.dependencies]
+# 2D polygon booleans and offsets for CAM toolpaths (MIT)
+i_overlay = "9.1"
 robust = "1.2"
 # internal
 solidcraft-geom = { path = "crates/geom" }
 solidcraft-sketch = { path = "crates/sketch" }
 solidcraft-kernel = { path = "crates/kernel" }
+solidcraft-cam = { path = "crates/cam" }
 solidcraft-render = { path = "crates/render" }
 solidcraft-gpu = { path = "crates/gpu" }
 solidcraft-doc = { path = "crates/doc" }

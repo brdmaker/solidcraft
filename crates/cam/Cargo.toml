@@ -1,0 +1,17 @@
+[package]
+name = "solidcraft-cam"
+description = "SolidCraft CAM: machining features from exact solids, 2.5D/3-axis router toolpaths, LinuxCNC G-code and a height-map cutting simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+solidcraft-geom = { workspace = true }
+solidcraft-kernel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+i_overlay = { workspace = true }

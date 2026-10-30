@@ -46,6 +46,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("kernel", Class::Layer(1)),
     ("render", Class::Layer(1)),
     ("doc", Class::Layer(2)),
+    // router CAM: features from exact solids, toolpaths, G-code, cutting simulation
+    ("cam", Class::Layer(2)),
     ("io", Class::Layer(3)),
     ("engine", Class::Layer(4)),
     ("ui-egui", Class::Layer(5)),
