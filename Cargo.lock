@@ -4295,6 +4295,7 @@ name = "solidcraft-cam"
 version = "0.27.1"
 dependencies = [
  "i_overlay",
+ "schemars",
  "serde",
  "serde_json",
  "solidcraft-geom",
@@ -4350,6 +4351,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "solidcraft-cam",
  "solidcraft-doc",
  "solidcraft-geom",
  "solidcraft-io",

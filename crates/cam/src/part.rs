@@ -6,6 +6,7 @@
 //! are chamfers. The tessellation is used only for topology (which edges bound a face) and to
 //! sample each face's extent and side; no toolpath geometry comes from triangles.
 
+use schemars::JsonSchema;
 use serde::Serialize;
 use solidcraft_geom::{Mesh, Plane, Vec2, Vec3};
 use solidcraft_kernel::{Body, FaceSurface, face_surface};
@@ -23,7 +24,7 @@ const ANGLE_TOL: f64 = 1e-4;
 pub const MAX_FACES: usize = 20_000;
 
 /// One step of a hole stack, from its top down.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 pub struct HoleStep {
     /// `cylinder` or `cone`.
     pub kind: &'static str,
@@ -34,7 +35,7 @@ pub struct HoleStep {
 }
 
 /// Concave round faces on one vertical axis, top down.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 pub struct HoleStack {
     pub center: [f64; 2],
     /// `hole`, `counterbore`, `countersink`, `stepped` (more than one step of another shape).
@@ -48,7 +49,7 @@ pub struct HoleStack {
 }
 
 /// An upward flat face.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Floor {
     pub face: usize,
     pub z: f64,
@@ -63,7 +64,7 @@ pub struct Floor {
 }
 
 /// A sloped band along an edge, cut with a chamfer mill.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Chamfer {
     pub z_top: f64,
     pub z_bottom: f64,
@@ -79,7 +80,7 @@ pub struct Chamfer {
 }
 
 /// A through opening that isn't a round hole: a cutout, cut round its outline.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Cutout {
     pub area: f64,
     pub bounds: [[f64; 2]; 2],
@@ -88,7 +89,7 @@ pub struct Cutout {
 }
 
 /// A face the job cannot machine (undercut, horizontal hole) or this version cannot yet.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct FaceNote {
     pub face: usize,
     pub surface: &'static str,
@@ -96,7 +97,7 @@ pub struct FaceNote {
 }
 
 /// Everything read from one part.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct PartFeatures {
     pub top_z: f64,
     pub bottom_z: f64,
@@ -149,6 +150,12 @@ fn samples(mesh: &Mesh, faces: usize) -> Vec<Sample> {
     s
 }
 
+/// Does any part of the face look down (its normal below horizontal)? From the top, a router
+/// cannot reach it.
+fn faces_down(s: &Sample) -> bool {
+    s.tris.iter().any(|(_, n, _)| n.len() > 0.0 && n.z / n.len() < -ANGLE_TOL)
+}
+
 /// Is the round face concave (material outside the circle, as in a hole)? Most of its area's
 /// normals point at the axis.
 fn concave(s: &Sample, c: [f64; 2]) -> bool {
@@ -197,7 +204,8 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
     }
     let size = body.size();
     let tol = (size * 1e-6).max(1e-6);
-    let mesh = body.tessellate((size * 2e-4).clamp(0.002, 0.05))?;
+    let mesh_tol = (size * 2e-5).clamp(0.001, 0.01);
+    let mesh = body.tessellate(mesh_tol)?;
     let samples = samples(&mesh, nf);
     let top_z = samples.iter().map(|s| s.zmax).fold(f64::NEG_INFINITY, f64::max);
     let bottom_z = samples.iter().map(|s| s.zmin).fold(f64::INFINITY, f64::min);
@@ -208,6 +216,7 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
     let mut floors = Vec::new();
     let mut rounds: Vec<Round> = Vec::new();
     let mut sloped: Vec<(usize, f64)> = Vec::new(); // face, angle from horizontal (rad)
+    let mut bottoms: Vec<Area> = Vec::new();
     let mut unsupported = Vec::new();
     let note = |face: usize, surface: &'static str, reason: &str| FaceNote { face, surface, reason: reason.into() };
 
@@ -227,6 +236,9 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
                 } else if n.z < -1.0 + ANGLE_TOL {
                     if (s.zmax - bottom_z).abs() > tol {
                         unsupported.push(note(face, "plane", "faces down above the bottom: an undercut a router cannot reach from the top"));
+                    } else {
+                        // the exact footprint: the outline of the part seen from above
+                        bottoms.push(floor(body, &mesh, face, s, top_z, tol)?.region);
                     }
                 } else if n.z.abs() <= ANGLE_TOL {
                     // a vertical wall: bounds the floors beside it
@@ -257,8 +269,8 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
                 let c = [apex.x, apex.y];
                 let r = |z: f64| (z - apex.z).abs() * half_angle.tan();
                 let (rt, rb) = (r(s.zmax), r(s.zmin));
-                if rt < rb {
-                    unsupported.push(note(face, "cone", "narrows upward: an undercut"));
+                if faces_down(s) {
+                    unsupported.push(note(face, "cone", "faces partly downward: an undercut a router cannot reach from the top"));
                 } else if concave(s, c) {
                     rounds.push((face, "cone", c, s.zmax, s.zmin, rt, rb, false));
                 } else {
@@ -312,26 +324,30 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
         f.in_hole = !f.top && holes.iter().any(|h| floor_in_hole(f, h, tol));
     }
 
-    // The part seen from above: its floors and the shadows of its sloped faces and cones.
+    // The part seen from above. Without undercuts every column of material stands on the bottom
+    // face, so the bottom faces' exact outlines are the part's footprint (floors added for parts
+    // that don't sit flat). The mesh shadows of sloped faces and cones only draw the chamfer
+    // bands, or widen the footprint where an undercut overhangs it.
     let mut silhouette = Area::empty();
+    for b in &bottoms {
+        silhouette = silhouette.union(b)?;
+    }
     for f in &floors {
         silhouette = silhouette.union(&f.region)?;
     }
+    let overhangs = !unsupported.is_empty();
     let mut chamfer_faces = Vec::new();
     for (face, angle) in &sloped {
         if let Some(s) = samples.get(*face) {
             let sh = shadow(s)?;
-            silhouette = silhouette.union(&sh)?;
+            if overhangs {
+                silhouette = silhouette.union(&sh)?;
+            }
             chamfer_faces.push((*face, *angle, s.zmax, s.zmin, sh));
         }
     }
-    for (face, ..) in &rounds {
-        if let Some(s) = samples.get(*face).filter(|_| matches!(face_surface(body, *face), Some(FaceSurface::Cone { .. }))) {
-            silhouette = silhouette.union(&shadow(s)?)?;
-        }
-    }
     let outline = Area::union_of(&silhouette.shapes.iter().filter_map(|s| s.first().cloned()).collect::<Vec<_>>())?;
-    let chamfers = chamfer_bands(chamfer_faces, &outline, tol)?;
+    let chamfers = chamfer_bands(chamfer_faces, &outline, mesh_tol)?;
 
     // Through openings that are not round holes.
     let mut cutouts = Vec::new();
@@ -467,37 +483,69 @@ fn floor_in_hole(f: &Floor, h: &HoleStack, tol: f64) -> bool {
 }
 
 /// Sloped faces joined into bands (connected shadows of one height range and angle).
-fn chamfer_bands(faces: Vec<(usize, f64, f64, f64, Area)>, outline: &Area, tol: f64) -> Result<Vec<Chamfer>> {
-    let mut bands: Vec<Chamfer> = Vec::new();
-    for (face, angle, zt, zb, sh) in faces {
-        let key = |c: &Chamfer| {
-            (c.z_top - zt).abs() <= tol * 10.0 && (c.z_bottom - zb).abs() <= tol * 10.0 && (c.angle_deg - angle.to_degrees()).abs() < 0.01
-        };
-        let touching = |c: &Chamfer| {
-            key(c) && !c.region.offset(tol.max(1e-3) * 10.0, 0.01).and_then(|g| g.intersection(&sh)).map(|a| a.is_empty()).unwrap_or(true)
-        };
-        match bands.iter_mut().find(|c| touching(c)) {
-            Some(c) => {
+fn chamfer_bands(faces: Vec<(usize, f64, f64, f64, Area)>, outline: &Area, mesh_tol: f64) -> Result<Vec<Chamfer>> {
+    let tol = mesh_tol;
+    // Faces of one height range and angle whose shadows touch belong to one band: join them
+    // into connected groups (union-find), whatever order they come in.
+    let n = faces.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        let mut guard = 0;
+        while let Some(&p) = parent.get(i) {
+            if p == i || guard > parent.len() {
+                break;
+            }
+            i = p;
+            guard += 1;
+        }
+        i
+    }
+    let grown: Vec<Option<Area>> = faces.iter().map(|f| f.4.offset(tol * 10.0, 0.01).ok()).collect();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (Some(a), Some(b), Some(ga)) = (faces.get(i), faces.get(j), grown.get(i).and_then(Option::as_ref)) else { continue };
+            let same = (a.2 - b.2).abs() <= tol * 10.0 && (a.3 - b.3).abs() <= tol * 10.0 && (a.1 - b.1).abs() < 1e-6;
+            if same && ga.intersection(&b.4).is_ok_and(|x| !x.is_empty()) {
+                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                if let Some(slot) = parent.get_mut(ri) {
+                    *slot = rj;
+                }
+            }
+        }
+    }
+    let mut groups: Vec<(usize, Chamfer)> = Vec::new();
+    for (i, (face, angle, zt, zb, sh)) in faces.into_iter().enumerate() {
+        let r = root(&mut parent, i);
+        match groups.iter_mut().find(|(g, _)| *g == r) {
+            Some((_, c)) => {
                 c.region = c.region.union(&sh)?;
                 c.faces.push(face);
             }
-            None => bands.push(Chamfer {
-                z_top: zt,
-                z_bottom: zb,
-                width: (zt - zb) / angle.tan().max(1e-9),
-                angle_deg: round_to(angle.to_degrees(), 1e-6),
-                on: "opening",
-                faces: vec![face],
-                region: sh,
-            }),
+            None => groups.push((
+                r,
+                Chamfer {
+                    z_top: zt,
+                    z_bottom: zb,
+                    width: (zt - zb) / angle.tan().max(1e-9),
+                    angle_deg: round_to(angle.to_degrees(), 1e-6),
+                    on: "opening",
+                    faces: vec![face],
+                    region: sh,
+                },
+            )),
         }
     }
-    // A band whose outer edge is the part's outline runs round the outside.
-    let outer = outline.area();
-    for c in &mut bands {
-        let filled = Area::union_of(&c.region.shapes.iter().filter_map(|s| s.first().cloned()).collect::<Vec<_>>())?;
-        if (filled.area() - outer).abs() <= outer * 1e-6 + 1e-3 {
-            c.on = "outline";
+    let mut bands: Vec<Chamfer> = groups.into_iter().map(|(_, c)| c).collect();
+    // A band whose outer edge is the part's outline runs round the outside: its shadow reaches
+    // the outline's bounds on every side (to within the mesh's chords).
+    if let Some((lo, hi)) = outline.bounds() {
+        for c in &mut bands {
+            if let Some((blo, bhi)) = c.region.bounds() {
+                let reach = mesh_tol * 2.0 + 1e-6;
+                if [blo[0] - lo[0], blo[1] - lo[1], hi[0] - bhi[0], hi[1] - bhi[1]].iter().all(|d| d.abs() <= reach) {
+                    c.on = "outline";
+                }
+            }
         }
     }
     Ok(bands)

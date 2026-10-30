@@ -1,0 +1,7 @@
+{
+  "en": { "cmd.cam_part_inspect": "Inspect Machining Features" },
+  "de": { "cmd.cam_part_inspect": "Bearbeitungsmerkmale prüfen" },
+  "ja": { "cmd.cam_part_inspect": "加工フィーチャを検査" },
+  "ko": { "cmd.cam_part_inspect": "가공 형상 검사" },
+  "zh": { "cmd.cam_part_inspect": "检查加工特征" }
+}
