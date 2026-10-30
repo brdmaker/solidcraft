@@ -210,3 +210,53 @@ fn with_step(part: &Value) -> Value {
     p["step"] = Value::from(part["design"].as_str().unwrap().replace(".sc", ".step"));
     p
 }
+
+/// Four flanges and two front panels, read from their STEP files, nested on a 600 × 400 × 10
+/// sheet: their boxes (90 × 90 and 200 × 100) fit with room to spare, so every copy goes on, and
+/// the outlines keep the margin and spacing.
+#[test]
+fn the_test_parts_nest_on_one_sheet() {
+    use crate::job::Job;
+    use crate::nest::{NestItem, nest};
+    let job = Job::from_json(
+        r#"{"stock": {"size": [600, 400], "thickness": 10, "material": "aluminium"},
+            "nest": {"margin": 10, "spacing": 8},
+            "parts": [{"design": "nema23-flange.step", "body": "Flange", "quantity": 4},
+                      {"design": "front-panel.step", "body": "Panel", "quantity": 2}]}"#,
+    )
+    .unwrap();
+    let features: Vec<crate::part::PartFeatures> = job
+        .parts
+        .iter()
+        .map(|p| {
+            let read = solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(&p.design)).unwrap()).unwrap();
+            crate::part::read_part(&read.bodies[0].body).unwrap()
+        })
+        .collect();
+    let items: Vec<NestItem> = job
+        .parts
+        .iter()
+        .zip(&features)
+        .map(|(p, f)| NestItem { label: p.label(), quantity: p.quantity, outline: &f.outline, height: f.top_z - f.bottom_z })
+        .collect();
+    let n = nest(&job.stock, &job.nest, &items);
+    assert_eq!(n.placements.len(), 6, "{:?}", n.unplaced);
+    let placed: Vec<crate::region::Area> =
+        n.placements.iter().map(|p| features[p.part].outline.placed(p.quarter_turns, p.offset[0], p.offset[1])).collect();
+    for a in &placed {
+        let (lo, hi) = a.bounds().unwrap();
+        assert!(lo[0] >= 10.0 - 1e-6 && lo[1] >= 10.0 - 1e-6 && hi[0] <= 590.0 + 1e-6 && hi[1] <= 390.0 + 1e-6, "{lo:?} {hi:?}");
+    }
+    for i in 0..placed.len() {
+        for j in (i + 1)..placed.len() {
+            let gap = placed[i].offset(4.0 - 1e-3, 0.01).unwrap().intersection(&placed[j].offset(4.0 - 1e-3, 0.01).unwrap()).unwrap();
+            assert!(gap.is_empty(), "{:?} and {:?} closer than 8 mm", n.placements[i], n.placements[j]);
+        }
+    }
+    // The outlines' areas over the usable 580 × 380: 4 rounded 90 × 90 squares and 2 rounded
+    // 200 × 100 panels (their through openings inside the outline count as part).
+    let flange = 8100.0 - (4.0 - PI) * 36.0;
+    let panel = 20_000.0 - (4.0 - PI) * 16.0;
+    let want = (4.0 * flange + 2.0 * panel) / (580.0 * 380.0);
+    assert!((n.utilisation - want).abs() < 1e-4, "utilisation {} vs {want}", n.utilisation);
+}

@@ -1,17 +1,26 @@
 //! CAM for 3-axis routers: machining features, toolpaths and G-code (`solidcraft_cam`).
 
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
+use solidcraft_cam::job::{Job, PartRef};
+use solidcraft_cam::nest::{NestItem, nest};
+use solidcraft_cam::part::{PartFeatures, read_part};
 
 use super::CommandSpec;
 use crate::params::bad;
-use crate::schema::cam::PartInspectParams;
+use crate::schema::cam::{JobNestParams, JobNestResult, NestedPart, PartInspectParams};
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
 
 const PART_INSPECT_CONTRACT: TypedContract<PartInspectParams> = TypedContract::new();
+const JOB_NEST_CONTRACT: TypedContract<JobNestParams> = TypedContract::new();
 
-pub static COMMANDS: &[CommandSpec] =
-    &[CommandSpec::new("cam.part.inspect", "Inspect Machining Features", crate::checked!("cam.part.inspect", part_inspect))
+/// Largest job file read (bytes).
+const MAX_JOB_BYTES: usize = 4 << 20;
+
+pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("cam.part.inspect", "Inspect Machining Features", crate::checked!("cam.part.inspect", part_inspect))
         .icon("list")
         .noundo()
         .contract(&PART_INSPECT_CONTRACT)
@@ -22,7 +31,21 @@ pub static COMMANDS: &[CommandSpec] =
          one vertical axis, top down: kind hole|counterbore|countersink|stepped, centre, through, diameter of the narrowest step, steps with \
          kind cylinder|cone, z and radius at top and bottom); chamfers (sloped bands: z range, width, angle, on outline|opening); cutouts \
          (through openings that aren't round); unsupported (faces it cannot machine, each with its reason). Read-only",
-        )];
+        ),
+    CommandSpec::new("cam.job.nest", "Nest Job", crate::checked!("cam.job.nest", job_nest))
+        .icon("list")
+        .noundo()
+        .contract(&JOB_NEST_CONTRACT)
+        .output(output_schema_for::<JobNestResult>)
+        .params(
+            "job: a job object or the path of a job file: {stock: {size: [width, depth], thickness, material?, spoilboard_allowance? (0.2)}, \
+             nest?: {margin? (10), spacing? (10), rotate? (true)}, tools?: [{number, kind: flat|drill|chamfer, diameter, flute_length, \
+             rpm, feed, plunge, flutes?, tip_angle_deg?, stepdown?, stepover? (fraction), peck?}], parts: [{body, design? (.sc or STEP, \
+             relative to the job file; empty: the open design), quantity? (1), name?}]} → each part's height, box and outline area, \
+             and the layout on the sheet (work zero at the sheet's top front-left corner, X right, Y back): placements {part, copy, \
+             quarter_turns, offset, bounds}, unplaced copies with the reason, utilisation. Bounding-box nesting with 90° turns. Read-only",
+        ),
+];
 
 fn part_inspect(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.part.inspect";
@@ -31,6 +54,98 @@ fn part_inspect(s: &mut Session, p: &Value) -> Result<Value> {
     let body = state.body(name).ok_or_else(|| bad(cmd, format!("no body named `{name}`")))?;
     let features = solidcraft_cam::part::read_part(&body.body).map_err(|e| EngineError::Other(e.to_string()))?;
     serde_json::to_value(features).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+fn job_nest(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.job.nest";
+    let (job, base) = read_job(s, p.get("job").ok_or_else(|| bad(cmd, "job: a job object or the path of a job file"))?)?;
+    let mut parts = Vec::new();
+    let mut features: Vec<PartFeatures> = Vec::new();
+    for part in &job.parts {
+        let body = part_body(s, base.as_deref(), part)?;
+        let f = read_part(&body).map_err(|e| EngineError::Other(format!("{}: {e}", part.label())))?;
+        let height = f.top_z - f.bottom_z;
+        parts.push(NestedPart {
+            label: part.label().to_string(),
+            design: part.design.clone(),
+            body: part.body.clone(),
+            quantity: part.quantity,
+            height,
+            face_off: (job.stock.thickness - height).max(0.0),
+            bounds: f.bounds,
+            outline_area: f.outline_area,
+            unsupported: f.unsupported.len(),
+        });
+        features.push(f);
+    }
+    let items: Vec<NestItem> = job
+        .parts
+        .iter()
+        .zip(&features)
+        .map(|(p, f)| NestItem { label: p.label(), quantity: p.quantity, outline: &f.outline, height: f.top_z - f.bottom_z })
+        .collect();
+    let nesting = nest(&job.stock, &job.nest, &items);
+    let result = JobNestResult { sheet: job.stock.size, thickness: job.stock.thickness, parts, nesting };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// The job from the parameter, and the folder its parts' designs are relative to.
+pub(crate) fn read_job(s: &Session, v: &Value) -> Result<(Job, Option<PathBuf>)> {
+    let cmd = "cam.job";
+    match v {
+        Value::String(path) => {
+            let bytes = solidcraft_io::vfs::read(path, MAX_JOB_BYTES).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            let text = String::from_utf8(bytes).map_err(|_| EngineError::Other(format!("{path}: not UTF-8 text")))?;
+            let job = Job::from_json(&text).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            Ok((job, Path::new(path).parent().map(Path::to_path_buf)))
+        }
+        Value::Object(_) => {
+            let job: Job = serde_json::from_value(v.clone()).map_err(|e| bad(cmd, format!("job: {e}")))?;
+            job.validate().map_err(|e| bad(cmd, e.to_string()))?;
+            Ok((job, s.path.as_deref().and_then(|p| Path::new(p).parent()).map(Path::to_path_buf)))
+        }
+        _ => Err(bad(cmd, "job: a job object or the path of a job file")),
+    }
+}
+
+/// The body a part cuts: from the open design, a design file or a STEP file.
+pub(crate) fn part_body(s: &Session, base: Option<&Path>, part: &PartRef) -> Result<solidcraft_kernel::Body> {
+    let label = part.label();
+    if part.design.is_empty() {
+        let state = s.world_state();
+        return state
+            .body(&part.body)
+            .map(|b| b.body.clone())
+            .ok_or_else(|| EngineError::Other(format!("{label}: the open design has no body named `{}`", part.body)));
+    }
+    let path = match base {
+        Some(dir) if Path::new(&part.design).is_relative() => dir.join(&part.design),
+        _ => PathBuf::from(&part.design),
+    };
+    let shown = path.display().to_string();
+    let fail = |e: String| EngineError::Other(format!("{label} ({shown}): {e}"));
+    let lower = shown.to_ascii_lowercase();
+    if lower.ends_with(".step") || lower.ends_with(".stp") {
+        let bytes = solidcraft_io::vfs::read(&shown, solidcraft_io::limits::max_step_bytes()).map_err(|e| fail(e.to_string()))?;
+        let read = solidcraft_kernel::step_import(&String::from_utf8_lossy(&bytes)).map_err(|e| fail(e.to_string()))?;
+        let pick = read.bodies.iter().find(|b| b.name == part.body).or_else(|| (read.bodies.len() == 1).then(|| read.bodies.first()).flatten());
+        return pick.map(|b| b.body.clone()).ok_or_else(|| fail(format!("no solid named `{}`", part.body)));
+    }
+    let bytes = solidcraft_io::vfs::read_design_path(&shown, s.path.as_deref(), solidcraft_io::limits::max_design_bytes())
+        .map_err(|e| fail(e.to_string()))?;
+    let (doc, saved) = if solidcraft_io::is_design_container(&bytes) {
+        let mut reader = solidcraft_io::DesignContainerReader::new(std::io::Cursor::new(&bytes)).map_err(|e| fail(e.to_string()))?;
+        let saved = reader.geometry();
+        (reader.read_document().map_err(|e| fail(e.to_string()))?, saved)
+    } else {
+        (solidcraft_io::read_design(&bytes).map_err(|e| fail(e.to_string()))?, None)
+    };
+    let design = Session::opened_at(doc, saved.as_ref(), Some(&shown));
+    if let Some(e) = design.model.results.iter().find_map(|r| r.error.clone()) {
+        return Err(fail(format!("the design has a feature that fails ({e})")));
+    }
+    let state = design.world_state();
+    state.body(&part.body).map(|b| b.body.clone()).ok_or_else(|| fail(format!("no body named `{}`", part.body)))
 }
 
 #[cfg(test)]

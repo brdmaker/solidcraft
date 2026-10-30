@@ -224,3 +224,175 @@ mod part_tests {
         assert!(p.unsupported.iter().all(|n| !n.reason.is_empty()));
     }
 }
+
+mod job_tests {
+    use crate::job::{Job, ToolKind};
+
+    const MINIMAL: &str = r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "Flange"}]}"#;
+
+    #[test]
+    fn a_minimal_job_takes_the_defaults() {
+        let j = Job::from_json(MINIMAL).unwrap();
+        assert_eq!(j.version, 1);
+        assert_eq!(j.stock.spoilboard_allowance, 0.2);
+        assert_eq!((j.nest.margin, j.nest.spacing, j.nest.rotate), (10.0, 10.0, true));
+        assert_eq!(j.parts[0].quantity, 1);
+        assert_eq!(j.parts[0].label(), "Flange");
+        assert!(j.tools.is_empty());
+    }
+
+    #[test]
+    fn tools_take_their_defaults() {
+        let j = Job::from_json(
+            r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B"}],
+                "tools": [{"number": 3, "kind": "drill", "diameter": 5, "flute_length": 30, "rpm": 3000, "feed": 200, "plunge": 100},
+                          {"number": 7, "kind": "flat", "diameter": 6, "flute_length": 20, "rpm": 18000, "feed": 1200, "plunge": 300, "stepover": 0.1},
+                          {"number": 9, "kind": "chamfer", "diameter": 12, "flute_length": 6, "rpm": 12000, "feed": 600, "plunge": 200}]}"#,
+        )
+        .unwrap();
+        let drill = j.tool(3).unwrap();
+        assert_eq!((drill.kind, drill.tip_angle(), drill.stepdown(), drill.flutes), (ToolKind::Drill, 118.0, 5.0, 2));
+        let flat = j.tool(7).unwrap();
+        assert!((flat.stepover() - 0.6).abs() < 1e-12, "10 % of 6 mm");
+        assert_eq!(j.tool(9).unwrap().tip_angle(), 90.0);
+        assert!(j.tool(4).is_none());
+    }
+
+    #[test]
+    fn hostile_jobs_are_refused_with_a_reason() {
+        let bad = [
+            (r#"{"stock": {"size": [-1, 400], "thickness": 10}, "parts": [{"body": "B"}]}"#, "stock.size[0]"),
+            (r#"{"stock": {"size": [600, 400], "thickness": 0}, "parts": [{"body": "B"}]}"#, "stock.thickness"),
+            (r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": []}"#, "at least one part"),
+            (r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B", "quantity": 0}]}"#, "quantity"),
+            (r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B", "quantity": 20000}]}"#, "at most 10000"),
+            (r#"{"stock": {"size": [600, 400], "thickness": 10}, "nest": {"margin": 300}, "parts": [{"body": "B"}]}"#, "no room"),
+            (r#"{"stock": {"size": [600, 400], "thickness": 10, "spoilboard_allowance": 9}, "parts": [{"body": "B"}]}"#, "spoilboard"),
+            (r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B"}], "colour": "red"}"#, "unknown field"),
+            (r#"{"version": 2, "stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B"}]}"#, "version 2"),
+            (
+                r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B"}],
+                    "tools": [{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 20, "rpm": 1, "feed": 1, "plunge": 1},
+                              {"number": 1, "kind": "drill", "diameter": 5, "flute_length": 20, "rpm": 1, "feed": 1, "plunge": 1}]}"#,
+                "listed twice",
+            ),
+            (
+                r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B"}],
+                    "tools": [{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 20, "rpm": 1, "feed": 0, "plunge": 1}]}"#,
+                "feed",
+            ),
+            (
+                r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "B"}],
+                    "tools": [{"number": 1, "kind": "chamfer", "diameter": 6, "flute_length": 20, "rpm": 1, "feed": 1, "plunge": 1, "tip_angle_deg": 180}]}"#,
+                "tip_angle_deg",
+            ),
+            ("[1, 2", "job:"),
+        ];
+        for (text, why) in bad {
+            let e = Job::from_json(text).unwrap_err().to_string();
+            assert!(e.contains(why), "{text}\n  → {e}\n  (expected it to mention `{why}`)");
+        }
+    }
+}
+
+mod nest_tests {
+    use crate::job::{NestOptions, Stock};
+    use crate::nest::{NestItem, Nesting, nest};
+    use crate::region::Area;
+
+    fn stock(w: f64, h: f64, t: f64) -> Stock {
+        Stock { size: [w, h], thickness: t, material: String::new(), spoilboard_allowance: 0.2 }
+    }
+
+    fn opts(margin: f64, spacing: f64, rotate: bool) -> NestOptions {
+        NestOptions { margin, spacing, rotate }
+    }
+
+    /// Independent of how the layout was found: every placed outline lies inside the margins,
+    /// and outlines grown by half the spacing never meet.
+    fn check_layout(n: &Nesting, st: &Stock, o: &NestOptions, outlines: &[&Area]) {
+        let placed: Vec<Area> = n.placements.iter().map(|p| outlines[p.part].placed(p.quarter_turns, p.offset[0], p.offset[1])).collect();
+        for (p, a) in n.placements.iter().zip(&placed) {
+            let (lo, hi) = a.bounds().unwrap();
+            assert!(lo[0] >= o.margin - 1e-6 && lo[1] >= o.margin - 1e-6, "{p:?} below the margin: {lo:?}");
+            assert!(hi[0] <= st.size[0] - o.margin + 1e-6 && hi[1] <= st.size[1] - o.margin + 1e-6, "{p:?} past the margin: {hi:?}");
+            for k in 0..2 {
+                assert!((lo[k] - p.bounds[0][k]).abs() < 1e-6 && (hi[k] - p.bounds[1][k]).abs() < 1e-6, "{p:?} reports bounds {:?}", (lo, hi));
+            }
+        }
+        let grown: Vec<Area> = placed.iter().map(|a| a.offset(o.spacing / 2.0 - 1e-3, 0.01).unwrap()).collect();
+        for i in 0..grown.len() {
+            for j in (i + 1)..grown.len() {
+                assert!(
+                    grown[i].intersection(&grown[j]).unwrap().is_empty(),
+                    "{:?} and {:?} are closer than the spacing",
+                    n.placements[i],
+                    n.placements[j]
+                );
+            }
+        }
+    }
+
+    /// Four 100 mm squares on a 230 mm sheet, margin 10 and spacing 10: 100 + 10 + 100 fills
+    /// the 210 mm between the margins exactly, so they go 2 × 2.
+    #[test]
+    fn four_squares_fill_the_sheet_exactly() {
+        let sq = Area::rect(0.0, 0.0, 100.0, 100.0).unwrap();
+        let (st, o) = (stock(230.0, 230.0, 10.0), opts(10.0, 10.0, true));
+        let n = nest(&st, &o, &[NestItem { label: "sq", quantity: 4, outline: &sq, height: 10.0 }]);
+        assert_eq!(n.placements.len(), 4);
+        assert!(n.unplaced.is_empty());
+        let mut corners: Vec<[f64; 2]> = n.placements.iter().map(|p| p.bounds[0]).collect();
+        corners.sort_by(|a, b| a[1].total_cmp(&b[1]).then(a[0].total_cmp(&b[0])));
+        assert_eq!(corners, vec![[10.0, 10.0], [120.0, 10.0], [10.0, 120.0], [120.0, 120.0]]);
+        assert!((n.utilisation - 40_000.0 / (210.0 * 210.0)).abs() < 1e-9);
+        check_layout(&n, &st, &o, &[&sq]);
+        // A fifth has no room and says so.
+        let n = nest(&st, &o, &[NestItem { label: "sq", quantity: 5, outline: &sq, height: 10.0 }]);
+        assert_eq!((n.placements.len(), n.unplaced.len()), (4, 1));
+        assert_eq!(n.unplaced[0].reason, "no room left on the sheet");
+    }
+
+    /// A 150 × 40 strip on a 60 mm wide sheet fits only turned; three stack 3 × 150 = 450 ≤ 460.
+    #[test]
+    fn strips_turn_to_fit() {
+        let strip = Area::rect(0.0, 0.0, 150.0, 40.0).unwrap();
+        let (st, o) = (stock(60.0, 460.0, 6.0), opts(0.0, 0.0, true));
+        let n = nest(&st, &o, &[NestItem { label: "strip", quantity: 3, outline: &strip, height: 6.0 }]);
+        assert_eq!(n.placements.len(), 3, "{:?}", n.unplaced);
+        assert!(n.placements.iter().all(|p| p.quarter_turns == 1));
+        check_layout(&n, &st, &o, &[&strip]);
+        let n = nest(&st, &opts(0.0, 0.0, false), &[NestItem { label: "strip", quantity: 3, outline: &strip, height: 6.0 }]);
+        assert_eq!(n.placements.len(), 0, "without turning nothing fits");
+    }
+
+    #[test]
+    fn a_part_thicker_than_the_sheet_is_not_placed() {
+        let sq = Area::rect(0.0, 0.0, 10.0, 10.0).unwrap();
+        let n = nest(&stock(100.0, 100.0, 5.0), &opts(0.0, 0.0, true), &[NestItem { label: "tall", quantity: 2, outline: &sq, height: 8.0 }]);
+        assert!(n.placements.is_empty());
+        assert_eq!(n.unplaced.len(), 2);
+        assert!(n.unplaced[0].reason.contains("8.000 mm tall"), "{}", n.unplaced[0].reason);
+    }
+
+    /// Mixed shapes away from the origin (round, L-shaped, long), many copies: whatever the
+    /// packer chooses, the layout keeps the margins and spacing.
+    #[test]
+    fn mixed_parts_keep_margins_and_spacing() {
+        let disc = Area::circle(-40.0, 25.0, 30.0, 0.01).unwrap();
+        let ell = Area::rect(0.0, 0.0, 80.0, 20.0).unwrap().union(&Area::rect(0.0, 0.0, 20.0, 70.0).unwrap()).unwrap().placed(0, 500.0, -300.0);
+        let bar = Area::rect(-100.0, -5.0, 100.0, 5.0).unwrap();
+        let (st, o) = (stock(500.0, 300.0, 3.0), opts(8.0, 6.5, true));
+        let items = [
+            NestItem { label: "disc", quantity: 5, outline: &disc, height: 3.0 },
+            NestItem { label: "ell", quantity: 6, outline: &ell, height: 2.0 },
+            NestItem { label: "bar", quantity: 4, outline: &bar, height: 3.0 },
+        ];
+        let n = nest(&st, &o, &items);
+        assert_eq!(n.placements.len() + n.unplaced.len(), 15);
+        assert!(n.placements.len() >= 12, "{} placed, {:?}", n.placements.len(), n.unplaced);
+        check_layout(&n, &st, &o, &[&disc, &ell, &bar]);
+        // Deterministic: the same input gives the same layout.
+        assert_eq!(nest(&st, &o, &items).placements, n.placements);
+    }
+}
