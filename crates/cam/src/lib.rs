@@ -9,6 +9,7 @@ pub mod job;
 pub mod nest;
 pub mod part;
 pub mod plan;
+pub mod preview;
 pub mod region;
 pub mod toolpath;
 

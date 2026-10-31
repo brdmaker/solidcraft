@@ -615,3 +615,53 @@ pub fn plan_sheet(job: &Job, parts: &[(&PartFeatures, &PartPlan)], placements: &
     all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     all.into_iter().map(|(.., op)| op).collect()
 }
+
+/// A whole job planned: each part's features and toolpaths, the nesting, and the sheet's
+/// operations in the order they run.
+pub struct JobPlan {
+    pub features: Vec<PartFeatures>,
+    pub plans: Vec<PartPlan>,
+    pub nesting: crate::nest::Nesting,
+    pub ops: Vec<Operation>,
+    /// Every part's warnings, and every copy that did not go on the sheet.
+    pub warnings: Vec<String>,
+}
+
+/// Read, nest and plan `job`, whose parts' bodies are `bodies` (in the order of `job.parts`).
+pub fn plan_job(job: &Job, bodies: &[solidcraft_kernel::Body]) -> Result<JobPlan> {
+    if bodies.len() != job.parts.len() {
+        return Err(CamError::Invalid(format!("{} bodies for {} parts", bodies.len(), job.parts.len())));
+    }
+    let mut features = Vec::new();
+    let mut plans = Vec::new();
+    let mut warnings = Vec::new();
+    for (p, b) in job.parts.iter().zip(bodies) {
+        let f = crate::part::read_part(b).map_err(|e| CamError::Invalid(format!("{}: {e}", p.label())))?;
+        let plan = plan_part(&f, job, p.label())?;
+        warnings.extend(plan.warnings.iter().cloned());
+        features.push(f);
+        plans.push(plan);
+    }
+    let items: Vec<crate::nest::NestItem> = job
+        .parts
+        .iter()
+        .zip(&features)
+        .map(|(p, f)| crate::nest::NestItem { label: p.label(), quantity: p.quantity, outline: &f.outline, height: f.top_z - f.bottom_z })
+        .collect();
+    let nesting = crate::nest::nest(&job.stock, &job.nest, &items);
+    warnings.extend(nesting.unplaced.iter().map(|u| format!("{} #{} is not on the sheet: {}", u.label, u.copy + 1, u.reason)));
+    let pairs: Vec<(&PartFeatures, &PartPlan)> = features.iter().zip(&plans).collect();
+    let ops = plan_sheet(job, &pairs, &nesting.placements);
+    Ok(JobPlan { features, plans, nesting, ops, warnings })
+}
+
+impl JobPlan {
+    /// Every placed copy's outline on the sheet.
+    pub fn placed_outlines(&self) -> Vec<Area> {
+        self.nesting
+            .placements
+            .iter()
+            .filter_map(|p| self.features.get(p.part).map(|f| f.outline.placed(p.quarter_turns, p.offset[0], p.offset[1])))
+            .collect()
+    }
+}

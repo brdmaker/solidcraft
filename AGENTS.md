@@ -23,7 +23,7 @@ Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelle
 - Every feature (command, operation, option) ships with tests in the same commit that check its result against independently worked-out values: `skills/solidcraft-tests/SKILL.md`.
 - A regression test goes in the area's existing test file, never a per-bug file (#3226).
 - Look at open PRs first, claim with a draft PR (lowest number wins), one topic per PR, never force-push `main`, no pushes just to catch up with `main`: `skills/solidcraft-contributing/SKILL.md`.
-- Show observable changes with real screenshots or a recording, captured yourself.
+- Show observable changes with real screenshots or a recording, captured yourself (CAM: the toolpath preview, shown in the conversation).
 - Run `cargo xtask ci` before every commit (CAM-only commits: `cargo xtask cam`, see the CAM skill), without switching branches while it runs. `cargo xtask skills` keeps this file and `skills/` honest.
 
 ## Working on X: read the skill first

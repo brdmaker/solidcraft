@@ -454,3 +454,120 @@ fn placed_paths_are_turned_moved_and_lowered() {
         assert!((r - (r0 - 10.0)).abs() < 1e-9 && (r - 1.0).abs() < 1e-9, "1 mm above the sheet's top");
     }
 }
+
+/// The panel's label recess (70 × 14, floor at 2.2) is roughed at 2.4 before its floor is
+/// finished: roughing passes at 2.4 inside it, 3.2 or more from its walls.
+#[test]
+fn the_label_recess_is_roughed_before_its_floor() {
+    use crate::toolpath::{Move, OpKind};
+    let (_, plan) = plan_fixture(1, 3.0);
+    let rough = ops_of(&plan, OpKind::Roughing);
+    let in_recess: Vec<[f64; 3]> = rough
+        .iter()
+        .flat_map(|o| o.moves.iter())
+        .filter_map(|m| if let Move::Line { to, .. } = m { Some(*to) } else { None })
+        .filter(|p| (p[2] - 2.4).abs() < 1e-9 && p[1] < -20.0)
+        .collect();
+    assert!(!in_recess.is_empty(), "no roughing in the label recess");
+    for p in &in_recess {
+        let d = rounded_rect_dist([p[0] + 40.0, p[1] + 30.0], 35.0, 7.0, 3.0);
+        assert!(d <= -(3.2 - crate::plan::PATH_TOL - 1e-6), "roughing at {p:?} is {} from the recess wall", -d);
+    }
+}
+
+/// The flange sheet's preview, checked pixel by pixel where the geometry says what must be
+/// there: the profile's dark line 3 mm outside a flange's straight edge, a drilled hole's red
+/// cross at its centre, white part face between features; and the SVG names every operation.
+#[test]
+fn the_preview_draws_the_toolpaths_where_they_are() {
+    use crate::preview::{Scene, colour, png, svg};
+    use crate::toolpath::OpKind;
+    let part = &expected()["parts"][0];
+    let read =
+        solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
+            .unwrap();
+    let job = crate::job::Job::from_json(&format!(
+        r#"{{"stock": {{"size": [220, 220], "thickness": 10}}, "nest": {{"margin": 10, "spacing": 10}}, "tools": {TOOLS}, "parts": [{{"body": "F", "quantity": 4}}]}}"#
+    ))
+    .unwrap();
+    let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    assert_eq!(plan.nesting.placements.len(), 4);
+    let outlines = plan.placed_outlines();
+    let scene = Scene { sheet: [220.0, 220.0], margin: 10.0, outlines: &outlines, ops: &plan.ops, clearance: 5.0 };
+
+    // 1100 px wide: the sheet plus 4 % of 220 each side (8.8 mm), 4.545... px per mm
+    let bytes = png(&scene, 1100).unwrap();
+    let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!((info.width, info.height), (1100, 1100));
+    let scale = 1100.0 / (220.0 + 2.0 * 8.8);
+    let pixel = |x: f64, y: f64| {
+        let (px, py) = (((x + 8.8) * scale) as usize, (((220.0 - y) + 8.8) * scale) as usize);
+        let i = (py * 1100 + px) * 4;
+        [buf[i], buf[i + 1], buf[i + 2]]
+    };
+    let near = |x: f64, y: f64, hex: &str| {
+        let want = [&hex[1..3], &hex[3..5], &hex[5..7]].map(|h| u8::from_str_radix(h, 16).unwrap() as i32);
+        (-2..=2).any(|dx| {
+            (-2..=2).any(|dy| {
+                let p = pixel(x + dx as f64 / scale, y + dy as f64 / scale);
+                (0..3).all(|k| (p[k] as i32 - want[k]).abs() < 60)
+            })
+        })
+    };
+    // The first placement: its outline's box and centre.
+    let pl = &plan.nesting.placements[0];
+    let [lo, hi] = pl.bounds;
+    let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+    assert!(near(c[0], lo[1] - 3.0, colour(OpKind::Profile)), "the profile 3 mm outside the bottom edge at {:?}", [c[0], lo[1] - 3.0]);
+    let drilled = plan.ops.iter().find(|o| o.kind == OpKind::Drilling).unwrap();
+    let crate::toolpath::Move::Drill { at, .. } = drilled.moves[1] else { panic!("a drilling cycle") };
+    assert!(near(at[0], at[1], colour(OpKind::Drilling)), "a drilled hole's cross at {at:?}");
+    // halfway between the centre bore (r 19.6 with its chamfer) and a counterbore (centre at
+    // 23.57, 23.57 from the middle, r 5): plain part face
+    let face = pixel(c[0] + 12.0, c[1] - 30.0);
+    assert!(face.iter().all(|v| *v > 240), "part face at {:?} is {face:?}", [c[0] + 12.0, c[1] - 30.0]);
+
+    let s = svg(&scene);
+    assert!(s.starts_with("<svg") && s.ends_with("</svg>"));
+    for op in &plan.ops {
+        assert!(s.contains(&format!("<title>{}</title>", op.name)), "the SVG names {}", op.name);
+    }
+    for k in [OpKind::Drilling, OpKind::HoleMilling, OpKind::Chamfer, OpKind::Profile, OpKind::EdgeChamfer] {
+        assert!(s.contains(colour(k)), "{k:?} drawn");
+    }
+    assert!(!s.contains(colour(OpKind::Roughing)), "the flange has no pockets to rough");
+    assert!(s.contains(">drilling<") && s.contains(">profile<"), "the legend names what is drawn");
+}
+
+/// Tracing: a full clockwise circle of radius 4 traced every 3° gives 120 points on the circle,
+/// ending where it began; a drilling cycle is a vertical stroke from its retract height down.
+#[test]
+fn traces_follow_arcs_and_drilling_cycles() {
+    use crate::toolpath::{Move, OpKind, Operation, StrokeKind, trace};
+    let op = Operation {
+        kind: OpKind::HoleMilling,
+        name: "t".into(),
+        tool: 1,
+        rpm: 1.0,
+        moves: vec![
+            Move::Rapid { to: [14.0, 10.0, 5.0] },
+            Move::Line { to: [14.0, 10.0, -1.0], feed: 1.0 },
+            Move::Arc { to: [14.0, 10.0, -1.0], center: [10.0, 10.0], ccw: false, feed: 1.0 },
+            Move::Rapid { to: [30.0, 0.0, 5.0] },
+            Move::Drill { at: [30.0, 0.0], back: 5.0, r: 1.0, bottom: -6.0, peck: None, feed: 1.0 },
+        ],
+    };
+    let strokes = trace(&op, [f64::NAN, f64::NAN, 5.0], 3f64.to_radians());
+    let cut: Vec<&[f64; 3]> = strokes.iter().filter(|s| s.kind == StrokeKind::Cut).flat_map(|s| s.pts.iter()).collect();
+    let on_circle = cut.iter().filter(|p| ((p[0] - 10.0).hypot(p[1] - 10.0) - 4.0).abs() < 1e-9 && (p[2] + 1.0).abs() < 1e-12).count();
+    assert!(on_circle >= 121, "{on_circle} points on the circle");
+    // clockwise: the second point after the start (14, 10) is below the X axis
+    let after = cut.iter().position(|p| (p[2] + 1.0).abs() < 1e-12 && p[0] == 14.0).unwrap();
+    assert!(cut[after + 1][1] < 10.0, "clockwise");
+    let drill = strokes.iter().find(|s| s.kind == StrokeKind::Cut && s.pts.first() == Some(&[30.0, 0.0, 1.0])).unwrap();
+    assert_eq!(drill.pts.last(), Some(&[30.0, 0.0, -6.0]));
+}

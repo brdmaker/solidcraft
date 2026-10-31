@@ -265,3 +265,75 @@ pub fn with_tabs(ring: &Ring, count: usize, width: f64) -> Vec<([f64; 2], bool)>
     }
     out
 }
+
+/// How the tool moved along a stroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrokeKind {
+    Rapid,
+    Cut,
+}
+
+/// An operation as polylines: lines as they are, arcs every `arc_step` radians, drilling cycles
+/// as their vertical plunge (from the retract height to the bottom).
+#[derive(Clone, Debug)]
+pub struct Stroke {
+    pub kind: StrokeKind,
+    pub pts: Vec<[f64; 3]>,
+}
+
+/// The strokes of `op`, starting from `start` (the tool's position before it). Consecutive moves
+/// of one kind join into one stroke.
+pub fn trace(op: &Operation, start: [f64; 3], arc_step: f64) -> Vec<Stroke> {
+    let mut out: Vec<Stroke> = Vec::new();
+    let mut cur = start;
+    let step = arc_step.clamp(1e-3, 1.0);
+    let mut push = |kind: StrokeKind, from: [f64; 3], pts: Vec<[f64; 3]>| match out.last_mut() {
+        Some(s) if s.kind == kind && s.pts.last() == Some(&from) => s.pts.extend(pts),
+        _ => {
+            let mut all = vec![from];
+            all.extend(pts);
+            out.push(Stroke { kind, pts: all });
+        }
+    };
+    for m in &op.moves {
+        match m {
+            Move::Rapid { to } => {
+                if to[0].is_finite() && cur[0].is_finite() {
+                    push(StrokeKind::Rapid, cur, vec![*to]);
+                }
+                cur = *to;
+            }
+            Move::Line { to, .. } => {
+                push(StrokeKind::Cut, cur, vec![*to]);
+                cur = *to;
+            }
+            Move::Arc { to, center, ccw, .. } => {
+                let r = (cur[0] - center[0]).hypot(cur[1] - center[1]);
+                let a0 = (cur[1] - center[1]).atan2(cur[0] - center[0]);
+                let a1 = (to[1] - center[1]).atan2(to[0] - center[0]);
+                let tau = std::f64::consts::TAU;
+                let mut sweep = if *ccw { (a1 - a0).rem_euclid(tau) } else { -(a0 - a1).rem_euclid(tau) };
+                if sweep.abs() < 1e-9 {
+                    sweep = if *ccw { tau } else { -tau };
+                }
+                let n = ((sweep.abs() / step).ceil() as usize).clamp(1, 100_000);
+                let pts = (1..=n)
+                    .map(|i| {
+                        let t = i as f64 / n as f64;
+                        let a = a0 + sweep * t;
+                        [center[0] + r * a.cos(), center[1] + r * a.sin(), cur[2] + (to[2] - cur[2]) * t]
+                    })
+                    .collect();
+                push(StrokeKind::Cut, cur, pts);
+                cur = *to;
+            }
+            Move::Drill { at, back, r, bottom, .. } => {
+                push(StrokeKind::Rapid, cur, vec![[at[0], at[1], *r]]);
+                push(StrokeKind::Cut, [at[0], at[1], *r], vec![[at[0], at[1], *bottom]]);
+                push(StrokeKind::Rapid, [at[0], at[1], *bottom], vec![[at[0], at[1], *back]]);
+                cur = [at[0], at[1], *back];
+            }
+        }
+    }
+    out
+}

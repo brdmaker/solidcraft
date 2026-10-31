@@ -24,5 +24,8 @@ Toolpaths come from exact faces (`face_surface`, `planar_edges`). The mesh only 
 - Add `--engine` when `crates/engine/src/cmd/cam*` or `crates/engine/src/schema/cam.rs` changed. Run `cargo xtask i18n` when you add labels.
 - The full `cargo xtask ci` takes hours on a small machine. For CAM-only commits it runs in GitHub CI, not locally. A commit that changes other crates still runs the full gate.
 
+## Show the toolpaths
+When work changes toolpaths, their order or the preview, look at the result and show it to the person you are working with. Render a preview with `cargo run -p solidcraft-cam --example preview -- JOB.json OUT.png` (parts as STEP files, relative to the job), read the PNG yourself, then attach it to your reply. Say what each colour is (`legend()` in `crates/cam/src/preview.rs`) and anything that looks wrong. A picture does not replace the tests that measure the paths.
+
 ## Never crash
 The usual rules apply (`skills/solidcraft-crash-safety/SKILL.md`). Call `i_overlay` only through its fixed-scale functions, which return `Result`; its plain `outline` can panic.

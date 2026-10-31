@@ -16,3 +16,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 i_overlay = { workspace = true }
+png = { workspace = true }
+tiny-skia = { workspace = true }
+
