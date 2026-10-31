@@ -10,3 +10,5 @@
 | tests/cam/stepped-slot.step | SolidCraft contributors | original CAM test part with a stepped slot and a narrow slot, exported by SolidCraft from tests/cam/stepped-slot.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/cross-slot.png | SolidCraft contributors | original render of the CAM cross slot test part, drawn by solidcraft-cli from tests/cam/cross-slot.sc | MIT OR Apache-2.0 |
 | tests/cam/cross-slot.step | SolidCraft contributors | original CAM test part with crossing slots, exported by SolidCraft from tests/cam/cross-slot.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/odd-slots.png | SolidCraft contributors | original render of the CAM odd slots test part, drawn by solidcraft-cli from tests/cam/odd-slots.sc | MIT OR Apache-2.0 |
+| tests/cam/odd-slots.step | SolidCraft contributors | original CAM test part with angled, curved, L-shaped, triangular and island pockets, exported by SolidCraft from tests/cam/odd-slots.sc; no external CAD geometry | MIT OR Apache-2.0 |

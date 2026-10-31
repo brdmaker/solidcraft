@@ -665,6 +665,179 @@
      "curved_length": 37.6991
     }
    ]
+  },
+  {
+   "design": "odd-slots.sc",
+   "body": "OddSlots",
+   "material": "aluminium",
+   "stock_thickness": 10,
+   "top_z": 10,
+   "volume_mm3": 175002.4,
+   "bbox": [
+    [
+     -80,
+     -60,
+     0
+    ],
+    [
+     80,
+     60,
+     10
+    ]
+   ],
+   "floor_levels": [
+    10,
+    6,
+    5,
+    4,
+    0
+   ],
+   "face_types": {
+    "plane": 27,
+    "cylinder": 7
+   },
+   "note": "odd shaped pockets: a 12 wide slot at 30 degrees (centres 40 apart) 4 deep; a 10 wide kidney slot on a 120 degree arc of radius 25 about (25, 20) 5 deep; an L-shaped dogleg of 12 wide arms 5 deep and a triangle 6 deep, both with sharp corners; a 36 x 30 pocket round a round island of radius 6, 5 deep. Each pocket's centre is the middle of its floor's bounds",
+   "features": [
+    {
+     "kind": "outline",
+     "shape": "rounded_rect",
+     "size": [
+      160,
+      120
+     ],
+     "corner_radius": 0,
+     "center": [
+      0,
+      0
+     ],
+     "from_z": 10,
+     "to_z": 0
+    },
+    {
+     "kind": "pocket",
+     "shape": "angled_slot",
+     "width": 12,
+     "centres": [
+      [
+       -65,
+       15
+      ],
+      [
+       -30.359,
+       35
+      ]
+     ],
+     "center": [
+      -47.6795,
+      25
+     ],
+     "from_z": 10,
+     "floor_z": 6,
+     "floor_area": 593.0973,
+     "curved_length": 37.6991
+    },
+    {
+     "kind": "pocket",
+     "shape": "arc_slot",
+     "width": 10,
+     "arc_center": [
+      25,
+      20
+     ],
+     "arc_radius": 25,
+     "from_deg": 30,
+     "sweep_deg": 120,
+     "center": [
+      25,
+      38.75
+     ],
+     "from_z": 10,
+     "floor_z": 5,
+     "floor_area": 602.1386,
+     "curved_length": 136.1357
+    },
+    {
+     "kind": "pocket",
+     "shape": "polygon",
+     "points": [
+      [
+       -70,
+       -50
+      ],
+      [
+       -30,
+       -50
+      ],
+      [
+       -30,
+       -10
+      ],
+      [
+       -42,
+       -10
+      ],
+      [
+       -42,
+       -38
+      ],
+      [
+       -70,
+       -38
+      ]
+     ],
+     "center": [
+      -50,
+      -30
+     ],
+     "from_z": 10,
+     "floor_z": 5,
+     "floor_area": 816,
+     "curved_length": 0
+    },
+    {
+     "kind": "pocket",
+     "shape": "polygon",
+     "points": [
+      [
+       0,
+       -50
+      ],
+      [
+       30,
+       -50
+      ],
+      [
+       15,
+       -20
+      ]
+     ],
+     "center": [
+      15,
+      -35
+     ],
+     "from_z": 10,
+     "floor_z": 4,
+     "floor_area": 450,
+     "curved_length": 0
+    },
+    {
+     "kind": "pocket",
+     "shape": "rect_round_island",
+     "size": [
+      36,
+      30
+     ],
+     "island_diameter": 12,
+     "center": [
+      58,
+      -35
+     ],
+     "from_z": 10,
+     "floor_z": 5,
+     "floor_area": 966.9027,
+     "curved_length": 37.6991
+    }
+   ]
   }
  ]
 }

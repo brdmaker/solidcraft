@@ -132,7 +132,10 @@ fn check_part(part: &Value) {
                     (Some(a), Some(l)) => (f(a), f(l)),
                     _ => rounded_rect(&feat["size"], f(&feat["corner_radius"])),
                 };
+                // the floor's bounds come from its outline drawn as chords, each within the
+                // area tolerance of the curve
                 let c = xy(&feat["center"]);
+                let tol = crate::part::AREA_TOL;
                 let floor = got["floors"]
                     .as_array()
                     .unwrap()
@@ -141,13 +144,13 @@ fn check_part(part: &Value) {
                         let b = &fl["bounds"];
                         near(f(&fl["z"]), f(&feat["floor_z"]), 1e-6)
                             && fl["in_hole"] == false
-                            && near((f(&b[0][0]) + f(&b[1][0])) / 2.0, c[0], 1e-6)
-                            && near((f(&b[0][1]) + f(&b[1][1])) / 2.0, c[1], 1e-6)
+                            && near((f(&b[0][0]) + f(&b[1][0])) / 2.0, c[0], tol)
+                            && near((f(&b[0][1]) + f(&b[1][1])) / 2.0, c[1], tol)
                     })
-                    .unwrap_or_else(|| panic!("{name}: no pocket floor at {}", feat["floor_z"]));
+                    .unwrap_or_else(|| panic!("{name}: no pocket floor at {} centred on {c:?}: {}", feat["floor_z"], got["floors"]));
                 assert!(near(f(&floor["area"]), area, chord(curved)), "{name}: pocket floor {} vs {area}", floor["area"]);
                 let b = &floor["bounds"];
-                assert!(near((f(&b[0][0]) + f(&b[1][0])) / 2.0, c[0], 1e-6) && near((f(&b[0][1]) + f(&b[1][1])) / 2.0, c[1], 1e-6));
+                assert!(near((f(&b[0][0]) + f(&b[1][0])) / 2.0, c[0], tol) && near((f(&b[0][1]) + f(&b[1][1])) / 2.0, c[1], tol));
             }
             "hole" => {
                 stacks += 1;
@@ -228,6 +231,11 @@ fn stepped_slot_features_match_the_design() {
 #[test]
 fn cross_slot_features_match_the_design() {
     check_part(&with_step(&expected()["parts"][4]));
+}
+
+#[test]
+fn odd_slots_features_match_the_design() {
+    check_part(&with_step(&expected()["parts"][5]));
 }
 
 /// The STEP file exported from the part's design.

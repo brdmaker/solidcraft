@@ -1120,11 +1120,156 @@ mod adaptive_tests {
         out
     }
 
-    /// Adaptive on the slot test parts (tests/cam: slot-plate, stepped-slot, cross-slot) with a
-    /// Ø6 cutter, 0.9 mm stepover, 3 mm stepdown: for each slot, replayed on a 0.05 mm grid round
-    /// it at its last roughing level (0.2 above its floor; −0.2 through), engagement stays within
-    /// the 90° default, every point the cutter can reach (within 3 of the slot shrunk by 3.2) is
-    /// cut, and the centre stays in the slot shrunk by 3.2. A cross's reach is its two arms'.
+    /// A slot's true shape, from its description in features.json.
+    enum Slot {
+        /// Rectangles of half-sizes about `c` with corner radius `r`, joined (a cross's arms).
+        Rects { c: [f64; 2], halves: Vec<[f64; 2]>, r: f64 },
+        /// Every point within `hw` of the segment `a`–`b`.
+        Straight { a: [f64; 2], b: [f64; 2], hw: f64 },
+        /// Every point within `hw` of the arc of radius `rad` about `c` from `from` turning
+        /// `sweep` counter-clockwise (radians).
+        Curved { c: [f64; 2], rad: f64, from: f64, sweep: f64, hw: f64 },
+        /// A polygon with sharp corners.
+        Polygon(Vec<[f64; 2]>),
+        /// A sharp-cornered rectangle less a round island of radius `ri`, both about `c`.
+        Island { c: [f64; 2], hx: f64, hy: f64, ri: f64 },
+    }
+
+    fn seg_dist(q: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let t = (((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        (a[0] + t * dx - q[0]).hypot(a[1] + t * dy - q[1])
+    }
+
+    /// Points every `step` along `a`–`b`, both ends included.
+    fn seg_points(a: [f64; 2], b: [f64; 2], step: f64) -> Vec<[f64; 2]> {
+        let n = ((a[0] - b[0]).hypot(a[1] - b[1]) / step).ceil().max(1.0) as usize;
+        (0..=n).map(|k| k as f64 / n as f64).map(|t| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]).collect()
+    }
+
+    /// Points every `step` along the arc of radius `r` about `c` from angle `a0` turning `sweep`.
+    fn arc_points(c: [f64; 2], r: f64, a0: f64, sweep: f64, step: f64) -> Vec<[f64; 2]> {
+        let n = ((r * sweep.abs()) / step).ceil().max(1.0) as usize;
+        (0..=n).map(|k| a0 + sweep * k as f64 / n as f64).map(|a| [c[0] + r * a.cos(), c[1] + r * a.sin()]).collect()
+    }
+
+    impl Slot {
+        fn from_feature(feat: &serde_json::Value) -> Slot {
+            let n = |v: &serde_json::Value| v.as_f64().unwrap();
+            let pt = |v: &serde_json::Value| [n(&v[0]), n(&v[1])];
+            match feat["shape"].as_str().unwrap() {
+                "angled_slot" => Slot::Straight { a: pt(&feat["centres"][0]), b: pt(&feat["centres"][1]), hw: n(&feat["width"]) / 2.0 },
+                "arc_slot" => Slot::Curved {
+                    c: pt(&feat["arc_center"]),
+                    rad: n(&feat["arc_radius"]),
+                    from: n(&feat["from_deg"]).to_radians(),
+                    sweep: n(&feat["sweep_deg"]).to_radians(),
+                    hw: n(&feat["width"]) / 2.0,
+                },
+                "polygon" => Slot::Polygon(feat["points"].as_array().unwrap().iter().map(pt).collect()),
+                "rect_round_island" => Slot::Island {
+                    c: pt(&feat["center"]),
+                    hx: n(&feat["size"][0]) / 2.0,
+                    hy: n(&feat["size"][1]) / 2.0,
+                    ri: n(&feat["island_diameter"]) / 2.0,
+                },
+                _ => Slot::Rects {
+                    c: pt(&feat["center"]),
+                    halves: match feat.get("arms") {
+                        Some(arms) => arms.as_array().unwrap().iter().map(|a| [n(&a[0]) / 2.0, n(&a[1]) / 2.0]).collect(),
+                        None => vec![[n(&feat["size"][0]) / 2.0, n(&feat["size"][1]) / 2.0]],
+                    },
+                    r: n(&feat["corner_radius"]),
+                },
+            }
+        }
+
+        /// Signed distance from `q` to the slot's wall, negative inside: exact inside every
+        /// shape but a cross (where it is the deeper of the two arms, so never more).
+        fn sdf(&self, q: [f64; 2]) -> f64 {
+            match self {
+                Slot::Rects { c, halves, r } => halves.iter().map(|h| rounded_rect_dist(q, *c, h[0], h[1], *r)).fold(f64::INFINITY, f64::min),
+                Slot::Straight { a, b, hw } => seg_dist(q, *a, *b) - hw,
+                Slot::Curved { c, rad, from, sweep, hw } => {
+                    let along = ((q[1] - c[1]).atan2(q[0] - c[0]) - from).rem_euclid(std::f64::consts::TAU);
+                    let d = if along <= *sweep {
+                        ((q[0] - c[0]).hypot(q[1] - c[1]) - rad).abs()
+                    } else {
+                        let end = |a: f64| (c[0] + rad * a.cos() - q[0]).hypot(c[1] + rad * a.sin() - q[1]);
+                        end(*from).min(end(from + sweep))
+                    };
+                    d - hw
+                }
+                Slot::Polygon(pts) => {
+                    let mut inside = false;
+                    let mut d = f64::INFINITY;
+                    for (i, a) in pts.iter().enumerate() {
+                        let b = pts[(i + 1) % pts.len()];
+                        d = d.min(seg_dist(q, *a, b));
+                        if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < a[0] + (q[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]) {
+                            inside = !inside;
+                        }
+                    }
+                    if inside { -d } else { d }
+                }
+                Slot::Island { c, hx, hy, ri } => rounded_rect_dist(q, *c, *hx, *hy, 0.0).max(ri - (q[0] - c[0]).hypot(q[1] - c[1])),
+            }
+        }
+
+        /// Its walls, a point every `step` (a cross: each arm's outline less what lies inside
+        /// the other arm).
+        fn outline(&self, step: f64) -> Vec<[f64; 2]> {
+            use std::f64::consts::PI;
+            match self {
+                Slot::Rects { c, halves, r } => halves
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, h)| {
+                        let others: Vec<[f64; 2]> = halves.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| *o).collect();
+                        rounded_rect_outline(*c, h[0], h[1], *r, step)
+                            .into_iter()
+                            .filter(move |q| others.iter().all(|o| rounded_rect_dist(*q, *c, o[0], o[1], *r) >= -1e-9))
+                    })
+                    .collect(),
+                Slot::Straight { a, b, hw } => {
+                    let dir = (b[1] - a[1]).atan2(b[0] - a[0]);
+                    let (nx, ny) = (-dir.sin() * hw, dir.cos() * hw);
+                    let mut out = seg_points([a[0] + nx, a[1] + ny], [b[0] + nx, b[1] + ny], step);
+                    out.extend(seg_points([a[0] - nx, a[1] - ny], [b[0] - nx, b[1] - ny], step));
+                    out.extend(arc_points(*b, *hw, dir - PI / 2.0, PI, step));
+                    out.extend(arc_points(*a, *hw, dir + PI / 2.0, PI, step));
+                    out
+                }
+                Slot::Curved { c, rad, from, sweep, hw } => {
+                    let mut out = arc_points(*c, rad + hw, *from, *sweep, step);
+                    out.extend(arc_points(*c, rad - hw, *from, *sweep, step));
+                    let end = |a: f64| [c[0] + rad * a.cos(), c[1] + rad * a.sin()];
+                    out.extend(arc_points(end(from + sweep), *hw, from + sweep, PI, step));
+                    out.extend(arc_points(end(*from), *hw, from + PI, PI, step));
+                    out
+                }
+                Slot::Polygon(pts) => pts.iter().enumerate().flat_map(|(i, a)| seg_points(*a, pts[(i + 1) % pts.len()], step)).collect(),
+                Slot::Island { c, hx, hy, ri } => {
+                    let mut out = rounded_rect_outline(*c, *hx, *hy, 0.0, step);
+                    out.extend(arc_points(*c, *ri, 0.0, 2.0 * PI, step));
+                    out
+                }
+            }
+        }
+
+        fn bounds(&self) -> ([f64; 2], [f64; 2]) {
+            self.outline(0.05).iter().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(lo, hi), p| {
+                ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])])
+            })
+        }
+    }
+
+    /// Adaptive on the slot test parts (tests/cam: slot-plate, stepped-slot, cross-slot,
+    /// odd-slots) with a Ø6 cutter, 0.9 mm stepover, 3 mm stepdown: for each slot, replayed on a
+    /// 0.05 mm grid round it at its last roughing level (0.2 above its floor; −0.2 through),
+    /// engagement stays within the 90° default, every point the cutter can reach (within 3 of a
+    /// point 3.2 inside the wall) is cut, and the centre stays 3.2 from the wall. A cross's reach
+    /// is its two arms'; a sharp corner's tip is out of reach.
     #[test]
     fn adaptive_clears_the_slot_test_parts() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/cam");
@@ -1162,16 +1307,12 @@ mod adaptive_tests {
             levels.dedup();
             for feat in part["features"].as_array().unwrap().iter().filter(|f| f["kind"] == "pocket" || f["kind"] == "cutout") {
                 let c = [feat["center"][0].as_f64().unwrap(), feat["center"][1].as_f64().unwrap()];
-                let r = feat["corner_radius"].as_f64().unwrap();
-                let rects: Vec<[f64; 2]> = match feat.get("arms") {
-                    Some(arms) => arms.as_array().unwrap().iter().map(|a| [a[0].as_f64().unwrap() / 2.0, a[1].as_f64().unwrap() / 2.0]).collect(),
-                    None => vec![[feat["size"][0].as_f64().unwrap() / 2.0, feat["size"][1].as_f64().unwrap() / 2.0]],
-                };
+                let slot = Slot::from_feature(feat);
                 let z = if feat["kind"] == "cutout" { -0.2 } else { feat["floor_z"].as_f64().unwrap() + 0.2 };
                 let z = *levels.iter().find(|l| (**l - z).abs() < 1e-6).unwrap_or_else(|| panic!("{name}: no roughing level at {z}: {levels:?}"));
                 let above = levels.iter().copied().filter(|l| *l > z + 1e-9).fold(top, f64::min);
-                let (hx, hy) = rects.iter().fold((0.0f64, 0.0f64), |(a, b), r| (a.max(r[0]), b.max(r[1])));
-                let grid = Replay::over([c[0] - hx - 4.0, c[1] - hy - 4.0], [c[0] + hx + 4.0, c[1] + hy + 4.0], 0.05);
+                let (lo, hi) = slot.bounds();
+                let grid = Replay::over([lo[0] - 4.0, lo[1] - 4.0], [hi[0] + 4.0, hi[1] + 4.0], 0.05);
                 let seen = replay_level_on(&sampled, z, above, grid);
                 let mut e: Vec<f64> = seen.engaged.iter().map(|e| e.0).collect();
                 assert!(!e.is_empty(), "{name}: nothing cut at {z} in the slot at {c:?}");
@@ -1187,22 +1328,8 @@ mod adaptive_tests {
                 } else {
                     assert!(p99 <= 90.0 && max <= 96.0, "{name}, slot at {c:?}, level {z}: p99 {p99:.1}°, max {max:.1}°");
                 }
-                // the slot shrunk by the cutter and the stock to leave, per arm
-                let reach = |q: [f64; 2]| {
-                    rects.iter().map(|h| rounded_rect_dist(q, c, h[0] - 3.2, h[1] - 3.2, (r - 3.2).max(0.0))).fold(f64::INFINITY, f64::min)
-                };
-                // the gouge check uses the slot's true outline: a cross's arms, each with its
-                // rounded ends, less what lies inside the other arm (sampled every 0.02 mm)
-                let outline: Vec<[f64; 2]> = rects
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(i, h)| {
-                        let others: Vec<[f64; 2]> = rects.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| *o).collect();
-                        rounded_rect_outline(c, h[0], h[1], r, 0.02)
-                            .into_iter()
-                            .filter(move |q| others.iter().all(|o| rounded_rect_dist(*q, c, o[0], o[1], r) >= -1e-9))
-                    })
-                    .collect();
+                // the gouge check uses the slot's true outline, sampled every 0.02 mm
+                let outline = slot.outline(0.02);
                 // outline points by 1 mm cell: a centre need only look at the cells within 4 mm
                 let mut cells: std::collections::HashMap<(i64, i64), Vec<[f64; 2]>> = Default::default();
                 for o in &outline {
@@ -1226,19 +1353,50 @@ mod adaptive_tests {
                         assert!(d >= 3.2 - 0.02, "{name}: the centre at {:?} is {d:.3} from the slot's wall", s.p);
                     }
                 }
-                let mut x = c[0] - hx;
-                while x <= c[0] + hx {
-                    let mut y = c[1] - hy;
-                    while y <= c[1] + hy {
-                        // 0.05 of slack: the region is built from offsets drawn as chords within
-                        // 0.01 and paths within 0.005, so its rounded corners sit a little inside
-                        if reach([x, y]) <= 3.0 - 0.05 {
-                            assert!(seen.replay.is_cut(x, y), "{name}: ({x:.2}, {y:.2}) in the slot at {c:?} is left uncut at {z}");
+                // Where the cutter can reach: within 3 of a centre 3.2 inside the wall. A point that
+                // deep is itself reached; any other is near the edge of the centres' region, so
+                // only centres on that edge (3.2 to 3.3 deep, every 0.1) are stamped, each with
+                // the points within 2.95 of it (0.05 of slack: the planner's region is built from
+                // offsets drawn as chords within 0.01 and paths within 0.005, so its rounded
+                // corners sit a little inside).
+                let h = 0.1;
+                let (gx, gy) = (((hi[0] - lo[0]) / h).ceil() as usize + 1, ((hi[1] - lo[1]) / h).ceil() as usize + 1);
+                let mut reach = vec![false; gx * gy];
+                let k = (2.95 / h).ceil() as i64;
+                for i in 0..gx {
+                    for j in 0..gy {
+                        let p = [lo[0] + i as f64 * h, lo[1] + j as f64 * h];
+                        let d = slot.sdf(p);
+                        if !(-3.3..=-3.2).contains(&d) {
+                            continue;
                         }
-                        y += 0.4;
+                        for di in -k..=k {
+                            for dj in -k..=k {
+                                let (ii, jj) = (i as i64 + di, j as i64 + dj);
+                                if ii >= 0
+                                    && jj >= 0
+                                    && (ii as usize) < gx
+                                    && (jj as usize) < gy
+                                    && ((di * di + dj * dj) as f64) * h * h <= 2.95 * 2.95
+                                {
+                                    reach[ii as usize * gy + jj as usize] = true;
+                                }
+                            }
+                        }
                     }
-                    x += 0.4;
                 }
+                let mut checked = 0;
+                for i in 0..gx {
+                    for j in 0..gy {
+                        let (x, y) = (lo[0] + i as f64 * h, lo[1] + j as f64 * h);
+                        if (i % 4 != 0 || j % 4 != 0) || !(slot.sdf([x, y]) <= -3.2 || reach[i * gy + j]) {
+                            continue;
+                        }
+                        checked += 1;
+                        assert!(seen.replay.is_cut(x, y), "{name}: ({x:.2}, {y:.2}) in the slot at {c:?} is left uncut at {z}");
+                    }
+                }
+                assert!(checked > 100, "{name}: only {checked} points checked in the slot at {c:?}");
             }
         }
     }
