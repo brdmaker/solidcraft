@@ -202,6 +202,61 @@ fn clear_rings(b: &mut PathBuilder, rings: &[Ring], allowed: &Area, z: f64, from
     }
 }
 
+/// A pocket corner the finishing tool can't reach into: its tip, the lowest height it was
+/// found at and how far the material left reaches into it.
+struct Corner {
+    at: [f64; 2],
+    z_low: f64,
+    depth: f64,
+}
+
+/// Material a tool of radius `rt` leaves at height `z`: where `pocket` is not covered by the
+/// tool anywhere its centre may go (`allowed`). Each piece of it reaching more than 0.05 mm past
+/// what the tool covers (more than the chords of a curved wall leave), beside it, is a corner
+/// tighter than the tool: its tip is the point farthest in. Corners found at several heights
+/// are one.
+fn unreached_corners(pocket: &Area, allowed: &Area, rt: f64, z: f64, corners: &mut Vec<Corner>) -> Result<()> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let covered = allowed.offset(rt, PATH_TOL)?;
+    let edges: Vec<([f64; 2], [f64; 2])> = covered.rings().flat_map(crate::region::ring_edges).collect();
+    let dist = |p: [f64; 2]| {
+        edges
+            .iter()
+            .map(|(a, b)| {
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let l2 = dx * dx + dy * dy;
+                let t = if l2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                (a[0] + t * dx - p[0]).hypot(a[1] + t * dy - p[1])
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    // past 0.05 mm: the hairlines along walls, where two regions' chords disagree, drop out
+    // and each corner is a piece of its own
+    for shape in &pocket.difference(&covered.offset(0.05, PATH_TOL)?)?.shapes {
+        let d: Vec<([f64; 2], f64)> = shape.iter().flatten().map(|p| (*p, dist(*p))).collect();
+        let Some(&(tip, depth)) = d.iter().max_by(|a, b| a.1.total_cmp(&b.1)) else { continue };
+        let nearest = d.iter().map(|(_, x)| *x).fold(f64::INFINITY, f64::min);
+        // a corner's leftover lies beside what the tool covers and is a wedge: a corner of
+        // angle a leaves r²(cot(a/2) − (π − a)/2) over a depth of r(1/sin(a/2) − 1), 1.25
+        // depth² at 90° and still 0.19 depth² at 20°; slivers away from every wall the tool
+        // finishes are far thinner
+        let area = Area { shapes: vec![shape.clone()] }.area();
+        if nearest > 0.05 + 0.02 || area < 0.02 * depth * depth {
+            continue;
+        }
+        match corners.iter_mut().find(|c| (c.at[0] - tip[0]).hypot(c.at[1] - tip[1]) < 0.01) {
+            Some(c) => {
+                c.z_low = c.z_low.min(z);
+                c.depth = c.depth.max(depth);
+            }
+            None => corners.push(Corner { at: tip, z_low: z, depth }),
+        }
+    }
+    Ok(())
+}
+
 /// Plan one part.
 pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
     let st = &job.strategy;
@@ -336,12 +391,14 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         }
         let mut wb = PathBuilder::new(cx.h, [0.0, 0.0]);
         let mut from = f.top_z;
+        let mut corners: Vec<Corner> = Vec::new();
         for z in levels(f.top_z, &targets, t.stepdown()) {
             let pocket = cx.pocket(z)?;
             let allowed = pocket.offset(-rt, PATH_TOL)?;
             if allowed.is_empty() && !pocket.is_empty() {
                 cx.warn(format!("{label}: a pocket at z {z:.3} is narrower than T{} (Ø{}) can finish", t.number, t.diameter));
             }
+            unreached_corners(&pocket, &allowed, rt, z, &mut corners)?;
             let walls: Vec<Ring> = allowed.rings().cloned().collect();
             for r in &walls {
                 let r = climb_inside(r);
@@ -356,6 +413,12 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         }
         if !wb.moves.is_empty() {
             ops.push(cx.op(OpKind::WallFinish, "walls", t, wb.moves));
+        }
+        for c in &corners {
+            cx.warn(format!(
+                "{label}: T{} (Ø{}) can't reach into the pocket corner at ({:.2}, {:.2}) down to z {:.3}: it leaves material up to {:.2} mm into the corner (rounded R{} where the design is sharper); a smaller finishing tool reaches further",
+                t.number, t.diameter, c.at[0], c.at[1], c.z_low, c.depth, rt
+            ));
         }
     }
 

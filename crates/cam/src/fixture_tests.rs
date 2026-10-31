@@ -318,6 +318,66 @@ fn plan_fixture(i: usize, thickness: f64) -> (crate::part::PartFeatures, crate::
     (f, plan)
 }
 
+/// Pocket corners sharper than the finishing tool (T2, Ø3) are warned about, each once, down to
+/// its pocket's floor, with how far material is left into it: r(1/sin(a/2) − 1) for a corner of
+/// angle a and r 1.5. odd-slots has twelve: the L's five 90° corners (its sixth, at (−42, −38),
+/// points into the pocket and is cut), the island pocket's four, and the triangle's (base
+/// angles atan(30/15) = 63.43°, apex 53.13°). The other test parts have none: their corners are
+/// rounded R2 or more, and a cross's or an island's corners point into the pocket. Roughing by
+/// offsets keeps the test quick.
+#[test]
+fn corners_too_sharp_for_the_finishing_tool_are_warned_about() {
+    let depth = |a_deg: f64| 1.5 * (1.0 / (a_deg.to_radians() / 2.0).sin() - 1.0);
+    let base = (30.0f64 / 15.0).atan().to_degrees();
+    let want: Vec<([f64; 2], f64, f64)> = vec![
+        ([-70.0, -50.0], 5.0, depth(90.0)),
+        ([-30.0, -50.0], 5.0, depth(90.0)),
+        ([-30.0, -10.0], 5.0, depth(90.0)),
+        ([-42.0, -10.0], 5.0, depth(90.0)),
+        ([-70.0, -38.0], 5.0, depth(90.0)),
+        ([40.0, -50.0], 5.0, depth(90.0)),
+        ([76.0, -50.0], 5.0, depth(90.0)),
+        ([76.0, -20.0], 5.0, depth(90.0)),
+        ([40.0, -20.0], 5.0, depth(90.0)),
+        ([0.0, -50.0], 4.0, depth(base)),
+        ([30.0, -50.0], 4.0, depth(base)),
+        ([15.0, -20.0], 4.0, depth(180.0 - 2.0 * base)),
+    ];
+    for i in 0..expected()["parts"].as_array().unwrap().len() {
+        let part = &expected()["parts"][i];
+        let read = solidcraft_kernel::step_import(
+            &std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap(),
+        )
+        .unwrap();
+        let f = crate::part::read_part(&read.bodies[0].body).unwrap();
+        let thickness = part["stock_thickness"].as_f64().unwrap();
+        let job = crate::job::Job::from_json(&format!(
+            r#"{{"stock": {{"size": [600, 400], "thickness": {thickness}}}, "tools": {TOOLS},
+                "strategy": {{"roughing": {{"pattern": "offset"}}}}, "parts": [{{"body": "P"}}]}}"#
+        ))
+        .unwrap();
+        let plan = crate::plan::plan_part(&f, &job, "P").unwrap();
+        let got: Vec<&String> = plan.warnings.iter().filter(|w| w.contains("pocket corner")).collect();
+        let name = part["design"].as_str().unwrap();
+        if name != "odd-slots.sc" {
+            assert!(got.is_empty(), "{name}: {got:#?}");
+            continue;
+        }
+        assert_eq!(got.len(), want.len(), "{name}: {got:#?}");
+        for (at, z, d) in &want {
+            let text =
+                format!("T2 (Ø3) can't reach into the pocket corner at ({:.2}, {:.2}) down to z {z:.3}: it leaves material up to ", at[0], at[1]);
+            // −0.00 prints for a coordinate a hair below zero
+            let alt = text.replace("(0.00,", "(-0.00,");
+            let w = got.iter().find(|w| w.contains(&text) || w.contains(&alt)).unwrap_or_else(|| panic!("{name}: no warning \"{text}\": {got:#?}"));
+            // within the paths' tolerance (the covered region's arcs are drawn as chords inside
+            // them, 0.005) and the printing's
+            let left: f64 = w.split("up to ").nth(1).and_then(|r| r.split(' ').next()).unwrap().parse().unwrap();
+            assert!((left - d).abs() <= 0.01, "{name}: {left} mm left at {at:?}, worked out {d:.4}");
+        }
+    }
+}
+
 fn ops_of(plan: &crate::plan::PartPlan, kind: crate::toolpath::OpKind) -> Vec<&crate::toolpath::Operation> {
     plan.ops.iter().filter(|o| o.kind == kind).collect()
 }

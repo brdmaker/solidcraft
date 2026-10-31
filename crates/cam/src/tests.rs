@@ -508,11 +508,17 @@ mod plan_tests {
 
     /// Roughing stays 3 + 0.2 mm off the pocket's walls and 0.2 mm above its floor; feeds below
     /// the top only inside the pocket; rapids that move sideways only at the clearance height.
+    /// The only warnings are the pocket's four sharp corners, where the Ø6 tool (also the
+    /// finishing tool) leaves 3(√2 − 1) = 1.24 mm.
     #[test]
     fn roughing_keeps_the_stock_to_leave() {
         let f = read_part(&pocket_plate()).unwrap();
         let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(plan.warnings.len(), 4, "{:?}", plan.warnings);
+        for (x, y) in [(-15.0, -10.0), (-15.0, 10.0), (15.0, -10.0), (15.0, 10.0)] {
+            let text = format!("corner at ({x:.2}, {y:.2}) down to z 6.000: it leaves material up to 1.24 mm");
+            assert!(plan.warnings.iter().any(|w| w.contains(&text)), "{text}: {:?}", plan.warnings);
+        }
         let rough = op(&plan.ops, OpKind::Roughing);
         let pts = sample(rough, [0.0, 0.0, 15.0]);
         assert!(pts.iter().all(|a| !a.drill), "roughing has no drilling cycles");
@@ -895,9 +901,11 @@ mod adaptive_tests {
         la >= 0.5 || turn > 5f64.to_radians()
     }
 
-    /// What the replay saw on the level at `z`: each sample's engagement, and the grid after.
+    /// What the replay saw on the level at `z`: each sample's engagement and where it was, and
+    /// the grid after.
     struct Seen {
         engaged: Vec<(f64, usize, usize)>,
+        at: Vec<[f64; 3]>,
         replay: Replay,
     }
 
@@ -910,6 +918,7 @@ mod adaptive_tests {
     /// marked), so the grid should cover the pocket with a cutter's radius to spare.
     fn replay_level_on(all: &[Vec<Sample>], z: f64, above: f64, mut r: Replay) -> Seen {
         let mut engaged = Vec::new();
+        let mut at = Vec::new();
         for st in all {
             // positions are marked cut once the tool is 1 mm further along: nearer ones would
             // cover the forward ring (anything within 0.2 r behind does) and hide the cut
@@ -946,6 +955,7 @@ mod adaptive_tests {
                 }
                 let e = r.engagement(s.p, s.dir, 3.0);
                 engaged.push(e);
+                at.push(s.p);
                 trail.push_back((s.p, along));
             }
             let rest: Vec<[f64; 3]> = trail.into_iter().map(|(p, _)| p).collect();
@@ -958,7 +968,7 @@ mod adaptive_tests {
                 last_stamped = Some(*p);
             }
         }
-        Seen { engaged, replay: r }
+        Seen { engaged, at, replay: r }
     }
 
     /// The pocket's region the cutter's centre may reach at a level: the 40 × 24 pocket shrunk
@@ -1068,6 +1078,39 @@ mod adaptive_tests {
         assert!(left_both < 0.9, "both ways: {:.1} % climb", left_both * 100.0);
         let (t_one, t_both) = (minutes(&one, 5000.0), minutes(&both, 5000.0));
         assert!(t_both < t_one, "both ways takes {t_both:.2} min, one way {t_one:.2}");
+    }
+
+    /// An L-shaped pocket (a 50 × 12 arm along x and a 12 × 30 arm along y, meeting at the
+    /// right-hand end) is cleared arm by arm: at each level, following the samples that cut
+    /// (engaged over 10°), the tool passes between the arms' far parts (more than a cutter's
+    /// diameter past the corner square) only a few times, not on every pass.
+    #[test]
+    fn adaptive_clears_an_l_arm_by_arm() {
+        let op = roughing(&plate(&[[-25.0, -15.0, 25.0, -3.0], [13.0, -15.0, 25.0, 15.0]]), &job(""));
+        for (z, above) in [(7.1, 10.0), (4.2, 7.1)] {
+            let seen = replay_level(&op, z, above);
+            // the corner square is x 13..25, y −15..−3: the far part of the x arm lies left of
+            // x 7, of the y arm above y 3
+            let arm = |p: [f64; 3]| {
+                if p[0] < 7.0 {
+                    Some(0)
+                } else if p[1] > 3.0 {
+                    Some(1)
+                } else {
+                    None
+                }
+            };
+            let mut seq: Vec<u8> = Vec::new();
+            for (e, p) in seen.engaged.iter().zip(&seen.at) {
+                if let (true, Some(a)) = (e.0 > 10.0, arm(*p))
+                    && seq.last() != Some(&a)
+                {
+                    seq.push(a);
+                }
+            }
+            assert!(seq.contains(&0) && seq.contains(&1), "level {z}: both arms cut: {seq:?}");
+            assert!(seq.len() <= 4, "level {z}: the tool goes between the arms {} times", seq.len() - 1);
+        }
     }
 
     /// Links take the quickest way for the machine's rapid speed: with fast rapids the tool goes
@@ -1288,7 +1331,8 @@ mod adaptive_tests {
             let plan = plan_part(&read_part(&body).unwrap(), &j, "P").unwrap();
             // only slots features.json says must be slotted may warn, and those must
             let slotted: Vec<&serde_json::Value> = part["features"].as_array().unwrap().iter().filter(|f| f["adaptive"] == "slotting").collect();
-            assert_eq!(plan.warnings.len(), slotted.len(), "{name}: {:?}", plan.warnings);
+            let adaptive_notes = plan.warnings.iter().filter(|w| w.contains("adaptive:")).count();
+            assert_eq!(adaptive_notes, slotted.len(), "{name}: {:?}", plan.warnings);
             let op = plan.ops.iter().find(|o| o.kind == OpKind::Roughing).unwrap();
             let sampled = strokes(op);
             // the levels the roughing cuts at: heights of moves that stay level (a helix moves

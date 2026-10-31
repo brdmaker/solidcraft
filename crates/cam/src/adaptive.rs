@@ -225,15 +225,99 @@ fn most_open(shape: &Area, step: f64) -> Result<([f64; 2], f64)> {
 
 /// The open stretches of `next`'s boundary not already run (inside `visited` grown by `tol`),
 /// each climbing: the uncut side on the left.
-fn fronts(next: &Area, visited: &Area, tol: f64, spacing: f64) -> Result<Vec<Vec<[f64; 2]>>> {
-    let grown = visited.offset(tol, 0.01)?;
+/// An area's edges by grid cell, to tell quickly whether a point lies within `tol` of them.
+struct EdgeGrid {
+    x0: f64,
+    y0: f64,
+    cell: f64,
+    nx: usize,
+    ny: usize,
+    tol: f64,
+    edges: Vec<([f64; 2], [f64; 2])>,
+    cells: Vec<Vec<usize>>,
+}
+
+impl EdgeGrid {
+    fn new(area: &Area, tol: f64) -> EdgeGrid {
+        let edges: Vec<([f64; 2], [f64; 2])> = area.rings().flat_map(crate::region::ring_edges).collect();
+        let (lo, hi) = area.bounds().unwrap_or(([0.0, 0.0], [0.0, 0.0]));
+        // about as many cells as edges, at most 1000 a side
+        let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-3);
+        let cell = (span / (edges.len() as f64).sqrt().clamp(1.0, 1000.0)).max(tol * 4.0).max((span + 4.0 * tol) / 999.0).max(1e-3);
+        let (x0, y0) = (lo[0] - 2.0 * tol, lo[1] - 2.0 * tol);
+        let nx = (((hi[0] - lo[0] + 4.0 * tol) / cell).ceil() as usize).clamp(1, 1000);
+        let ny = (((hi[1] - lo[1] + 4.0 * tol) / cell).ceil() as usize).clamp(1, 1000);
+        let mut g = EdgeGrid { x0, y0, cell, nx, ny, tol, edges, cells: vec![Vec::new(); nx * ny] };
+        for (k, (a, b)) in g.edges.iter().enumerate() {
+            let (i0, j0) = g.index([a[0].min(b[0]) - tol, a[1].min(b[1]) - tol]);
+            let (i1, j1) = g.index([a[0].max(b[0]) + tol, a[1].max(b[1]) + tol]);
+            for i in i0..=i1 {
+                for j in j0..=j1 {
+                    if let Some(c) = g.cells.get_mut(i * ny + j) {
+                        c.push(k);
+                    }
+                }
+            }
+        }
+        g
+    }
+
+    fn index(&self, p: [f64; 2]) -> (usize, usize) {
+        let i = ((p[0] - self.x0) / self.cell).floor().clamp(0.0, (self.nx - 1) as f64) as usize;
+        let j = ((p[1] - self.y0) / self.cell).floor().clamp(0.0, (self.ny - 1) as f64) as usize;
+        (i, j)
+    }
+
+    /// Is `p` within `tol` of an edge?
+    fn near(&self, p: [f64; 2]) -> bool {
+        let (i, j) = self.index(p);
+        self.cells.get(i * self.ny + j).is_some_and(|c| {
+            c.iter().filter_map(|k| self.edges.get(*k)).any(|(a, b)| {
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let l2 = dx * dx + dy * dy;
+                let t = if l2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                (a[0] + t * dx - p[0]).hypot(a[1] + t * dy - p[1]) <= self.tol
+            })
+        })
+    }
+}
+
+/// The piece of the growth from `visited` to `next` nearest `here` (by the start of one of its
+/// stretches, or either end cutting both ways) with the stretches of front that bound it; `None`
+/// when no piece has any.
+fn nearest_piece(next: &Area, visited: &Area, here: [f64; 2], tol: f64, spacing: f64, both_ways: bool) -> Result<Option<(Area, Vec<Vec<[f64; 2]>>)>> {
+    let growth = next.difference(visited)?;
+    let near_visited = EdgeGrid::new(visited, tol);
+    let d = |q: [f64; 2], r: [f64; 2]| (q[0] - r[0]).hypot(q[1] - r[1]);
+    // a piece's front: its outline where it doesn't run along the visited region's edge
+    let pieces: Vec<(Area, Vec<Vec<[f64; 2]>>)> = growth
+        .shapes
+        .iter()
+        .map(|sh| {
+            let piece = Area { shapes: vec![sh.clone()] };
+            let segs = fronts(&piece, &near_visited, spacing);
+            (piece, segs)
+        })
+        .collect();
+    let reach = |sg: &Vec<[f64; 2]>| {
+        let first = sg.first().map_or(f64::INFINITY, |q| d(*q, here));
+        let last = if both_ways { sg.last().map_or(f64::INFINITY, |q| d(*q, here)) } else { f64::INFINITY };
+        first.min(last)
+    };
+    Ok(pieces.into_iter().filter(|(_, g)| !g.is_empty()).min_by(|a, b| {
+        let near = |g: &Vec<Vec<[f64; 2]>>| g.iter().map(reach).fold(f64::INFINITY, f64::min);
+        near(&a.1).total_cmp(&near(&b.1))
+    }))
+}
+
+fn fronts(next: &Area, visited: &EdgeGrid, spacing: f64) -> Vec<Vec<[f64; 2]>> {
     let mut out = Vec::new();
     for ring in next.rings() {
         // outer rings run anticlockwise and holes clockwise: reverse both to keep the uncut
         // material (outside the region) on the left
         let rev: Ring = ring.iter().rev().copied().collect();
         let pts = densify(&rev, spacing);
-        let new: Vec<bool> = pts.iter().map(|p| !grown.contains(*p)).collect();
+        let new: Vec<bool> = pts.iter().map(|p| !visited.near(*p)).collect();
         if new.iter().all(|n| *n) {
             out.push(pts);
             continue;
@@ -261,7 +345,7 @@ fn fronts(next: &Area, visited: &Area, tol: f64, spacing: f64) -> Result<Vec<Vec
             out.push(cur);
         }
     }
-    Ok(out.into_iter().filter(|s| s.len() >= 2).collect())
+    out.into_iter().filter(|s| s.len() >= 2).collect()
 }
 
 /// Is the straight move from `a` to `b` inside `area` everywhere, checked every 0.05 mm (a
@@ -361,30 +445,44 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
     b.helix(c, rh, z, pitch, t.feed);
     cleared.stamp(c, rh + rt);
     let mut centres = Area::circle(c[0], c[1], rh, 0.01)?.intersection(shape)?;
+    // the centres grown by the full step: offsetting a union is the union of the offsets, so
+    // each piece cut adds its own offset rather than the whole region being offset again
+    let mut grown = centres.offset(step, 0.01)?;
     // the first point still over the limit at the finest step, if any
     let mut over: Option<[f64; 2]> = None;
+    // the step the last pass took: the next starts at twice that (up to the full step), not
+    // at the full step every time, where a front runs along a wall pass after pass
+    let mut last = step;
 
     for _ in 0..MAX_PASSES {
-        // The next pass at the full step; where it would engage more than the limit anywhere
-        // (where the front meets a wall or wraps round an island), the whole pass again at half
-        // the step, down to a sixteenth: smaller steps, smooth fronts.
-        let mut s = step;
-        let (next, segs) = loop {
-            let next = centres.offset(s, 0.01)?.intersection(shape)?;
-            let segs = fronts(&next, &centres, (s * 0.05).max(0.005), spacing)?;
+        // The next pass at the full step, one piece of it at a time: where the region branches
+        // (the arms of an L or a cross, the two ends of a long slot) the growth falls apart in
+        // pieces, and the tool finishes the piece nearest it, pass after pass, before moving
+        // on, instead of hopping from arm to arm every pass. Where a piece would engage more
+        // than the limit anywhere (where its front meets a wall or wraps round an island), it
+        // is grown again at half the step, down to a sixteenth: smaller steps, smooth fronts.
+        let here = [b.at[0], b.at[1]];
+        let mut s = if last * 2.0 >= step - 1e-12 { step } else { last * 2.0 };
+        let (piece, segs) = loop {
+            let next = if s == step { grown.clone() } else { centres.offset(s, 0.01)? };
+            let next = next.intersection(shape)?;
+            let Some((piece, segs)) = nearest_piece(&next, &centres, here, (s * 0.05).max(0.005), spacing, p.both_ways)? else {
+                break (Area::default(), Vec::new());
+            };
             let hot = hot_points(&segs, &cleared, rt, p.max_engagement);
             if hot.is_empty() {
-                break (next, segs);
+                break (piece, segs);
             }
             if s <= step / 16.0 + 1e-12 {
                 if over.is_none() {
                     over = hot.first().copied();
                 }
-                break (next, segs);
+                break (piece, segs);
             }
             s /= 2.0;
         };
-        if next.area() - centres.area() < 1e-6 || segs.is_empty() {
+        last = s;
+        if segs.is_empty() {
             break;
         }
         // links at depth go through the centres' region (cleared ground), checked every 0.05 mm
@@ -454,7 +552,8 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
             cleared.sweep(&sg, rt);
         }
         // repeated offsets add a vertex at every round corner: thin them out
-        centres = next.simplified(0.002)?;
+        centres = centres.union(&piece)?.simplified(0.002)?;
+        grown = piece.offset(step, 0.01).and_then(|g| grown.union(&g))?.simplified(0.002)?;
     }
     Ok(over.map(|q| {
         format!(
