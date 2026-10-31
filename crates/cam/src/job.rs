@@ -27,7 +27,71 @@ pub struct Job {
     pub nest: NestOptions,
     #[serde(default)]
     pub tools: Vec<Tool>,
+    #[serde(default)]
+    pub strategy: Strategy,
     pub parts: Vec<PartRef>,
+}
+
+/// How the toolpaths are made: which tool does what, and the cutting allowances.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Strategy {
+    /// Tool for facing and roughing (default: the largest flat end mill).
+    pub rough_tool: Option<u32>,
+    /// Tool for floors, walls and holes no drill fits (default: the smallest flat end mill).
+    pub finish_tool: Option<u32>,
+    /// Tool for cutting the parts out (default: the largest flat end mill long enough to cut
+    /// through, else the largest).
+    pub profile_tool: Option<u32>,
+    /// Tool for countersinks and chamfers (default: the first chamfer cutter).
+    pub chamfer_tool: Option<u32>,
+    /// Material roughing leaves on walls and floors for the finishing passes, mm (default 0.2).
+    pub stock_to_leave: f64,
+    /// Steepest ramp into the material, degrees from horizontal (default 3).
+    pub ramp_angle_deg: f64,
+    /// Height above the sheet for rapid moves, mm (default 5).
+    pub clearance: f64,
+    /// How far above a surface feeds start, mm (default 1).
+    pub retract: f64,
+    /// Tabs holding each part to the sheet as its outline is cut through.
+    pub tabs: Tabs,
+    /// How far below a chamfer's foot the chamfer cutter's tip goes, mm (default 0.3): the cut
+    /// uses the flank, not the fragile tip.
+    pub chamfer_tip_below: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tabs {
+    /// Tabs round each part (default 4; 0: none, as when the parts are held down otherwise).
+    pub count: u32,
+    /// Length of a tab along the outline, mm (default 6).
+    pub width: f64,
+    /// Height of a tab above the bottom of the part, mm (default 1).
+    pub height: f64,
+}
+
+impl Default for Tabs {
+    fn default() -> Self {
+        Tabs { count: 4, width: 6.0, height: 1.0 }
+    }
+}
+
+impl Default for Strategy {
+    fn default() -> Self {
+        Strategy {
+            rough_tool: None,
+            finish_tool: None,
+            profile_tool: None,
+            chamfer_tool: None,
+            stock_to_leave: 0.2,
+            ramp_angle_deg: 3.0,
+            clearance: 5.0,
+            retract: 1.0,
+            tabs: Tabs::default(),
+            chamfer_tip_below: 0.3,
+        }
+    }
 }
 
 fn one() -> u32 {
@@ -246,6 +310,36 @@ impl Job {
                 return Err(CamError::Invalid(format!("{} is a fraction of the diameter, above 0 and at most 1; it is {f}", at("stepover"))));
             }
         }
+        let st = &self.strategy;
+        length("strategy.stock_to_leave", st.stock_to_leave, 0.0)?;
+        length("strategy.clearance", st.clearance, 0.5)?;
+        length("strategy.retract", st.retract, 0.1)?;
+        length("strategy.chamfer_tip_below", st.chamfer_tip_below, 0.0)?;
+        length("strategy.tabs.width", st.tabs.width, 0.0)?;
+        length("strategy.tabs.height", st.tabs.height, 0.0)?;
+        if st.retract > st.clearance {
+            return Err(CamError::Invalid("strategy.retract must not be above strategy.clearance".into()));
+        }
+        if !(st.ramp_angle_deg.is_finite() && st.ramp_angle_deg >= 0.5 && st.ramp_angle_deg <= 90.0) {
+            return Err(CamError::Invalid(format!("strategy.ramp_angle_deg must be from 0.5 to 90; it is {}", st.ramp_angle_deg)));
+        }
+        if st.tabs.count > 100 {
+            return Err(CamError::Invalid("strategy.tabs.count: at most 100 tabs".into()));
+        }
+        for (field, n) in
+            [("rough_tool", st.rough_tool), ("finish_tool", st.finish_tool), ("profile_tool", st.profile_tool), ("chamfer_tool", st.chamfer_tool)]
+        {
+            if let Some(n) = n {
+                let want = if field == "chamfer_tool" { ToolKind::Chamfer } else { ToolKind::Flat };
+                match self.tool(n) {
+                    None => return Err(CamError::Invalid(format!("strategy.{field}: no tool T{n} in tools"))),
+                    Some(t) if t.kind != want => {
+                        return Err(CamError::Invalid(format!("strategy.{field}: T{n} is a {:?} tool, not {:?}", t.kind, want)));
+                    }
+                    _ => {}
+                }
+            }
+        }
         if self.parts.is_empty() {
             return Err(CamError::Invalid("a job needs at least one part".into()));
         }
@@ -263,6 +357,37 @@ impl Job {
             return Err(CamError::Invalid(format!("{copies} copies in all; a job cuts at most {MAX_COPIES}")));
         }
         Ok(())
+    }
+
+    fn flats(&self) -> impl Iterator<Item = &Tool> {
+        self.tools.iter().filter(|t| t.kind == ToolKind::Flat)
+    }
+
+    /// The tool for facing and roughing.
+    pub fn rough_tool(&self) -> Option<&Tool> {
+        self.strategy.rough_tool.and_then(|n| self.tool(n)).or_else(|| self.flats().max_by(|a, b| a.diameter.total_cmp(&b.diameter)))
+    }
+
+    /// The tool for finishing and for holes no drill fits.
+    pub fn finish_tool(&self) -> Option<&Tool> {
+        self.strategy.finish_tool.and_then(|n| self.tool(n)).or_else(|| self.flats().min_by(|a, b| a.diameter.total_cmp(&b.diameter)))
+    }
+
+    /// The tool for cutting parts out of the sheet.
+    pub fn profile_tool(&self) -> Option<&Tool> {
+        let through = self.stock.thickness + self.stock.spoilboard_allowance;
+        self.strategy.profile_tool.and_then(|n| self.tool(n)).or_else(|| {
+            self.flats().filter(|t| t.flute_length >= through).max_by(|a, b| a.diameter.total_cmp(&b.diameter)).or_else(|| self.rough_tool())
+        })
+    }
+
+    pub fn chamfer_tool(&self) -> Option<&Tool> {
+        self.strategy.chamfer_tool.and_then(|n| self.tool(n)).or_else(|| self.tools.iter().find(|t| t.kind == ToolKind::Chamfer))
+    }
+
+    /// A drill of `diameter` (within 0.01 mm).
+    pub fn drill(&self, diameter: f64) -> Option<&Tool> {
+        self.tools.iter().find(|t| t.kind == ToolKind::Drill && (t.diameter - diameter).abs() <= 0.01)
     }
 
     /// The tool with LinuxCNC number `n`.

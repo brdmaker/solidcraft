@@ -396,3 +396,334 @@ mod nest_tests {
         assert_eq!(nest(&st, &o, &items).placements, n.placements);
     }
 }
+
+mod plan_tests {
+    use solidcraft_geom::Vec3;
+    use solidcraft_kernel::{Body, BoolOp, boolean, box_solid, cylinder};
+
+    use crate::job::Job;
+    use crate::part::read_part;
+    use crate::plan::{PATH_TOL, plan_part};
+    use crate::region::{GRID, signed_area};
+    use crate::toolpath::{Move, OpKind, Operation};
+
+    fn v(x: f64, y: f64, z: f64) -> Vec3 {
+        Vec3::new(x, y, z)
+    }
+
+    fn cut(a: Body, b: Body) -> Body {
+        boolean(&a, &b, BoolOp::Cut).unwrap().unwrap()
+    }
+
+    /// A tool position along the moves, with the move that made it.
+    #[derive(Clone, Copy, Debug)]
+    struct At {
+        p: [f64; 3],
+        rapid: bool,
+        drill: bool,
+    }
+
+    /// Every move as tool positions: lines every 0.25 mm, arcs every 2°, drill cycles at their
+    /// bottom. Independent of how the planner built them.
+    fn sample(op: &Operation, start: [f64; 3]) -> Vec<At> {
+        let mut out = vec![At { p: start, rapid: true, drill: false }];
+        let mut cur = start;
+        for m in &op.moves {
+            match m {
+                Move::Rapid { to } | Move::Line { to, .. } => {
+                    let rapid = matches!(m, Move::Rapid { .. });
+                    let d = ((to[0] - cur[0]).powi(2) + (to[1] - cur[1]).powi(2) + (to[2] - cur[2]).powi(2)).sqrt();
+                    let n = (d / 0.25).ceil().max(1.0) as usize;
+                    for i in 1..=n {
+                        let t = i as f64 / n as f64;
+                        out.push(At {
+                            p: [cur[0] + (to[0] - cur[0]) * t, cur[1] + (to[1] - cur[1]) * t, cur[2] + (to[2] - cur[2]) * t],
+                            rapid,
+                            drill: false,
+                        });
+                    }
+                    cur = *to;
+                }
+                Move::Arc { to, center, ccw, .. } => {
+                    let r = (cur[0] - center[0]).hypot(cur[1] - center[1]);
+                    let r_end = (to[0] - center[0]).hypot(to[1] - center[1]);
+                    assert!((r - r_end).abs() < 1e-6, "arc radius changes: {r} → {r_end}");
+                    let a0 = (cur[1] - center[1]).atan2(cur[0] - center[0]);
+                    let a1 = (to[1] - center[1]).atan2(to[0] - center[0]);
+                    let tau = std::f64::consts::TAU;
+                    let mut sweep = if *ccw { (a1 - a0).rem_euclid(tau) } else { -(a0 - a1).rem_euclid(tau) };
+                    if sweep.abs() < 1e-9 {
+                        sweep = if *ccw { tau } else { -tau };
+                    }
+                    let n = (sweep.abs().to_degrees() / 2.0).ceil().max(1.0) as usize;
+                    for i in 1..=n {
+                        let t = i as f64 / n as f64;
+                        let a = a0 + sweep * t;
+                        out.push(At {
+                            p: [center[0] + r * a.cos(), center[1] + r * a.sin(), cur[2] + (to[2] - cur[2]) * t],
+                            rapid: false,
+                            drill: false,
+                        });
+                    }
+                    cur = *to;
+                }
+                Move::Drill { at, back, r, bottom, .. } => {
+                    assert!((cur[0] - at[0]).hypot(cur[1] - at[1]) < 1e-9 && (cur[2] - back).abs() < 1e-9, "a cycle starts where the tool is");
+                    out.push(At { p: [at[0], at[1], *r], rapid: true, drill: false });
+                    out.push(At { p: [at[0], at[1], *bottom], rapid: false, drill: true });
+                    cur = [at[0], at[1], *back];
+                    out.push(At { p: cur, rapid: true, drill: false });
+                }
+            }
+        }
+        out
+    }
+
+    fn op(ops: &[Operation], kind: OpKind) -> &Operation {
+        ops.iter().find(|o| o.kind == kind).unwrap_or_else(|| panic!("no {kind:?} operation: {:?}", ops.iter().map(|o| o.kind).collect::<Vec<_>>()))
+    }
+
+    /// Distance from (x, y) to the outside of the axis-aligned box [x0, x1] × [y0, y1]: negative inside.
+    fn rect_dist(p: [f64; 3], x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+        let dx = (x0 - p[0]).max(p[0] - x1);
+        let dy = (y0 - p[1]).max(p[1] - y1);
+        if dx <= 0.0 && dy <= 0.0 { dx.max(dy) } else { dx.max(0.0).hypot(dy.max(0.0)) }
+    }
+
+    fn job(tools: &str, thickness: f64, extra: &str) -> Job {
+        Job::from_json(&format!(
+            r#"{{"stock": {{"size": [300, 300], "thickness": {thickness}}}, "tools": [{tools}], "parts": [{{"body": "P"}}] {extra}}}"#
+        ))
+        .unwrap()
+    }
+
+    const FLAT6: &str =
+        r#"{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3}"#;
+
+    /// A 60 × 40 × 10 plate with a 30 × 20 pocket 4 deep in the middle (floor at z 6).
+    fn pocket_plate() -> Body {
+        let b = box_solid(v(-30.0, -20.0, 0.0), v(30.0, 20.0, 10.0)).unwrap();
+        cut(b, box_solid(v(-15.0, -10.0, 6.0), v(15.0, 10.0, 11.0)).unwrap())
+    }
+
+    /// Roughing stays 3 + 0.2 mm off the pocket's walls and 0.2 mm above its floor; feeds below
+    /// the top only inside the pocket; rapids that move sideways only at the clearance height.
+    #[test]
+    fn roughing_keeps_the_stock_to_leave() {
+        let f = read_part(&pocket_plate()).unwrap();
+        let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        let rough = op(&plan.ops, OpKind::Roughing);
+        let pts = sample(rough, [0.0, 0.0, 15.0]);
+        assert!(pts.iter().all(|a| !a.drill), "roughing has no drilling cycles");
+        let cutting: Vec<&At> = pts.iter().filter(|a| !a.rapid && a.p[2] < 10.0 - 1e-9).collect();
+        assert!(!cutting.is_empty());
+        for a in &cutting {
+            let d = rect_dist(a.p, -15.0, -10.0, 15.0, 10.0);
+            assert!(d <= -(3.2 - PATH_TOL - 1e-6), "roughing at {:?} is {} from the pocket wall", a.p, -d);
+        }
+        let low = cutting.iter().map(|a| a.p[2]).fold(f64::INFINITY, f64::min);
+        assert!((low - 6.2).abs() < 1e-9, "roughing reaches {low}");
+        // levels: 10 → 6.2 in steps of at most 3 (3.8 / 2 = 1.9 each)
+        let mut zs: Vec<f64> = cutting.iter().map(|a| (a.p[2] * 1e6).round() / 1e6).collect();
+        zs.dedup();
+        assert!(zs.contains(&8.1) && zs.contains(&6.2), "{zs:?}");
+        check_rapids(rough, 15.0);
+    }
+
+    /// Sideways rapids only at the clearance height; down at rapid never below the retract height
+    /// above the sheet's top (10 + 1 here, or the level just cut).
+    fn check_rapids(op: &Operation, clearance: f64) {
+        let mut at = [0.0, 0.0, clearance];
+        for m in &op.moves {
+            if let Move::Rapid { to } = m {
+                let sideways = (to[0] - at[0]).hypot(to[1] - at[1]) > 1e-9;
+                if sideways {
+                    assert!((to[2] - clearance).abs() < 1e-9 && (at[2] - clearance).abs() < 1e-9, "rapid across at z {} → {}: {m:?}", at[2], to[2]);
+                }
+            }
+            at = m.end();
+        }
+    }
+
+    /// The floor pass runs exactly on the floor and reaches every point of it a Ø6 tool can
+    /// reach: the pocket less its four corner squares (3 × 3, where the round tool can't go).
+    #[test]
+    fn the_floor_is_finished_at_its_height_and_covered() {
+        let f = read_part(&pocket_plate()).unwrap();
+        let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
+        let pts = sample(op(&plan.ops, OpKind::FloorFinish), [0.0, 0.0, 15.0]);
+        let floor: Vec<[f64; 3]> = pts.iter().filter(|a| !a.rapid && (a.p[2] - 6.0).abs() < 1e-9).map(|a| a.p).collect();
+        assert!(!floor.is_empty());
+        for p in &floor {
+            assert!(rect_dist(*p, -15.0, -10.0, 15.0, 10.0) <= -(3.0 - PATH_TOL - 1e-6), "floor pass at {p:?} cuts the wall");
+        }
+        assert!(pts.iter().all(|a| a.p[2] >= 6.0 - 1e-9), "nothing below the floor");
+        let mut x: f64 = -15.0 + 0.05;
+        while x < 15.0 {
+            let mut y: f64 = -10.0 + 0.05;
+            while y < 10.0 {
+                let corner = (x.abs() > 12.0) && (y.abs() > 7.0);
+                if !corner {
+                    let near = floor.iter().any(|p| (p[0] - x).hypot(p[1] - y) <= 3.0 + 0.01);
+                    assert!(near, "the floor point ({x:.2}, {y:.2}) is left uncut");
+                }
+                y += 0.5;
+            }
+            x += 0.5;
+        }
+    }
+
+    /// The wall pass runs exactly 3 mm (the tool's radius) inside each wall, clockwise round the
+    /// pocket (wall on the left: climb milling), and down to the floor.
+    #[test]
+    fn walls_are_finished_climbing_at_the_tool_radius() {
+        let f = read_part(&pocket_plate()).unwrap();
+        let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
+        let walls = op(&plan.ops, OpKind::WallFinish);
+        let pts = sample(walls, [0.0, 0.0, 15.0]);
+        let at6: Vec<[f64; 2]> = pts.iter().filter(|a| !a.rapid && (a.p[2] - 6.0).abs() < 1e-9).map(|a| [a.p[0], a.p[1]]).collect();
+        assert!(!at6.is_empty(), "the walls are finished down to the floor");
+        for p in &at6 {
+            let d = rect_dist([p[0], p[1], 0.0], -15.0, -10.0, 15.0, 10.0);
+            assert!((d + 3.0).abs() <= PATH_TOL + 1e-6, "wall pass at {p:?} is {} from the wall", -d);
+        }
+        assert!(signed_area(&at6) < 0.0, "clockwise round the pocket");
+        for side in [[-12.0, 0.0], [12.0, 0.0], [0.0, -7.0], [0.0, 7.0]] {
+            assert!(
+                at6.iter().any(|p| (p[0] - side[0]).abs() < 0.3 && (p[1] - side[1]).abs() < 0.3
+                    || (side[0] == 0.0 && (p[1] - side[1]).abs() < 1e-6)
+                    || (side[1] == 0.0 && (p[0] - side[0]).abs() < 1e-6)),
+                "no pass along the wall at {side:?}"
+            );
+        }
+    }
+
+    /// The profile runs 3 mm outside the outline, anticlockwise (part on the left), down to the
+    /// spoilboard allowance (−0.2), except over four tabs 1 mm high and 6 + 6 mm long.
+    #[test]
+    fn the_profile_cuts_through_round_four_tabs() {
+        let f = read_part(&pocket_plate()).unwrap();
+        let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
+        let prof = op(&plan.ops, OpKind::Profile);
+        let pts = sample(prof, [0.0, 0.0, 15.0]);
+        let cutting: Vec<[f64; 3]> = pts.iter().filter(|a| !a.rapid && a.p[2] < 10.0 - 1e-9).map(|a| a.p).collect();
+        for p in &cutting {
+            let d = rect_dist(*p, -30.0, -20.0, 30.0, 20.0);
+            assert!((d - 3.0).abs() <= PATH_TOL + 1e-6, "profile at {p:?} is {d} from the outline");
+        }
+        let low = cutting.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min);
+        assert!((low + 0.2).abs() < 1e-9, "through to {low}");
+        // the deepest pass: the stretches still at tab height
+        let deepest: Vec<[f64; 3]> = cutting.iter().copied().filter(|p| p[2] < 1.0 + 1e-9).collect();
+        let ring: Vec<[f64; 2]> = deepest.iter().map(|p| [p[0], p[1]]).collect();
+        assert!(signed_area(&ring) > 0.0, "anticlockwise round the part");
+        let mut tabs = 0;
+        let mut on = false;
+        let mut tab_len = 0.0;
+        let mut lens = Vec::new();
+        for w in deepest.windows(2) {
+            let up = (w[1][2] - 1.0).abs() < 1e-9 && (w[0][2] - 1.0).abs() < 1e-9;
+            if up {
+                tab_len += (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
+            }
+            if up && !on {
+                tabs += 1;
+            }
+            if !up && on {
+                lens.push(tab_len);
+                tab_len = 0.0;
+            }
+            on = up;
+        }
+        assert_eq!(tabs, 4, "four tabs");
+        for l in &lens {
+            assert!((l - 12.0).abs() < 0.3, "a tab {l} long (6 + the 6 mm cutter)");
+        }
+        check_rapids(prof, 15.0);
+    }
+
+    /// A Ø10 through hole: with a Ø10 drill it is one drilling cycle at its centre, down past the
+    /// spoilboard allowance by the drill's point (5 / tan 59°); without one, the Ø6 mill cuts it
+    /// with circles no wider than 10 − 6 across, through to −0.2.
+    #[test]
+    fn a_through_hole_is_drilled_or_milled() {
+        let b = cut(box_solid(v(0.0, 0.0, 0.0), v(40.0, 40.0, 8.0)).unwrap(), cylinder(v(20.0, 20.0, -1.0), v(0.0, 0.0, 1.0), 5.0, 10.0).unwrap());
+        let f = read_part(&b).unwrap();
+        let drill = r#"{"number": 5, "kind": "drill", "diameter": 10, "flute_length": 40, "rpm": 1500, "feed": 120, "plunge": 120, "peck": 2}"#;
+        let plan = plan_part(&f, &job(&format!("{FLAT6}, {drill}"), 8.0, ""), "P").unwrap();
+        let d = op(&plan.ops, OpKind::Drilling);
+        assert_eq!(d.tool, 5);
+        let tip = 5.0 / 59f64.to_radians().tan();
+        match d.moves.as_slice() {
+            [Move::Rapid { .. }, Move::Drill { at, r, bottom, peck, .. }] => {
+                assert!((at[0] - 20.0).abs() < 1e-6 && (at[1] - 20.0).abs() < 1e-6);
+                assert!((r - 9.0).abs() < 1e-9 && (bottom - (-0.2 - tip)).abs() < 1e-9 && *peck == Some(2.0), "{:?}", d.moves);
+            }
+            m => panic!("a rapid over the hole and one drilling cycle, not {m:?}"),
+        }
+        assert!(!plan.ops.iter().any(|o| o.kind == OpKind::HoleMilling));
+
+        let plan = plan_part(&f, &job(FLAT6, 8.0, ""), "P").unwrap();
+        let pts = sample(op(&plan.ops, OpKind::HoleMilling), [20.0, 20.0, 13.0]);
+        let cutting: Vec<[f64; 3]> = pts.iter().filter(|a| !a.rapid && a.p[2] < 8.0).map(|a| a.p).collect();
+        for p in &cutting {
+            assert!((p[0] - 20.0).hypot(p[1] - 20.0) <= 2.0 + 1e-6, "the mill at {p:?} cuts the hole's wall");
+        }
+        assert!(cutting.iter().any(|p| ((p[0] - 20.0).hypot(p[1] - 20.0) - 2.0).abs() < 1e-6), "the last circle is on the wall");
+        let low = cutting.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min);
+        assert!((low + 0.2).abs() < 1e-9, "through to {low}");
+    }
+
+    /// A counterbore Ø10 × 4 over a Ø5 hole with a Ø3 mill: circles within 5 − 1.5 across down
+    /// to the seat (z 4), within 2.5 − 1.5 below it, and nothing wider below the seat.
+    #[test]
+    fn a_counterbore_is_milled_step_by_step() {
+        let mut b = box_solid(v(0.0, 0.0, 0.0), v(40.0, 40.0, 8.0)).unwrap();
+        b = cut(b, cylinder(v(20.0, 20.0, 4.0), v(0.0, 0.0, 1.0), 5.0, 5.0).unwrap());
+        b = cut(b, cylinder(v(20.0, 20.0, -1.0), v(0.0, 0.0, 1.0), 2.5, 10.0).unwrap());
+        let f = read_part(&b).unwrap();
+        let flat3 = r#"{"number": 2, "kind": "flat", "diameter": 3, "flute_length": 12, "rpm": 20000, "feed": 600, "plunge": 150, "stepdown": 1.5}"#;
+        let plan = plan_part(&f, &job(&format!("{FLAT6}, {flat3}"), 8.0, ""), "P").unwrap();
+        let ops = &plan.ops;
+        let holes = op(ops, OpKind::HoleMilling);
+        assert_eq!(holes.tool, 2, "the smaller mill finishes holes");
+        let pts = sample(holes, [20.0, 20.0, 13.0]);
+        for a in pts.iter().filter(|a| !a.rapid && a.p[2] < 8.0) {
+            let r = (a.p[0] - 20.0).hypot(a.p[1] - 20.0);
+            let wall = if a.p[2] >= 4.0 - 1e-9 { 3.5 } else { 1.0 };
+            assert!(r <= wall + 1e-6, "at {:?} the mill is {r} from the axis (wall {wall})", a.p);
+        }
+        let seat = pts.iter().filter(|a| !a.rapid && (a.p[2] - 4.0).abs() < 1e-9).map(|a| (a.p[0] - 20.0).hypot(a.p[1] - 20.0)).fold(0.0, f64::max);
+        assert!((seat - 3.5).abs() < 1e-6, "the seat is cut out to its wall: {seat}");
+    }
+
+    #[test]
+    fn levels_land_on_every_target() {
+        use crate::plan::levels_for_tests as levels;
+        assert_eq!(levels(10.0, &[6.2], 3.0), vec![8.1, 6.2]);
+        let l = levels(10.0, &[7.0, 2.0, -0.2], 2.0);
+        assert_eq!(l.first(), Some(&8.5));
+        for t in [7.0, 2.0, -0.2] {
+            assert!(l.iter().any(|z| (z - t).abs() < 1e-12), "{l:?} misses {t}");
+        }
+        assert!(l.windows(2).all(|w| w[0] - w[1] <= 2.0 + 1e-12 && w[0] > w[1]));
+        assert!(levels(5.0, &[6.0], 1.0).is_empty(), "nothing above the start");
+    }
+
+    #[test]
+    fn tabs_split_the_ring_evenly() {
+        use crate::toolpath::with_tabs;
+        let ring = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]];
+        let pts = with_tabs(&ring, 4, 10.0);
+        let mut on = 0.0;
+        for w in pts.windows(2) {
+            if w[0].1 && w[1].1 || (w[0].1 && !w[1].1) {
+                on += (w[1].0[0] - w[0].0[0]).hypot(w[1].0[1] - w[0].0[1]);
+            }
+        }
+        assert!((on - 40.0).abs() < 1e-9, "4 tabs of 10: {on}");
+        assert_eq!(pts.first().map(|p| p.0), pts.last().map(|p| p.0), "closed");
+        let _ = GRID;
+    }
+}

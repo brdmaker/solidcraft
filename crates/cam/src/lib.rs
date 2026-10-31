@@ -8,7 +8,9 @@
 pub mod job;
 pub mod nest;
 pub mod part;
+pub mod plan;
 pub mod region;
+pub mod toolpath;
 
 /// What went wrong while planning a job.
 #[derive(Debug, thiserror::Error)]

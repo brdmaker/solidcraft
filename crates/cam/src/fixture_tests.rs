@@ -260,3 +260,197 @@ fn the_test_parts_nest_on_one_sheet() {
     let want = (4.0 * flange + 2.0 * panel) / (580.0 * 380.0);
     assert!((n.utilisation - want).abs() < 1e-4, "utilisation {} vs {want}", n.utilisation);
 }
+
+/// The tools of a small aluminium job: Ø6 and Ø3 end mills, a Ø5.5 drill (M5 clearance), a
+/// 90° Ø12 chamfer cutter.
+const TOOLS: &str = r#"[
+    {"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3},
+    {"number": 2, "kind": "flat", "diameter": 3, "flute_length": 12, "rpm": 22000, "feed": 700, "plunge": 150, "stepdown": 1.5},
+    {"number": 3, "kind": "drill", "diameter": 5.5, "flute_length": 40, "rpm": 2500, "feed": 150, "plunge": 150, "peck": 2},
+    {"number": 4, "kind": "chamfer", "diameter": 12, "flute_length": 6, "rpm": 12000, "feed": 600, "plunge": 200, "tip_angle_deg": 90}
+]"#;
+
+fn plan_fixture(i: usize, thickness: f64) -> (crate::part::PartFeatures, crate::plan::PartPlan) {
+    let part = &expected()["parts"][i];
+    let read =
+        solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
+            .unwrap();
+    let f = crate::part::read_part(&read.bodies[0].body).unwrap();
+    let job = crate::job::Job::from_json(&format!(
+        r#"{{"stock": {{"size": [600, 400], "thickness": {thickness}}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}]}}"#
+    ))
+    .unwrap();
+    let plan = crate::plan::plan_part(&f, &job, "P").unwrap();
+    (f, plan)
+}
+
+fn ops_of(plan: &crate::plan::PartPlan, kind: crate::toolpath::OpKind) -> Vec<&crate::toolpath::Operation> {
+    plan.ops.iter().filter(|o| o.kind == kind).collect()
+}
+
+/// The flange, every feature from features.json machined by the right tool:
+/// - the 8 Ø5.5 through holes (4 under counterbores, 4 under countersinks) drilled with T3,
+///   from 1 mm above the flange's top (nothing is milled yet) to −0.2 less the drill's point
+///   (2.75 / tan 59°);
+/// - the Ø38.2 recess, the Ø24 bore and the Ø10 counterbores milled with T2;
+/// - the countersinks (Ø10.4, cone foot r 2.75 at z 7.55) and the recess's chamfer (foot r 19.1
+///   at z 9.5) cut by T4 0.3 below their foot and 0.3 in from it: circles r 2.45 at z 7.25 and
+///   r 18.8 at z 9.2;
+/// - the outline chamfer (foot at z 9) by T4 0.3 outside the outline at z 8.7, after the
+///   profile; the profile with T1, 3 mm outside the outline.
+#[test]
+fn the_flange_is_planned_feature_by_feature() {
+    use crate::toolpath::{Move, OpKind};
+    let (_, plan) = plan_fixture(0, 10.0);
+    assert!(plan.warnings.is_empty(), "{:#?}", plan.warnings);
+    assert!(ops_of(&plan, OpKind::Roughing).is_empty() && ops_of(&plan, OpKind::Facing).is_empty(), "no pockets or facing on the flange");
+
+    let drills = ops_of(&plan, OpKind::Drilling);
+    assert_eq!(drills.len(), 1);
+    assert_eq!(drills[0].tool, 3);
+    let tip = 2.75 / 59f64.to_radians().tan();
+    let mut centres = Vec::new();
+    for m in drills[0].moves.iter().filter(|m| !matches!(m, Move::Rapid { .. })) {
+        let Move::Drill { at, r, bottom, back, .. } = m else { panic!("only drilling cycles and rapids: {m:?}") };
+        assert!((back - 15.0).abs() < 1e-9, "each cycle returns to the clearance height (G98)");
+        assert!((bottom - (-0.2 - tip)).abs() < 1e-6, "drilled to {bottom}");
+        let cb = (at[0].abs() - 23.57).abs() < 1e-6;
+        let cs = (at[0].abs() - 35.0).abs() < 1e-6;
+        assert!(cb || cs, "a drill at {at:?}");
+        // Drilling comes before the counterbores and countersinks are cut, so every cycle starts
+        // 1 mm above the flange's top (10): starting above the seat (5) or the cone's foot
+        // (7.55) would rapid into solid metal.
+        assert!((r - 11.0).abs() < 1e-6, "retract {r} for {at:?}");
+        centres.push(*at);
+    }
+    assert_eq!(centres.len(), 8);
+
+    let holes = ops_of(&plan, OpKind::HoleMilling);
+    assert_eq!(holes.len(), 1);
+    assert_eq!(holes[0].tool, 2);
+
+    let cones = ops_of(&plan, OpKind::Chamfer);
+    assert_eq!(cones.len(), 1);
+    let circles: Vec<(f64, f64)> = cones[0]
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Arc { to, center, .. } => Some((((to[0] - center[0]).hypot(to[1] - center[1]) * 1e6).round() / 1e6, (to[2] * 1e6).round() / 1e6)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(circles.iter().filter(|c| **c == (2.45, 7.25)).count(), 4, "{circles:?}");
+    assert_eq!(circles.iter().filter(|c| **c == (18.8, 9.2)).count(), 1, "{circles:?}");
+
+    let edge = ops_of(&plan, OpKind::EdgeChamfer);
+    assert_eq!(edge.len(), 1);
+    let flat: Vec<[f64; 3]> =
+        edge[0].moves.iter().filter_map(|m| if let Move::Line { to, .. } = m { (to[2] < 9.0).then_some(*to) } else { None }).collect();
+    assert!(!flat.is_empty());
+    for p in &flat {
+        assert!((p[2] - 8.7).abs() < 1e-9);
+        let d = rounded_rect_dist([p[0], p[1]], 45.0, 45.0, 6.0);
+        assert!((d - 0.3).abs() <= crate::plan::PATH_TOL + 1e-6, "edge chamfer at {p:?} is {d} off the outline");
+    }
+    let prof = ops_of(&plan, OpKind::Profile);
+    assert_eq!(prof[0].tool, 1);
+    // the outline chamfer runs after the profile, the countersinks before it
+    let rank = |k: OpKind| k.rank();
+    assert!(rank(OpKind::Chamfer) < rank(OpKind::Profile) && rank(OpKind::Profile) < rank(OpKind::EdgeChamfer));
+}
+
+/// Signed distance from `p` to the outside of a rectangle of half-sizes `hx`, `hy` centred on
+/// the origin with corner radius `r`.
+fn rounded_rect_dist(p: [f64; 2], hx: f64, hy: f64, r: f64) -> f64 {
+    let qx = p[0].abs() - (hx - r);
+    let qy = p[1].abs() - (hy - r);
+    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+}
+
+/// The panel: the label recess roughed to 2.4 and finished at 2.2, the display cutout cleared
+/// through, its chamfer and the outline's cut, the round holes milled (no drill of their size),
+/// the countersinks cut by T4 at r 1.4, z 1.1 (foot r 1.7 at z 1.4).
+#[test]
+fn the_panel_is_planned_feature_by_feature() {
+    use crate::toolpath::{Move, OpKind};
+    let (_, plan) = plan_fixture(1, 3.0);
+    assert!(plan.warnings.is_empty(), "{:#?}", plan.warnings);
+    let lows = |kind: OpKind| -> f64 {
+        ops_of(&plan, kind)
+            .iter()
+            .flat_map(|o| o.moves.iter())
+            .filter_map(|m| if let Move::Line { to, .. } = m { Some(to[2]) } else { None })
+            .fold(f64::INFINITY, f64::min)
+    };
+    assert!((lows(OpKind::Roughing) + 0.2).abs() < 1e-9, "the cutout is cleared through");
+    let floors: Vec<f64> = ops_of(&plan, OpKind::FloorFinish)
+        .iter()
+        .flat_map(|o| o.moves.iter())
+        .filter_map(|m| if let Move::Line { to, .. } = m { Some(to[2]) } else { None })
+        .collect();
+    assert!(floors.iter().any(|z| (z - 2.2).abs() < 1e-9) && floors.iter().all(|z| *z >= 2.2 - 1e-9), "the label floor at 2.2");
+    assert!(ops_of(&plan, OpKind::Drilling).is_empty(), "no drill of the panel's sizes");
+    let cones = ops_of(&plan, OpKind::Chamfer);
+    let csk = cones
+        .iter()
+        .flat_map(|o| o.moves.iter())
+        .filter(|m| matches!(m, Move::Arc { to, center, .. } if ((to[0] - center[0]).hypot(to[1] - center[1]) - 1.4).abs() < 1e-6 && (to[2] - 1.1).abs() < 1e-6))
+        .count();
+    assert_eq!(csk, 4, "four countersinks");
+    assert_eq!(cones.len(), 2, "countersinks and the display's chamfer: {:?}", cones.iter().map(|o| &o.name).collect::<Vec<_>>());
+    assert_eq!(ops_of(&plan, OpKind::EdgeChamfer).len(), 1);
+}
+
+/// Whatever the features, on both test parts: every rapid that moves sideways does it at the
+/// clearance height (top + 5), every drilling cycle starts above the part's top, and no move
+/// goes below the spoilboard allowance (−0.2) or the drill's point under it.
+#[test]
+fn no_operation_rapids_into_the_material() {
+    use crate::toolpath::Move;
+    for (i, thickness) in [(0usize, 10.0), (1, 3.0)] {
+        let (f, plan) = plan_fixture(i, thickness);
+        let clearance = f.top_z + 5.0;
+        for op in &plan.ops {
+            let mut at = [0.0, 0.0, clearance];
+            for m in &op.moves {
+                let to = m.end();
+                match m {
+                    Move::Rapid { to } if (to[0] - at[0]).hypot(to[1] - at[1]) > 1e-9 => {
+                        assert!((at[2] - clearance).abs() < 1e-9 && (to[2] - clearance).abs() < 1e-9, "{}: rapid across at {at:?} → {to:?}", op.name);
+                    }
+                    Move::Drill { r, bottom, .. } => {
+                        assert!(*r > f.top_z, "{}: a drilling cycle starts at {r}, inside the part (top {})", op.name, f.top_z);
+                        assert!(*bottom >= -0.2 - 2.75 / 59f64.to_radians().tan() - 1e-9, "{}: drilled to {bottom}", op.name);
+                    }
+                    _ => assert!(to[2] >= -0.2 - 1e-9, "{}: {m:?} below the spoilboard allowance", op.name),
+                }
+                at = to;
+            }
+            assert!((at[2] - clearance).abs() < 1e-9, "{} ends at {at:?}, not at the clearance height", op.name);
+        }
+    }
+}
+
+/// Placing on the sheet: a part turned a quarter turn and moved by (100, 50) has its point
+/// (x, y) at (100 − y, 50 + x); its top (z 10 on a 10 mm sheet) is the sheet's top, Z0.
+#[test]
+fn placed_paths_are_turned_moved_and_lowered() {
+    use crate::nest::Placement;
+    use crate::plan::plan_sheet;
+    use crate::toolpath::Move;
+    let (f, plan) = plan_fixture(0, 10.0);
+    let job =
+        crate::job::Job::from_json(&format!(r#"{{"stock": {{"size": [600, 400], "thickness": 10}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}]}}"#))
+            .unwrap();
+    let pl = Placement { part: 0, label: "P".into(), copy: 1, quarter_turns: 1, offset: [100.0, 50.0], bounds: [[0.0; 2]; 2] };
+    let ops = plan_sheet(&job, &[(&f, &plan)], &[pl]);
+    assert_eq!(ops.len(), plan.ops.len());
+    assert!(ops.iter().all(|o| o.name.starts_with("P #2: ")), "{:?}", ops.iter().map(|o| &o.name).collect::<Vec<_>>());
+    assert!(ops.windows(2).all(|w| w[0].kind.rank() <= w[1].kind.rank()), "in machining order");
+    let drill = ops.iter().find(|o| o.kind == crate::toolpath::OpKind::Drilling).unwrap();
+    for (m, orig) in drill.moves.iter().zip(&plan.ops.iter().find(|o| o.kind == crate::toolpath::OpKind::Drilling).unwrap().moves) {
+        let (Move::Drill { at, r, .. }, Move::Drill { at: a0, r: r0, .. }) = (m, orig) else { continue };
+        assert!((at[0] - (100.0 - a0[1])).abs() < 1e-9 && (at[1] - (50.0 + a0[0])).abs() < 1e-9);
+        assert!((r - (r0 - 10.0)).abs() < 1e-9 && (r - 1.0).abs() < 1e-9, "1 mm above the sheet's top");
+    }
+}
