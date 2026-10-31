@@ -12,7 +12,8 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::job::{Job, Tool};
+use crate::adaptive::AdaptiveParams;
+use crate::job::{Job, LevelOrder, Pattern, Tool};
 use crate::nest::Placement;
 use crate::part::{HoleStack, PartFeatures};
 use crate::region::{Area, Ring, signed_area};
@@ -89,6 +90,34 @@ impl Ctx<'_> {
 
 fn hole_radius(h: &HoleStack) -> f64 {
     h.steps.iter().map(|s| s.r_top.max(s.r_bottom)).fold(0.0, f64::max)
+}
+
+/// One pocket region at one level, for roughing: `root` is the region at the top level it lies
+/// in, so `area` order can cut each root all the way down.
+struct RoughTask {
+    z: f64,
+    from: f64,
+    root: usize,
+    area: Area,
+}
+
+/// A point inside `area` (not on its edge).
+fn interior_point(area: &Area) -> Option<[f64; 2]> {
+    let mut a = area.clone();
+    let mut last = None;
+    for _ in 0..8 {
+        if let Some(p) = a.rings().next().and_then(|r| r.first()).copied() {
+            last = Some(p);
+        }
+        let (lo, hi) = a.bounds()?;
+        let shrink = ((hi[0] - lo[0]).min(hi[1] - lo[1]) * 0.05).max(1e-3);
+        let next = a.offset(-shrink, 0.01).ok()?;
+        if next.is_empty() {
+            break;
+        }
+        a = next;
+    }
+    a.rings().next().and_then(|r| r.first()).copied().or(last).filter(|p| area.contains(*p))
 }
 
 /// Levels from `from` down to each target in turn, no deeper than `step` apart, ending exactly
@@ -223,14 +252,16 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         targets.push(cx.through);
     }
 
-    // Roughing, leaving stock on walls and floors.
+    // Roughing, leaving stock on walls and floors: each pocket region at each level, in the
+    // order the strategy asks, adaptive or offset.
     if let Some(t) = rough
         && !targets.is_empty()
     {
         let rt = t.diameter / 2.0;
         let leave = st.stock_to_leave;
         let rough_targets: Vec<f64> = targets.iter().map(|z| if *z > cx.through + Z_EPS { z + leave } else { *z }).collect();
-        let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+        let mut tasks: Vec<RoughTask> = Vec::new();
+        let mut roots: Vec<Area> = Vec::new();
         let mut from = f.top_z;
         for z in levels(f.top_z, &rough_targets, t.stepdown()) {
             let pocket = cx.pocket(z)?;
@@ -238,10 +269,43 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
             if allowed.is_empty() && !pocket.is_empty() {
                 cx.warn(format!("{label}: a pocket at z {z:.3} is narrower than T{} (Ø{}) can rough", t.number, t.diameter));
             }
-            let rings = fill_rings(&allowed, t.stepover())?;
-            clear_rings(&mut b, &rings, &allowed, z, from, t, ramp);
-            b.up();
+            for shape in allowed.shapes {
+                let area = Area { shapes: vec![shape] };
+                let inside = interior_point(&area);
+                let root = match roots.iter().position(|r| inside.is_some_and(|p| r.contains(p))) {
+                    Some(i) => i,
+                    None => {
+                        roots.push(area.clone());
+                        roots.len() - 1
+                    }
+                };
+                tasks.push(RoughTask { z, from, root, area });
+            }
             from = z;
+        }
+        // depth: level by level (as made); area: each root region all the way down first
+        if st.roughing.order == LevelOrder::Area {
+            tasks.sort_by(|a, b| a.root.cmp(&b.root).then(b.z.total_cmp(&a.z)));
+        }
+        let params = AdaptiveParams {
+            step: t.stepover(),
+            max_engagement: st.roughing.max_engagement_deg.map(f64::to_radians).unwrap_or_else(|| {
+                (AdaptiveParams::straight_engagement(t.stepover().min(rt * 0.9), rt) * 1.3).clamp(std::f64::consts::FRAC_PI_2, std::f64::consts::PI)
+            }),
+            both_ways: st.roughing.both_ways,
+            ramp,
+            retract: st.retract,
+        };
+        let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+        for task in &tasks {
+            match st.roughing.pattern {
+                Pattern::Adaptive => crate::adaptive::clear_level(&mut b, &task.area, task.z, task.from, t, &params)?,
+                Pattern::Offset => {
+                    let rings = fill_rings(&task.area, t.stepover())?;
+                    clear_rings(&mut b, &rings, &task.area, task.z, task.from, t, ramp);
+                }
+            }
+            b.up();
         }
         if !b.moves.is_empty() {
             ops.push(cx.op(OpKind::Roughing, "roughing", t, b.moves));

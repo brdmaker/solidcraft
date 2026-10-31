@@ -134,6 +134,12 @@ impl Area {
         Ok(Area { shapes })
     }
 
+    /// The area with each ring thinned to the points that matter (Douglas–Peucker within `tol`).
+    pub fn simplified(&self, tol: f64) -> Result<Area> {
+        let rings: Vec<Ring> = self.rings().map(|r| simplify_ring(r, tol)).filter(|r| r.len() >= 3).collect();
+        Area::from_rings(&rings)
+    }
+
     /// Enclosed area (mm²), holes subtracted.
     pub fn area(&self) -> f64 {
         self.shapes.iter().flatten().map(signed_area).sum()
@@ -225,4 +231,64 @@ fn ring_contains(r: &Ring, p: [f64; 2]) -> bool {
 /// Length of a ring, closing segment included.
 pub fn ring_length(r: &Ring) -> f64 {
     ring_edges(r).map(|(a, b)| (b[0] - a[0]).hypot(b[1] - a[1])).sum()
+}
+
+/// A closed ring thinned within `tol`: split at its farthest pair of points, each half thinned
+/// by Douglas–Peucker.
+fn simplify_ring(r: &Ring, tol: f64) -> Ring {
+    if r.len() < 8 {
+        return r.clone();
+    }
+    let first = r.first().copied().unwrap_or([0.0, 0.0]);
+    let far = r.iter().enumerate().max_by(|a, b| dist(*a.1, first).total_cmp(&dist(*b.1, first))).map(|(i, _)| i).unwrap_or(0);
+    let mut a: Vec<[f64; 2]> = r.get(..=far).map(<[_]>::to_vec).unwrap_or_default();
+    let mut b: Vec<[f64; 2]> = r.get(far..).map(<[_]>::to_vec).unwrap_or_default();
+    b.push(first);
+    a = douglas_peucker(&a, tol);
+    b = douglas_peucker(&b, tol);
+    a.pop();
+    b.pop();
+    a.extend(b);
+    a
+}
+
+fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+/// Keeps the ends and every point farther than `tol` from the chord of what it would drop.
+fn douglas_peucker(pts: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; n];
+    if let Some(f) = keep.first_mut() {
+        *f = true;
+    }
+    if let Some(l) = keep.last_mut() {
+        *l = true;
+    }
+    let mut stack = vec![(0usize, n - 1)];
+    while let Some((i, j)) = stack.pop() {
+        let (Some(&a), Some(&b)) = (pts.get(i), pts.get(j)) else { continue };
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = dx.hypot(dy);
+        let mut best = (0.0, i);
+        for k in (i + 1)..j {
+            let Some(&p) = pts.get(k) else { continue };
+            let d = if len < 1e-12 { dist(p, a) } else { ((p[0] - a[0]) * dy - (p[1] - a[1]) * dx).abs() / len };
+            if d > best.0 {
+                best = (d, k);
+            }
+        }
+        if best.0 > tol {
+            if let Some(k) = keep.get_mut(best.1) {
+                *k = true;
+            }
+            stack.push((i, best.1));
+            stack.push((best.1, j));
+        }
+    }
+    pts.iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| *p).collect()
 }

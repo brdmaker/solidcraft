@@ -727,3 +727,271 @@ mod plan_tests {
         let _ = GRID;
     }
 }
+
+mod adaptive_tests {
+    use solidcraft_geom::Vec3;
+    use solidcraft_kernel::{Body, BoolOp, boolean, box_solid};
+
+    use crate::job::Job;
+    use crate::part::read_part;
+    use crate::plan::plan_part;
+    use crate::toolpath::{OpKind, Operation, StrokeKind, trace};
+
+    fn v(x: f64, y: f64, z: f64) -> Vec3 {
+        Vec3::new(x, y, z)
+    }
+
+    /// A 60 × 40 × 10 plate with pockets cut 6 deep (floor at z 4), each [x0, y0, x1, y1].
+    fn plate(pockets: &[[f64; 4]]) -> Body {
+        let mut b = box_solid(v(-30.0, -20.0, 0.0), v(30.0, 20.0, 10.0)).unwrap();
+        for p in pockets {
+            b = boolean(&b, &box_solid(v(p[0], p[1], 4.0), v(p[2], p[3], 11.0)).unwrap(), BoolOp::Cut).unwrap().unwrap();
+        }
+        b
+    }
+
+    fn job(extra: &str) -> Job {
+        Job::from_json(&format!(
+            r#"{{"stock": {{"size": [300, 300], "thickness": 10}},
+                "tools": [{{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3, "stepover": 0.15}}],
+                "strategy": {{"roughing": {{{extra}}}}},
+                "parts": [{{"body": "P"}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn roughing(b: &Body, j: &Job) -> Operation {
+        let plan = plan_part(&read_part(b).unwrap(), j, "P").unwrap();
+        plan.ops.into_iter().find(|o| o.kind == OpKind::Roughing).unwrap()
+    }
+
+    /// The tool's positions along the roughing every 0.05 mm, stroke by stroke (a stroke: cuts
+    /// between rapids), each with its direction of travel.
+    struct Sample {
+        p: [f64; 3],
+        dir: [f64; 2],
+    }
+
+    fn strokes(op: &Operation) -> Vec<Vec<Sample>> {
+        let mut out = Vec::new();
+        for s in trace(op, [f64::NAN, f64::NAN, 15.0], 1f64.to_radians()) {
+            if s.kind != StrokeKind::Cut {
+                continue;
+            }
+            let mut st = Vec::new();
+            for w in s.pts.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+                let n = ((len.max((b[2] - a[2]).abs())) / 0.05).ceil().max(1.0) as usize;
+                let dir = if len > 1e-12 { [(b[0] - a[0]) / len, (b[1] - a[1]) / len] } else { [0.0, 0.0] };
+                for k in 1..=n {
+                    let t = k as f64 / n as f64;
+                    st.push(Sample { p: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t], dir });
+                }
+            }
+            out.push(st);
+        }
+        out
+    }
+
+    /// An independent replay on a 0.04 mm grid, level by level. A sample's engagement is the
+    /// textbook one: the arc of the cutter's forward half (rays ahead of its travel) over
+    /// material not yet cut before this stroke, acos(1 − a/r) for a straight cut a deep. Each
+    /// stroke is marked cut once it is done.
+    struct Replay {
+        h: f64,
+        x0: f64,
+        y0: f64,
+        nx: usize,
+        ny: usize,
+        cut: Vec<bool>,
+    }
+
+    impl Replay {
+        fn new() -> Replay {
+            let h = 0.04;
+            let (x0, y0) = (-31.0, -21.0);
+            let (nx, ny) = ((62.0 / h) as usize, (42.0 / h) as usize);
+            Replay { h, x0, y0, nx, ny, cut: vec![false; nx * ny] }
+        }
+        fn idx(&self, x: f64, y: f64) -> Option<usize> {
+            let (i, j) = (((x - self.x0) / self.h).floor(), ((y - self.y0) / self.h).floor());
+            (i >= 0.0 && j >= 0.0 && (i as usize) < self.nx && (j as usize) < self.ny).then(|| j as usize * self.nx + i as usize)
+        }
+        fn is_cut(&self, x: f64, y: f64) -> bool {
+            self.idx(x, y).is_some_and(|i| self.cut[i])
+        }
+        /// (engaged arc of the forward half in degrees, uncut rays on the left of `dir`, on
+        /// the right)
+        fn engagement(&self, p: [f64; 3], dir: [f64; 2], r: f64) -> (f64, usize, usize) {
+            let (mut n, mut left, mut right) = (0, 0, 0);
+            for k in 0..192 {
+                let a = k as f64 * std::f64::consts::TAU / 192.0;
+                let (cx, cy) = (a.cos(), a.sin());
+                if cx * dir[0] + cy * dir[1] <= 0.0 {
+                    continue;
+                }
+                if !self.is_cut(p[0] + 0.98 * r * cx, p[1] + 0.98 * r * cy) {
+                    n += 1;
+                    let side = dir[0] * cy - dir[1] * cx;
+                    if side > 1e-9 {
+                        left += 1;
+                    } else if side < -1e-9 {
+                        right += 1;
+                    }
+                }
+            }
+            (n as f64 * 360.0 / 192.0, left, right)
+        }
+        fn stamp(&mut self, p: [f64; 3], r: f64) {
+            let k = (r / self.h).ceil() as i64 + 1;
+            let (ci, cj) = (((p[0] - self.x0) / self.h) as i64, ((p[1] - self.y0) / self.h) as i64);
+            for dj in -k..=k {
+                for di in -k..=k {
+                    let (i, j) = (ci + di, cj + dj);
+                    if i < 0 || j < 0 || i as usize >= self.nx || j as usize >= self.ny {
+                        continue;
+                    }
+                    let (x, y) = (self.x0 + (i as f64 + 0.5) * self.h, self.y0 + (j as f64 + 0.5) * self.h);
+                    if (x - p[0]).hypot(y - p[1]) <= r {
+                        self.cut[j as usize * self.nx + i as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the replay saw on the level at `z`: each sample's engagement, and the grid after.
+    struct Seen {
+        engaged: Vec<(f64, usize, usize)>,
+        replay: Replay,
+    }
+
+    /// Replay the level at `z`; `above` is the level over it (the stock's top for the first).
+    fn replay_level(op: &Operation, z: f64, above: f64) -> Seen {
+        let mut r = Replay::new();
+        let mut engaged = Vec::new();
+        for st in strokes(op) {
+            // positions are marked cut once the tool is 1 mm further along: nearer ones would
+            // cover the forward ring (anything within 0.2 r behind does) and hide the cut
+            let mut trail: std::collections::VecDeque<([f64; 3], f64)> = Default::default();
+            let mut along = 0.0;
+            let mut prev: Option<[f64; 3]> = None;
+            // entering the level (a helix or ramp coming down onto it, less than a stepdown
+            // above): cut as it goes, not measured (an entry plunges, it doesn't cut sideways)
+            for s in st.iter().filter(|s| s.p[2] > z + 1e-9 && s.p[2] < above - 1e-9) {
+                r.stamp(s.p, 3.0);
+            }
+            for s in st.iter().filter(|s| (s.p[2] - z).abs() < 1e-9) {
+                if let Some(q) = prev {
+                    along += (s.p[0] - q[0]).hypot(s.p[1] - q[1]);
+                }
+                prev = Some(s.p);
+                while trail.front().is_some_and(|(_, a)| along - a > 1.0) {
+                    let (p, _) = trail.pop_front().unwrap();
+                    r.stamp(p, 3.0);
+                }
+                engaged.push(r.engagement(s.p, s.dir, 3.0));
+                trail.push_back((s.p, along));
+            }
+            for (p, _) in trail {
+                r.stamp(p, 3.0);
+            }
+        }
+        Seen { engaged, replay: r }
+    }
+
+    /// The pocket's region the cutter's centre may reach at a level: the 40 × 24 pocket shrunk
+    /// by the radius (3) and the stock to leave (0.2): |x| ≤ 16.8, |y| ≤ 8.8.
+    fn in_reach(p: [f64; 3]) -> bool {
+        p[0].abs() <= 16.8 + 0.01 && p[1].abs() <= 8.8 + 0.01
+    }
+
+    /// Engagement stays within the limit (default here 90°: 1.3 × the straight cut's 45.6° is
+    /// less) at both levels, to within the replay's resolution (rays every 1.9°, a 0.04 mm grid);
+    /// no move takes the centre outside its region; and the last level is cut everywhere the
+    /// cutter can reach.
+    #[test]
+    fn adaptive_keeps_engagement_and_clears_the_pocket() {
+        let op = roughing(&plate(&[[-20.0, -12.0, 20.0, 12.0]]), &job(""));
+        for (z, above) in [(7.1, 10.0), (4.2, 7.1)] {
+            let seen = replay_level(&op, z, above);
+            let mut e: Vec<f64> = seen.engaged.iter().map(|e| e.0).collect();
+            assert!(e.len() > 1000, "level {z} has {} samples", e.len());
+            e.sort_by(f64::total_cmp);
+            let p99 = e[(e.len() - 1) * 99 / 100];
+            let max = *e.last().unwrap();
+            assert!(p99 <= 90.0 && max <= 90.0 + 6.0, "level {z}: p99 {p99:.1}°, max {max:.1}°");
+            let median = e[e.len() / 2];
+            assert!(median > 20.0, "level {z}: the cutter mostly works ({median:.1}° median)");
+            if z == 4.2 {
+                let mut x: f64 = -19.75;
+                while x < 19.75 {
+                    let mut y: f64 = -11.75;
+                    while y < 11.75 {
+                        let corner = x.abs() > 16.8 && y.abs() > 8.8;
+                        assert!(corner || seen.replay.is_cut(x, y), "({x:.2}, {y:.2}) left uncut");
+                        y += 0.25;
+                    }
+                    x += 0.25;
+                }
+            }
+        }
+        for st in strokes(&op) {
+            for s in st.iter().filter(|s| s.p[2] < 10.0) {
+                assert!(in_reach(s.p), "the centre at {:?} is outside its region", s.p);
+            }
+        }
+    }
+
+    /// One way, every engaged sample (over 10°) has the uncut material on its left: climbing.
+    /// Both ways, a good share cut with it on the right (conventional), and the job lifts less.
+    #[test]
+    fn one_way_climbs_and_both_ways_lifts_less() {
+        let lifts = |op: &Operation| op.moves.windows(2).filter(|w| w[1].end()[2] > w[0].end()[2] + 1e-9).count();
+        let side = |op: &Operation| {
+            let seen = replay_level(op, 7.1, 10.0);
+            let engaged: Vec<_> = seen.engaged.iter().filter(|e| e.0 > 10.0).collect();
+            let left = engaged.iter().filter(|e| e.1 > e.2).count();
+            (left as f64 / engaged.len() as f64, engaged.len())
+        };
+        let b = plate(&[[-20.0, -12.0, 20.0, 12.0]]);
+        let one = roughing(&b, &job(""));
+        let both = roughing(&b, &job(r#""both_ways": true"#));
+        let (left_one, n_one) = side(&one);
+        let (left_both, _) = side(&both);
+        assert!(left_one >= 0.97, "one way: {:.1} % of {n_one} engaged samples climb", left_one * 100.0);
+        assert!(left_both < 0.9, "both ways: {:.1} % climb", left_both * 100.0);
+        assert!(lifts(&both) < lifts(&one), "both ways lifts {} times, one way {}", lifts(&both), lifts(&one));
+    }
+
+    /// Two pockets, each two levels deep. By depth: every level's z never rises again (both
+    /// pockets at 7.1, then both at 4.2). By area: one pocket all the way down, then the other.
+    #[test]
+    fn levels_go_by_depth_or_by_area() {
+        let b = plate(&[[-27.0, -10.0, -5.0, 10.0], [5.0, -10.0, 27.0, 10.0]]);
+        for pattern in ["adaptive", "offset"] {
+            let seq = |order: &str| {
+                let op = roughing(&b, &job(&format!(r#""order": "{order}", "pattern": "{pattern}""#)));
+                let mut seq: Vec<(i8, f64)> = Vec::new();
+                for st in strokes(&op) {
+                    // horizontal moves only: a descent passes through 7.1 on its way to 4.2
+                    for s in st.iter().filter(|s| s.dir != [0.0, 0.0] && ((s.p[2] - 7.1).abs() < 1e-6 || (s.p[2] - 4.2).abs() < 1e-6)) {
+                        let key = (if s.p[0] < 0.0 { -1 } else { 1 }, (s.p[2] * 1e3).round() / 1e3);
+                        if seq.last() != Some(&key) {
+                            seq.push(key);
+                        }
+                    }
+                }
+                seq
+            };
+            let depth = seq("depth");
+            assert!(depth.windows(2).all(|w| w[1].1 <= w[0].1), "{pattern} by depth: {depth:?}");
+            assert_eq!(depth.iter().filter(|k| k.1 == 7.1).count(), 2, "{pattern}: both pockets at 7.1 first: {depth:?}");
+            let area = seq("area");
+            assert_eq!(area.len(), 4, "{pattern} by area: each pocket's two levels, once: {area:?}");
+            assert!(area[0].0 == area[1].0 && area[2].0 == area[3].0 && area[0].0 != area[2].0, "{pattern} by area: {area:?}");
+            assert!(area[0].1 > area[1].1 && area[2].1 > area[3].1, "{pattern} by area, top level first: {area:?}");
+        }
+    }
+}

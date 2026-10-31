@@ -55,9 +55,58 @@ pub struct Strategy {
     pub retract: f64,
     /// Tabs holding each part to the sheet as its outline is cut through.
     pub tabs: Tabs,
+    /// How pockets are roughed.
+    pub roughing: Roughing,
     /// How far below a chamfer's foot the chamfer cutter's tip goes, mm (default 0.3): the cut
     /// uses the flank, not the fragile tip.
     pub chamfer_tip_below: f64,
+}
+
+/// The roughing pattern.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Pattern {
+    /// Grows the cleared area from a helix entry, never cutting more than the stepover sideways
+    /// (engagement measured along every pass and kept under the limit).
+    #[default]
+    Adaptive,
+    /// Concentric offset rings from the middle out.
+    Offset,
+}
+
+/// Which order levels are cut in when there are several pockets.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelOrder {
+    /// Level by level: every pocket at one depth, then every pocket at the next.
+    #[default]
+    Depth,
+    /// Pocket by pocket: each pocket down through all its levels before the next.
+    Area,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Roughing {
+    /// `adaptive` (default) or `offset`.
+    pub pattern: Pattern,
+    /// `depth` (default: level by level) or `area` (pocket by pocket).
+    pub order: LevelOrder,
+    /// Adaptive: also cut against the climbing direction, taking whichever end of the next
+    /// stretch is nearer (fewer links, half the stretches conventional). Default false: climb only.
+    pub both_ways: bool,
+    /// Adaptive: the most of the cutter's edge in uncut material, degrees, measured over the
+    /// forward half (a straight cut `a` deep into a cutter of radius `r` engages acos(1 − a/r);
+    /// a full slot 180). Default: 1.3 times the straight cut at the stepover, at least 90 (where
+    /// a growing front first meets a wall the cutter briefly engages more than on a straight
+    /// cut; a stricter limit makes those passes take smaller steps, and the job longer).
+    pub max_engagement_deg: Option<f64>,
+}
+
+impl Default for Roughing {
+    fn default() -> Self {
+        Roughing { pattern: Pattern::Adaptive, order: LevelOrder::Depth, both_ways: false, max_engagement_deg: None }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -90,6 +139,7 @@ impl Default for Strategy {
             retract: 1.0,
             tabs: Tabs::default(),
             chamfer_tip_below: 0.3,
+            roughing: Roughing::default(),
         }
     }
 }
@@ -322,6 +372,11 @@ impl Job {
         }
         if !(st.ramp_angle_deg.is_finite() && st.ramp_angle_deg >= 0.5 && st.ramp_angle_deg <= 90.0) {
             return Err(CamError::Invalid(format!("strategy.ramp_angle_deg must be from 0.5 to 90; it is {}", st.ramp_angle_deg)));
+        }
+        if let Some(e) = st.roughing.max_engagement_deg
+            && !(e.is_finite() && (5.0..=180.0).contains(&e))
+        {
+            return Err(CamError::Invalid(format!("strategy.roughing.max_engagement_deg must be from 5 to 180; it is {e}")));
         }
         if st.tabs.count > 100 {
             return Err(CamError::Invalid("strategy.tabs.count: at most 100 tabs".into()));
