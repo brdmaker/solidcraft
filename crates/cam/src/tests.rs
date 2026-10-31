@@ -735,7 +735,7 @@ mod adaptive_tests {
     use crate::job::Job;
     use crate::part::read_part;
     use crate::plan::plan_part;
-    use crate::toolpath::{OpKind, Operation, StrokeKind, trace};
+    use crate::toolpath::{Move, OpKind, Operation, StrokeKind, trace};
 
     fn v(x: f64, y: f64, z: f64) -> Vec3 {
         Vec3::new(x, y, z)
@@ -809,10 +809,15 @@ mod adaptive_tests {
 
     impl Replay {
         fn new() -> Replay {
-            let h = 0.04;
-            let (x0, y0) = (-31.0, -21.0);
-            let (nx, ny) = ((62.0 / h) as usize, (42.0 / h) as usize);
-            Replay { h, x0, y0, nx, ny, cut: vec![false; nx * ny] }
+            Replay::over([-31.0, -21.0], [31.0, 21.0], 0.04)
+        }
+        /// An uncut grid over `lo`..`hi` with cells `h` wide.
+        fn over(lo: [f64; 2], hi: [f64; 2], h: f64) -> Replay {
+            let (nx, ny) = (((hi[0] - lo[0]) / h) as usize, ((hi[1] - lo[1]) / h) as usize);
+            Replay { h, x0: lo[0], y0: lo[1], nx, ny, cut: vec![false; nx * ny] }
+        }
+        fn inside(&self, p: [f64; 3]) -> bool {
+            self.idx(p[0], p[1]).is_some()
         }
         fn idx(&self, x: f64, y: f64) -> Option<usize> {
             let (i, j) = (((x - self.x0) / self.h).floor(), ((y - self.y0) / self.h).floor());
@@ -843,6 +848,25 @@ mod adaptive_tests {
             }
             (n as f64 * 360.0 / 192.0, left, right)
         }
+        /// The cells within `r` of the segment `a`–`b` (both ends included).
+        fn capsule(&mut self, a: [f64; 3], b: [f64; 3], r: f64) {
+            let (lo, hi) = ([a[0].min(b[0]) - r, a[1].min(b[1]) - r], [a[0].max(b[0]) + r, a[1].max(b[1]) + r]);
+            let i0 = (((lo[0] - self.x0) / self.h).floor().max(0.0)) as usize;
+            let j0 = (((lo[1] - self.y0) / self.h).floor().max(0.0)) as usize;
+            let i1 = ((((hi[0] - self.x0) / self.h).ceil().max(0.0)) as usize).min(self.nx.saturating_sub(1));
+            let j1 = ((((hi[1] - self.y0) / self.h).ceil().max(0.0)) as usize).min(self.ny.saturating_sub(1));
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = dx * dx + dy * dy;
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let (x, y) = (self.x0 + (i as f64 + 0.5) * self.h, self.y0 + (j as f64 + 0.5) * self.h);
+                    let t = if l2 > 0.0 { (((x - a[0]) * dx + (y - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    if (x - a[0] - t * dx).hypot(y - a[1] - t * dy) <= r {
+                        self.cut[j * self.nx + i] = true;
+                    }
+                }
+            }
+        }
         fn stamp(&mut self, p: [f64; 3], r: f64) {
             let k = (r / self.h).ceil() as i64 + 1;
             let (ci, cj) = (((p[0] - self.x0) / self.h) as i64, ((p[1] - self.y0) / self.h) as i64);
@@ -861,6 +885,16 @@ mod adaptive_tests {
         }
     }
 
+    /// Does the trail need marking up to `p`: 0.5 mm since the last mark, the path turning there
+    /// by more than 5° (a chord past a corner would miss it), or the trail's end?
+    fn needs_stamp(q: [f64; 3], p: [f64; 3], next: Option<[f64; 3]>) -> bool {
+        let Some(n) = next else { return true };
+        let (ax, ay, bx, by) = (p[0] - q[0], p[1] - q[1], n[0] - p[0], n[1] - p[1]);
+        let (la, lb) = (ax.hypot(ay), bx.hypot(by));
+        let turn = if la > 1e-9 && lb > 1e-9 { ((ax * bx + ay * by) / (la * lb)).clamp(-1.0, 1.0).acos() } else { 0.0 };
+        la >= 0.5 || turn > 5f64.to_radians()
+    }
+
     /// What the replay saw on the level at `z`: each sample's engagement, and the grid after.
     struct Seen {
         engaged: Vec<(f64, usize, usize)>,
@@ -869,33 +903,59 @@ mod adaptive_tests {
 
     /// Replay the level at `z`; `above` is the level over it (the stock's top for the first).
     fn replay_level(op: &Operation, z: f64, above: f64) -> Seen {
-        let mut r = Replay::new();
+        replay_level_on(&strokes(op), z, above, Replay::new())
+    }
+
+    /// The same on a grid of its own: samples off the grid are skipped (neither measured nor
+    /// marked), so the grid should cover the pocket with a cutter's radius to spare.
+    fn replay_level_on(all: &[Vec<Sample>], z: f64, above: f64, mut r: Replay) -> Seen {
         let mut engaged = Vec::new();
-        for st in strokes(op) {
+        for st in all {
             // positions are marked cut once the tool is 1 mm further along: nearer ones would
             // cover the forward ring (anything within 0.2 r behind does) and hide the cut
             let mut trail: std::collections::VecDeque<([f64; 3], f64)> = Default::default();
             let mut along = 0.0;
             let mut prev: Option<[f64; 3]> = None;
+            let mut last_stamped: Option<[f64; 3]> = None;
             // entering the level (a helix or ramp coming down onto it, less than a stepdown
             // above): cut as it goes, not measured (an entry plunges, it doesn't cut sideways)
-            for s in st.iter().filter(|s| s.p[2] > z + 1e-9 && s.p[2] < above - 1e-9) {
-                r.stamp(s.p, 3.0);
+            let entering: Vec<[f64; 3]> = st.iter().filter(|s| s.p[2] > z + 1e-9 && s.p[2] < above - 1e-9 && r.inside(s.p)).map(|s| s.p).collect();
+            for w in entering.chunks(10).filter_map(|c| Some((*c.first()?, *c.last()?))) {
+                r.capsule(w.0, w.1, 3.0);
             }
-            for s in st.iter().filter(|s| (s.p[2] - z).abs() < 1e-9) {
+            if let [p] = entering.as_slice() {
+                r.stamp(*p, 3.0);
+            }
+            let on_level: Vec<&Sample> = st.iter().filter(|s| (s.p[2] - z).abs() < 1e-9 && r.inside(s.p)).collect();
+            for s in on_level {
                 if let Some(q) = prev {
                     along += (s.p[0] - q[0]).hypot(s.p[1] - q[1]);
                 }
                 prev = Some(s.p);
+                // marked in capsules about 0.5 mm long (a path bending at r 2 sags 0.016 off
+                // such a chord): one capsule costs as much as a disc
                 while trail.front().is_some_and(|(_, a)| along - a > 1.0) {
                     let (p, _) = trail.pop_front().unwrap();
-                    r.stamp(p, 3.0);
+                    let next = trail.front().map(|t| t.0);
+                    match last_stamped {
+                        Some(q) if !needs_stamp(q, p, next) => continue,
+                        Some(q) => r.capsule(q, p, 3.0),
+                        None => r.stamp(p, 3.0),
+                    }
+                    last_stamped = Some(p);
                 }
-                engaged.push(r.engagement(s.p, s.dir, 3.0));
+                let e = r.engagement(s.p, s.dir, 3.0);
+                engaged.push(e);
                 trail.push_back((s.p, along));
             }
-            for (p, _) in trail {
-                r.stamp(p, 3.0);
+            let rest: Vec<[f64; 3]> = trail.into_iter().map(|(p, _)| p).collect();
+            for (k, p) in rest.iter().enumerate() {
+                match last_stamped {
+                    Some(q) if !needs_stamp(q, *p, rest.get(k + 1).copied()) => continue,
+                    Some(q) => r.capsule(q, *p, 3.0),
+                    None => r.stamp(*p, 3.0),
+                }
+                last_stamped = Some(*p);
             }
         }
         Seen { engaged, replay: r }
@@ -944,11 +1004,55 @@ mod adaptive_tests {
         }
     }
 
+    /// The time a roughing takes, minutes: each move's length over its feed, rapids at `rapid`
+    /// mm/min. An arc's length is its turn (a full turn where it ends where it starts) times
+    /// its radius, with its drop.
+    fn minutes(op: &Operation, rapid: f64) -> f64 {
+        let mut at = [f64::NAN; 3];
+        let mut total = 0.0;
+        for m in &op.moves {
+            let e = m.end();
+            let (len, feed) = match m {
+                Move::Rapid { .. } => ((e[0] - at[0]).hypot(e[1] - at[1]).hypot(e[2] - at[2]), rapid),
+                Move::Line { feed, .. } => ((e[0] - at[0]).hypot(e[1] - at[1]).hypot(e[2] - at[2]), *feed),
+                Move::Arc { center, ccw, feed, .. } => {
+                    let a0 = (at[1] - center[1]).atan2(at[0] - center[0]);
+                    let a1 = (e[1] - center[1]).atan2(e[0] - center[0]);
+                    let tau = std::f64::consts::TAU;
+                    let mut turn = if *ccw { a1 - a0 } else { a0 - a1 };
+                    turn = turn.rem_euclid(tau);
+                    if turn < 1e-9 {
+                        turn = tau;
+                    }
+                    let r = (e[0] - center[0]).hypot(e[1] - center[1]);
+                    ((turn * r).hypot(e[2] - at[2]), *feed)
+                }
+                Move::Drill { .. } => (0.0, 1.0),
+            };
+            if len.is_finite() {
+                total += len / feed;
+            }
+            at = e;
+        }
+        total
+    }
+
+    fn rapid_job(rapid: f64) -> Job {
+        let mut j = job("");
+        j.strategy.rapid_feed = rapid;
+        j
+    }
+
+    /// Times up to clearance height.
+    fn lifts_to_clearance(op: &Operation) -> usize {
+        op.moves.windows(2).filter(|w| w[1].end()[2] >= 15.0 - 1e-9 && w[0].end()[2] < 15.0 - 1e-9).count()
+    }
+
     /// One way, every engaged sample (over 10°) has the uncut material on its left: climbing.
-    /// Both ways, a good share cut with it on the right (conventional), and the job lifts less.
+    /// Both ways, a good share cut with it on the right (conventional), and the job is quicker
+    /// (fewer links: it starts each stretch at whichever end is nearer).
     #[test]
-    fn one_way_climbs_and_both_ways_lifts_less() {
-        let lifts = |op: &Operation| op.moves.windows(2).filter(|w| w[1].end()[2] > w[0].end()[2] + 1e-9).count();
+    fn one_way_climbs_and_both_ways_is_quicker() {
         let side = |op: &Operation| {
             let seen = replay_level(op, 7.1, 10.0);
             let engaged: Vec<_> = seen.engaged.iter().filter(|e| e.0 > 10.0).collect();
@@ -962,7 +1066,181 @@ mod adaptive_tests {
         let (left_both, _) = side(&both);
         assert!(left_one >= 0.97, "one way: {:.1} % of {n_one} engaged samples climb", left_one * 100.0);
         assert!(left_both < 0.9, "both ways: {:.1} % climb", left_both * 100.0);
-        assert!(lifts(&both) < lifts(&one), "both ways lifts {} times, one way {}", lifts(&both), lifts(&one));
+        let (t_one, t_both) = (minutes(&one, 5000.0), minutes(&both, 5000.0));
+        assert!(t_both < t_one, "both ways takes {t_both:.2} min, one way {t_one:.2}");
+    }
+
+    /// Links take the quickest way for the machine's rapid speed: with fast rapids the tool goes
+    /// up to clearance (15 here: the sheet top 10 plus 5) more often than with slow ones, which
+    /// keep it down in cleared ground; and each job is quickest at its own rapid speed.
+    #[test]
+    fn links_take_the_quickest_way_for_the_rapid_speed() {
+        let b = plate(&[[-20.0, -12.0, 20.0, 12.0]]);
+        let fast = roughing(&b, &rapid_job(1e6));
+        let slow = roughing(&b, &rapid_job(600.0));
+        assert!(
+            lifts_to_clearance(&fast) > lifts_to_clearance(&slow),
+            "fast rapids lift {} times, slow {}",
+            lifts_to_clearance(&fast),
+            lifts_to_clearance(&slow)
+        );
+        assert!(minutes(&fast, 1e6) <= minutes(&slow, 1e6), "fast rapids");
+        assert!(minutes(&slow, 600.0) <= minutes(&fast, 600.0), "slow rapids");
+    }
+
+    /// Signed distance from `p` to a rectangle of half-sizes `hx`, `hy` about `c` with corner
+    /// radius `r` (negative inside).
+    fn rounded_rect_dist(p: [f64; 2], c: [f64; 2], hx: f64, hy: f64, r: f64) -> f64 {
+        let qx = (p[0] - c[0]).abs() - (hx - r);
+        let qy = (p[1] - c[1]).abs() - (hy - r);
+        qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+    }
+
+    /// Points every `step` round a rectangle of half-sizes `hx`, `hy` about `c` with corner
+    /// radius `r`.
+    fn rounded_rect_outline(c: [f64; 2], hx: f64, hy: f64, r: f64, step: f64) -> Vec<[f64; 2]> {
+        let mut out = Vec::new();
+        let (ix, iy) = (hx - r, hy - r);
+        for (sx, sy) in [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+            let a0: f64 = f64::atan2(sy, sx) - std::f64::consts::FRAC_PI_4;
+            let n = ((r * std::f64::consts::FRAC_PI_2) / step).ceil().max(1.0) as usize;
+            for k in 0..=n {
+                let a = a0 + std::f64::consts::FRAC_PI_2 * k as f64 / n as f64;
+                out.push([c[0] + sx * ix + r * a.cos(), c[1] + sy * iy + r * a.sin()]);
+            }
+        }
+        // the straight sides
+        for (a, b) in [([ix, hy], [-ix, hy]), ([-hx, iy], [-hx, -iy]), ([-ix, -hy], [ix, -hy]), ([hx, -iy], [hx, iy])] {
+            let n = ((a[0] - b[0]).hypot(a[1] - b[1]) / step).ceil().max(1.0) as usize;
+            for k in 0..=n {
+                let t = k as f64 / n as f64;
+                out.push([c[0] + a[0] + (b[0] - a[0]) * t, c[1] + a[1] + (b[1] - a[1]) * t]);
+            }
+        }
+        out
+    }
+
+    /// Adaptive on the slot test parts (tests/cam: slot-plate, stepped-slot, cross-slot) with a
+    /// Ø6 cutter, 0.9 mm stepover, 3 mm stepdown: for each slot, replayed on a 0.05 mm grid round
+    /// it at its last roughing level (0.2 above its floor; −0.2 through), engagement stays within
+    /// the 90° default, every point the cutter can reach (within 3 of the slot shrunk by 3.2) is
+    /// cut, and the centre stays in the slot shrunk by 3.2. A cross's reach is its two arms'.
+    #[test]
+    fn adaptive_clears_the_slot_test_parts() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/cam");
+        let expected: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("features.json")).unwrap()).unwrap();
+        for part in expected["parts"].as_array().unwrap().iter().filter(|p| p["design"].as_str().unwrap().contains("slot")) {
+            let name = part["design"].as_str().unwrap();
+            let step = std::fs::read_to_string(dir.join(name.replace(".sc", ".step"))).unwrap();
+            let body = solidcraft_kernel::step_import(&step).unwrap().bodies.remove(0).body;
+            let top = part["top_z"].as_f64().unwrap();
+            let j = Job::from_json(&format!(
+                r#"{{"stock": {{"size": [300, 300], "thickness": {top}}},
+                    "tools": [{{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3, "stepover": 0.15}}],
+                    "parts": [{{"body": "P"}}]}}"#
+            ))
+            .unwrap();
+            let plan = plan_part(&read_part(&body).unwrap(), &j, "P").unwrap();
+            // only slots features.json says must be slotted may warn, and those must
+            let slotted: Vec<&serde_json::Value> = part["features"].as_array().unwrap().iter().filter(|f| f["adaptive"] == "slotting").collect();
+            assert_eq!(plan.warnings.len(), slotted.len(), "{name}: {:?}", plan.warnings);
+            let op = plan.ops.iter().find(|o| o.kind == OpKind::Roughing).unwrap();
+            let sampled = strokes(op);
+            // the levels the roughing cuts at: heights of moves that stay level (a helix moves
+            // sideways while it comes down)
+            let mut at = [0.0f64; 3];
+            let mut levels: Vec<f64> = Vec::new();
+            for m in &op.moves {
+                let to = m.end();
+                if matches!(m, crate::toolpath::Move::Line { .. } | crate::toolpath::Move::Arc { .. }) && (to[2] - at[2]).abs() < 1e-12 && to[2] < top
+                {
+                    levels.push((to[2] * 1e6).round() / 1e6);
+                }
+                at = to;
+            }
+            levels.sort_by(|a, b| b.total_cmp(a));
+            levels.dedup();
+            for feat in part["features"].as_array().unwrap().iter().filter(|f| f["kind"] == "pocket" || f["kind"] == "cutout") {
+                let c = [feat["center"][0].as_f64().unwrap(), feat["center"][1].as_f64().unwrap()];
+                let r = feat["corner_radius"].as_f64().unwrap();
+                let rects: Vec<[f64; 2]> = match feat.get("arms") {
+                    Some(arms) => arms.as_array().unwrap().iter().map(|a| [a[0].as_f64().unwrap() / 2.0, a[1].as_f64().unwrap() / 2.0]).collect(),
+                    None => vec![[feat["size"][0].as_f64().unwrap() / 2.0, feat["size"][1].as_f64().unwrap() / 2.0]],
+                };
+                let z = if feat["kind"] == "cutout" { -0.2 } else { feat["floor_z"].as_f64().unwrap() + 0.2 };
+                let z = *levels.iter().find(|l| (**l - z).abs() < 1e-6).unwrap_or_else(|| panic!("{name}: no roughing level at {z}: {levels:?}"));
+                let above = levels.iter().copied().filter(|l| *l > z + 1e-9).fold(top, f64::min);
+                let (hx, hy) = rects.iter().fold((0.0f64, 0.0f64), |(a, b), r| (a.max(r[0]), b.max(r[1])));
+                let grid = Replay::over([c[0] - hx - 4.0, c[1] - hy - 4.0], [c[0] + hx + 4.0, c[1] + hy + 4.0], 0.05);
+                let seen = replay_level_on(&sampled, z, above, grid);
+                let mut e: Vec<f64> = seen.engaged.iter().map(|e| e.0).collect();
+                assert!(!e.is_empty(), "{name}: nothing cut at {z} in the slot at {c:?}");
+                e.sort_by(f64::total_cmp);
+                let (p99, max) = (e[(e.len() - 1) * 99 / 100], *e.last().unwrap());
+                if feat["adaptive"] == "slotting" {
+                    let at = format!("({:.1}, {:.1})", c[0], c[1]);
+                    assert!(
+                        plan.warnings.iter().any(|w| w.contains("slotting") && w.contains(&at)),
+                        "{name}: the slot at {at} is slotted unannounced: {:?}",
+                        plan.warnings
+                    );
+                } else {
+                    assert!(p99 <= 90.0 && max <= 96.0, "{name}, slot at {c:?}, level {z}: p99 {p99:.1}°, max {max:.1}°");
+                }
+                // the slot shrunk by the cutter and the stock to leave, per arm
+                let reach = |q: [f64; 2]| {
+                    rects.iter().map(|h| rounded_rect_dist(q, c, h[0] - 3.2, h[1] - 3.2, (r - 3.2).max(0.0))).fold(f64::INFINITY, f64::min)
+                };
+                // the gouge check uses the slot's true outline: a cross's arms, each with its
+                // rounded ends, less what lies inside the other arm (sampled every 0.02 mm)
+                let outline: Vec<[f64; 2]> = rects
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, h)| {
+                        let others: Vec<[f64; 2]> = rects.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| *o).collect();
+                        rounded_rect_outline(c, h[0], h[1], r, 0.02)
+                            .into_iter()
+                            .filter(move |q| others.iter().all(|o| rounded_rect_dist(*q, c, o[0], o[1], r) >= -1e-9))
+                    })
+                    .collect();
+                // outline points by 1 mm cell: a centre need only look at the cells within 4 mm
+                let mut cells: std::collections::HashMap<(i64, i64), Vec<[f64; 2]>> = Default::default();
+                for o in &outline {
+                    cells.entry((o[0].floor() as i64, o[1].floor() as i64)).or_default().push(*o);
+                }
+                let depth = |q: [f64; 2]| {
+                    let (ci, cj) = (q[0].floor() as i64, q[1].floor() as i64);
+                    let mut d = 4.0f64;
+                    for i in ci - 4..=ci + 4 {
+                        for j in cj - 4..=cj + 4 {
+                            for o in cells.get(&(i, j)).into_iter().flatten() {
+                                d = d.min((o[0] - q[0]).hypot(o[1] - q[1]));
+                            }
+                        }
+                    }
+                    d
+                };
+                for st in &sampled {
+                    for s in st.iter().filter(|s| (s.p[2] - z).abs() < 1e-9 && seen.replay.inside(s.p)).step_by(4) {
+                        let d = depth([s.p[0], s.p[1]]);
+                        assert!(d >= 3.2 - 0.02, "{name}: the centre at {:?} is {d:.3} from the slot's wall", s.p);
+                    }
+                }
+                let mut x = c[0] - hx;
+                while x <= c[0] + hx {
+                    let mut y = c[1] - hy;
+                    while y <= c[1] + hy {
+                        // 0.05 of slack: the region is built from offsets drawn as chords within
+                        // 0.01 and paths within 0.005, so its rounded corners sit a little inside
+                        if reach([x, y]) <= 3.0 - 0.05 {
+                            assert!(seen.replay.is_cut(x, y), "{name}: ({x:.2}, {y:.2}) in the slot at {c:?} is left uncut at {z}");
+                        }
+                        y += 0.4;
+                    }
+                    x += 0.4;
+                }
+            }
+        }
     }
 
     /// Two pockets, each two levels deep. By depth: every level's z never rises again (both

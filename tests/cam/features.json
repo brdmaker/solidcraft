@@ -400,6 +400,271 @@
      "through": true
     }
    ]
+  },
+  {
+   "design": "slot-plate.sc",
+   "body": "SlotPlate",
+   "material": "aluminium",
+   "stock_thickness": 10,
+   "top_z": 10,
+   "volume_mm3": 113918.64,
+   "bbox": [
+    [
+     -70,
+     -50,
+     0
+    ],
+    [
+     70,
+     50,
+     10
+    ]
+   ],
+   "floor_levels": [
+    10,
+    6,
+    4,
+    0
+   ],
+   "face_types": {
+    "plane": 20,
+    "cylinder": 12
+   },
+   "features": [
+    {
+     "kind": "outline",
+     "shape": "rounded_rect",
+     "size": [
+      140,
+      100
+     ],
+     "corner_radius": 0,
+     "center": [
+      0,
+      0
+     ],
+     "from_z": 10,
+     "to_z": 0
+    },
+    {
+     "kind": "pocket",
+     "shape": "rounded_rect",
+     "size": [
+      70,
+      10
+     ],
+     "corner_radius": 4,
+     "center": [
+      0,
+      30
+     ],
+     "from_z": 10,
+     "floor_z": 6
+    },
+    {
+     "kind": "pocket",
+     "shape": "rounded_rect",
+     "size": [
+      70,
+      16
+     ],
+     "corner_radius": 3,
+     "center": [
+      0,
+      5
+     ],
+     "from_z": 10,
+     "floor_z": 4
+    },
+    {
+     "kind": "cutout",
+     "shape": "rounded_rect",
+     "size": [
+      70,
+      24
+     ],
+     "corner_radius": 4,
+     "center": [
+      0,
+      -28
+     ],
+     "from_z": 10,
+     "to_z": 0,
+     "through": true
+    }
+   ]
+  },
+  {
+   "design": "stepped-slot.sc",
+   "body": "SteppedSlot",
+   "material": "aluminium",
+   "stock_thickness": 12,
+   "top_z": 12,
+   "volume_mm3": 57273.34,
+   "bbox": [
+    [
+     -50,
+     -30,
+     0
+    ],
+    [
+     50,
+     30,
+     12
+    ]
+   ],
+   "floor_levels": [
+    12,
+    9,
+    8,
+    3,
+    0
+   ],
+   "face_types": {
+    "plane": 21,
+    "cylinder": 12
+   },
+   "note": "the upper slot's floor (z 8) is a ring round the lower slot: its area is the upper slot's less the lower's",
+   "features": [
+    {
+     "kind": "outline",
+     "shape": "rounded_rect",
+     "size": [
+      100,
+      60
+     ],
+     "corner_radius": 0,
+     "center": [
+      0,
+      0
+     ],
+     "from_z": 12,
+     "to_z": 0
+    },
+    {
+     "kind": "pocket",
+     "shape": "rounded_rect",
+     "size": [
+      80,
+      30
+     ],
+     "corner_radius": 4,
+     "center": [
+      0,
+      8
+     ],
+     "from_z": 12,
+     "floor_z": 8,
+     "floor_area": 1553.9911,
+     "curved_length": 43.9823
+    },
+    {
+     "kind": "pocket",
+     "shape": "rounded_rect",
+     "size": [
+      60,
+      14
+     ],
+     "corner_radius": 3,
+     "center": [
+      0,
+      8
+     ],
+     "from_z": 8,
+     "floor_z": 3
+    },
+    {
+     "kind": "pocket",
+     "shape": "rounded_rect",
+     "size": [
+      50,
+      7
+     ],
+     "corner_radius": 3.4,
+     "center": [
+      0,
+      -20
+     ],
+     "from_z": 12,
+     "floor_z": 9,
+     "adaptive": "slotting",
+     "adaptive_note": "with a 6 mm cutter and 0.2 mm left on the walls the centre has 0.6 mm of room: only slotting cuts it"
+    }
+   ]
+  },
+  {
+   "design": "cross-slot.sc",
+   "body": "CrossSlot",
+   "material": "aluminium",
+   "stock_thickness": 8,
+   "top_z": 8,
+   "volume_mm3": 72397.26,
+   "bbox": [
+    [
+     -50,
+     -50,
+     0
+    ],
+    [
+     50,
+     50,
+     8
+    ]
+   ],
+   "floor_levels": [
+    8,
+    3,
+    0
+   ],
+   "face_types": {
+    "plane": 19,
+    "cylinder": 8
+   },
+   "note": "two crossing slots, 80 x 12 and 12 x 60, 5 deep, each arm's end corners R3; the four corners where they cross stay sharp",
+   "features": [
+    {
+     "kind": "outline",
+     "shape": "rounded_rect",
+     "size": [
+      100,
+      100
+     ],
+     "corner_radius": 0,
+     "center": [
+      0,
+      0
+     ],
+     "from_z": 8,
+     "to_z": 0
+    },
+    {
+     "kind": "pocket",
+     "shape": "cross",
+     "size": [
+      80,
+      60
+     ],
+     "arms": [
+      [
+       80,
+       12
+      ],
+      [
+       12,
+       60
+      ]
+     ],
+     "corner_radius": 3,
+     "center": [
+      0,
+      0
+     ],
+     "from_z": 8,
+     "floor_z": 3,
+     "floor_area": 1520.5487,
+     "curved_length": 37.6991
+    }
+   ]
   }
  ]
 }

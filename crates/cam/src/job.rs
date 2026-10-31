@@ -53,6 +53,9 @@ pub struct Strategy {
     pub clearance: f64,
     /// How far above a surface feeds start, mm (default 1).
     pub retract: f64,
+    /// The machine's rapid traverse speed, mm/min (default 5000): used to choose the quicker
+    /// way between passes (up to clearance and across, or along cleared ground at depth).
+    pub rapid_feed: f64,
     /// Tabs holding each part to the sheet as its outline is cut through.
     pub tabs: Tabs,
     /// How pockets are roughed.
@@ -137,6 +140,7 @@ impl Default for Strategy {
             ramp_angle_deg: 3.0,
             clearance: 5.0,
             retract: 1.0,
+            rapid_feed: 5000.0,
             tabs: Tabs::default(),
             chamfer_tip_below: 0.3,
             roughing: Roughing::default(),
@@ -367,6 +371,9 @@ impl Job {
         length("strategy.chamfer_tip_below", st.chamfer_tip_below, 0.0)?;
         length("strategy.tabs.width", st.tabs.width, 0.0)?;
         length("strategy.tabs.height", st.tabs.height, 0.0)?;
+        if !(st.rapid_feed.is_finite() && (1.0..=1e6).contains(&st.rapid_feed)) {
+            return Err(CamError::Invalid(format!("strategy.rapid_feed must be from 1 to 1000000 mm/min; it is {}", st.rapid_feed)));
+        }
         if st.retract > st.clearance {
             return Err(CamError::Invalid("strategy.retract must not be above strategy.clearance".into()));
         }

@@ -10,3 +10,10 @@ recognition must find in each one, with its exact sizes, levels and volume; the 
 
 Both are built from planes, cylinders and cones only. The `.step` files carry the same solids for
 importing elsewhere.
+| `slot-plate` | 140 × 100 × 10 mm | three 70 mm slots side by side: 10 wide 4 deep (R4), 16 wide 6 deep (R3), 24 wide through (R4) |
+| `stepped-slot` | 100 × 60 × 12 mm | an 80 × 30 slot 4 deep (R4) with a 60 × 14 slot (R3) on down to z 3 in it; a 50 × 7 slot 3 deep (R3.4) only just wider than a Ø6 cutter |
+| `cross-slot` | 100 × 100 × 8 mm | an 80 × 12 and a 12 × 60 slot crossing, 5 deep, R3 at the arms' ends, sharp where they cross |
+
+The slot parts test adaptive clearing: fronts meeting long walls, a stepped floor, a slot barely
+wider than the cutter, and fronts crossing at an intersection. A pocket that isn't one rounded
+rectangle gives its `floor_area` and `curved_length` in `features.json`.

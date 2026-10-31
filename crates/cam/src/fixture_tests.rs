@@ -126,13 +126,24 @@ fn check_part(part: &Value) {
                 assert!(got["floors"].as_array().unwrap().iter().any(|fl| near(f(&fl["z"]), floor, 1e-6) && fl["in_hole"] == true));
             }
             "pocket" => {
-                let (area, curved) = rounded_rect(&feat["size"], f(&feat["corner_radius"]));
+                // a pocket that isn't one rounded rectangle (a ring round a deeper step, a cross)
+                // states its floor's area and curved length
+                let (area, curved) = match (feat.get("floor_area"), feat.get("curved_length")) {
+                    (Some(a), Some(l)) => (f(a), f(l)),
+                    _ => rounded_rect(&feat["size"], f(&feat["corner_radius"])),
+                };
                 let c = xy(&feat["center"]);
                 let floor = got["floors"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .find(|fl| near(f(&fl["z"]), f(&feat["floor_z"]), 1e-6) && fl["in_hole"] == false)
+                    .find(|fl| {
+                        let b = &fl["bounds"];
+                        near(f(&fl["z"]), f(&feat["floor_z"]), 1e-6)
+                            && fl["in_hole"] == false
+                            && near((f(&b[0][0]) + f(&b[1][0])) / 2.0, c[0], 1e-6)
+                            && near((f(&b[0][1]) + f(&b[1][1])) / 2.0, c[1], 1e-6)
+                    })
                     .unwrap_or_else(|| panic!("{name}: no pocket floor at {}", feat["floor_z"]));
                 assert!(near(f(&floor["area"]), area, chord(curved)), "{name}: pocket floor {} vs {area}", floor["area"]);
                 let b = &floor["bounds"];
@@ -202,6 +213,21 @@ fn nema23_flange_features_match_the_design() {
 #[test]
 fn front_panel_features_match_the_design() {
     check_part(&with_step(&expected()["parts"][1]));
+}
+
+#[test]
+fn slot_plate_features_match_the_design() {
+    check_part(&with_step(&expected()["parts"][2]));
+}
+
+#[test]
+fn stepped_slot_features_match_the_design() {
+    check_part(&with_step(&expected()["parts"][3]));
+}
+
+#[test]
+fn cross_slot_features_match_the_design() {
+    check_part(&with_step(&expected()["parts"][4]));
 }
 
 /// The STEP file exported from the part's design.

@@ -295,11 +295,16 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
             both_ways: st.roughing.both_ways,
             ramp,
             retract: st.retract,
+            rapid: st.rapid_feed,
         };
         let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
         for task in &tasks {
             match st.roughing.pattern {
-                Pattern::Adaptive => crate::adaptive::clear_level(&mut b, &task.area, task.z, task.from, t, &params)?,
+                Pattern::Adaptive => {
+                    for note in crate::adaptive::clear_level(&mut b, &task.area, task.z, task.from, t, &params)? {
+                        cx.warn(format!("{label}: {note}"));
+                    }
+                }
                 Pattern::Offset => {
                     let rings = fill_rings(&task.area, t.stepover())?;
                     clear_rings(&mut b, &rings, &task.area, task.z, task.from, t, ramp);
