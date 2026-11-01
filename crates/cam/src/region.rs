@@ -97,6 +97,18 @@ impl Area {
         self.boolean(other, OverlayRule::Union)
     }
 
+    /// The union of several areas in one go.
+    pub fn union_all(areas: &[&Area]) -> Result<Area> {
+        let shapes: Vec<Vec<Ring>> = areas.iter().flat_map(|a| a.shapes.iter().cloned()).collect();
+        if shapes.is_empty() {
+            return Ok(Area::empty());
+        }
+        let shapes = shapes
+            .overlay_with_fixed_scale_as::<i64>(&Vec::<Vec<Ring>>::new(), OverlayRule::Subject, FillRule::NonZero, 1.0 / GRID)
+            .map_err(|e| CamError::Geometry(format!("union of areas: {e:?}")))?;
+        Ok(Area { shapes })
+    }
+
     pub fn difference(&self, other: &Area) -> Result<Area> {
         self.boolean(other, OverlayRule::Difference)
     }

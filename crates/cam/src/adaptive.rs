@@ -18,8 +18,8 @@ use crate::{CamError, Result};
 /// Directions the engagement is sampled in round the cutter's edge.
 const RAYS: usize = 192;
 
-/// The most grid cells of the cleared map; past it the cells grow.
-const MAX_CELLS: usize = 4_000_000;
+/// The most grid cells of the cleared map (made only where cut); past it the cells grow.
+const MAX_CELLS: usize = 400_000_000;
 
 /// The most passes one pocket level may take.
 const MAX_PASSES: usize = 5_000;
@@ -49,15 +49,21 @@ impl AdaptiveParams {
     }
 }
 
-/// What has been cut, on a grid.
+/// What has been cut, on a grid kept in blocks of 64 × 64 cells, made only where something is
+/// cut: a band round the parts of a whole sheet costs what the band covers, not the sheet.
 pub struct Cleared {
     x0: f64,
     y0: f64,
     h: f64,
     nx: usize,
     ny: usize,
-    cells: Vec<bool>,
+    /// blocks across
+    bx: usize,
+    blocks: Vec<Option<Box<[bool]>>>,
 }
+
+/// A block's side, in cells.
+const BLOCK: usize = 64;
 
 impl Cleared {
     /// An uncut grid over `lo`..`hi` with cells about `h` wide (wider if there would be too many).
@@ -71,21 +77,39 @@ impl Cleared {
             h *= 1.5;
         }
         let (nx, ny) = ((w / h).ceil() as usize + 1, (d / h).ceil() as usize + 1);
-        Ok(Cleared { x0: lo[0], y0: lo[1], h, nx, ny, cells: vec![false; nx * ny] })
+        let bx = nx.div_ceil(BLOCK);
+        let by = ny.div_ceil(BLOCK);
+        Ok(Cleared { x0: lo[0], y0: lo[1], h, nx, ny, bx, blocks: vec![None; bx * by] })
     }
 
-    fn cell(&self, p: [f64; 2]) -> Option<usize> {
-        let (i, j) = ((p[0] - self.x0) / self.h, (p[1] - self.y0) / self.h);
-        if i < 0.0 || j < 0.0 {
-            return None;
+    fn get(&self, i: usize, j: usize) -> bool {
+        self.blocks
+            .get((j / BLOCK) * self.bx + i / BLOCK)
+            .and_then(|b| b.as_ref())
+            .and_then(|b| b.get((j % BLOCK) * BLOCK + i % BLOCK))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn set(&mut self, i: usize, j: usize) {
+        if i >= self.nx || j >= self.ny {
+            return;
         }
-        let (i, j) = (i as usize, j as usize);
-        (i < self.nx && j < self.ny).then_some(j * self.nx + i)
+        if let Some(b) = self.blocks.get_mut((j / BLOCK) * self.bx + i / BLOCK)
+            && let Some(cell) = b.get_or_insert_with(|| vec![false; BLOCK * BLOCK].into_boxed_slice()).get_mut((j % BLOCK) * BLOCK + i % BLOCK)
+        {
+            *cell = true;
+        }
     }
 
     /// Is the point cut? Off the grid counts as uncut.
     pub fn is_cut(&self, p: [f64; 2]) -> bool {
-        self.cell(p).and_then(|c| self.cells.get(c)).copied().unwrap_or(false)
+        let (i, j) = ((p[0] - self.x0) / self.h, (p[1] - self.y0) / self.h);
+        if !(i >= 0.0 && j >= 0.0) {
+            return false;
+        }
+        let (i, j) = (i as usize, j as usize);
+        i < self.nx && j < self.ny && self.get(i, j)
     }
 
     /// Mark the disc of radius `r` about `c` as cut.
@@ -97,10 +121,8 @@ impl Cleared {
         for j in lo_j..=hi_j {
             for i in lo_i..=hi_i {
                 let (x, y) = (self.x0 + (i as f64 + 0.5) * self.h, self.y0 + (j as f64 + 0.5) * self.h);
-                if (x - c[0]).hypot(y - c[1]) <= r
-                    && let Some(cell) = self.cells.get_mut(j * self.nx + i)
-                {
-                    *cell = true;
+                if (x - c[0]).hypot(y - c[1]) <= r {
+                    self.set(i, j);
                 }
             }
         }
@@ -132,10 +154,8 @@ impl Cleared {
             for i in i0..=i1 {
                 let x = self.x0 + (i as f64 + 0.5) * self.h;
                 let t = if l2 > 0.0 { (((x - a[0]) * dx + (y - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
-                if (x - a[0] - t * dx).hypot(y - a[1] - t * dy) <= r
-                    && let Some(cell) = self.cells.get_mut(j * self.nx + i)
-                {
-                    *cell = true;
+                if (x - a[0] - t * dx).hypot(y - a[1] - t * dy) <= r {
+                    self.set(i, j);
                 }
             }
         }
@@ -223,8 +243,6 @@ fn most_open(shape: &Area, step: f64) -> Result<([f64; 2], f64)> {
     Ok((p, depth))
 }
 
-/// The open stretches of `next`'s boundary not already run (inside `visited` grown by `tol`),
-/// each climbing: the uncut side on the left.
 /// An area's edges by grid cell, to tell quickly whether a point lies within `tol` of them.
 struct EdgeGrid {
     x0: f64,
@@ -282,34 +300,151 @@ impl EdgeGrid {
     }
 }
 
+/// What the growth inside a window offers.
+enum Pick {
+    /// The piece nearest the tool, with the stretches of front that bound it.
+    Piece(Area, Vec<Vec<[f64; 2]>>),
+    /// A piece reaching the window's edge (it may go on outside), or none nearer than the
+    /// edge: look again over a wider window.
+    Wider,
+    /// Nothing left to grow into.
+    Done,
+}
+
 /// The piece of the growth from `visited` to `next` nearest `here` (by the start of one of its
-/// stretches, or either end cutting both ways) with the stretches of front that bound it; `None`
-/// when no piece has any.
-fn nearest_piece(next: &Area, visited: &Area, here: [f64; 2], tol: f64, spacing: f64, both_ways: bool) -> Result<Option<(Area, Vec<Vec<[f64; 2]>>)>> {
+/// stretches, or either end cutting both ways) with the stretches of front that bound it.
+///
+/// `window` is where `next` was found, `None` for the whole region: a piece reaching within
+/// a hair of its edge may be cut short there, and one outside could be nearer than any inside
+/// when the nearest inside is farther than the edge.
+#[allow(clippy::too_many_arguments)]
+fn nearest_piece(
+    next: &Area,
+    visited: &Area,
+    here: [f64; 2],
+    tol: f64,
+    spacing: f64,
+    both_ways: bool,
+    window: Option<([f64; 2], [f64; 2])>,
+) -> Result<Pick> {
     let growth = next.difference(visited)?;
     let near_visited = EdgeGrid::new(visited, tol);
     let d = |q: [f64; 2], r: [f64; 2]| (q[0] - r[0]).hypot(q[1] - r[1]);
-    // a piece's front: its outline where it doesn't run along the visited region's edge
-    let pieces: Vec<(Area, Vec<Vec<[f64; 2]>>)> = growth
-        .shapes
-        .iter()
-        .map(|sh| {
-            let piece = Area { shapes: vec![sh.clone()] };
-            let segs = fronts(&piece, &near_visited, spacing);
-            (piece, segs)
-        })
-        .collect();
     let reach = |sg: &Vec<[f64; 2]>| {
         let first = sg.first().map_or(f64::INFINITY, |q| d(*q, here));
         let last = if both_ways { sg.last().map_or(f64::INFINITY, |q| d(*q, here)) } else { f64::INFINITY };
         first.min(last)
     };
-    Ok(pieces.into_iter().filter(|(_, g)| !g.is_empty()).min_by(|a, b| {
-        let near = |g: &Vec<Vec<[f64; 2]>>| g.iter().map(reach).fold(f64::INFINITY, f64::min);
-        near(&a.1).total_cmp(&near(&b.1))
-    }))
+    let edge = |lo: [f64; 2], hi: [f64; 2]| match window {
+        None => false,
+        Some((wlo, whi)) => {
+            let m = 4.0 * tol + 0.01;
+            lo[0] < wlo[0] + m || lo[1] < wlo[1] + m || hi[0] > whi[0] - m || hi[1] > whi[1] - m
+        }
+    };
+    let border = window.map_or(f64::INFINITY, |(wlo, whi)| (here[0] - wlo[0]).min(here[1] - wlo[1]).min(whi[0] - here[0]).min(whi[1] - here[1]));
+    let mut best: Option<(f64, Area, Vec<Vec<[f64; 2]>>)> = None;
+    let mut cut_short = f64::INFINITY;
+    for sh in &growth.shapes {
+        // a piece's front: its outline where it doesn't run along the visited region's edge
+        let piece = Area { shapes: vec![sh.clone()] };
+        let segs = fronts(&piece, &near_visited, spacing);
+        if segs.is_empty() {
+            continue;
+        }
+        let r = segs.iter().map(reach).fold(f64::INFINITY, f64::min);
+        let Some((lo, hi)) = piece.bounds() else { continue };
+        if edge(lo, hi) {
+            cut_short = cut_short.min(r);
+        } else if best.as_ref().is_none_or(|(b, ..)| r < *b) {
+            best = Some((r, piece, segs));
+        }
+    }
+    Ok(match best {
+        Some((r, piece, segs)) if r <= cut_short && r <= border => Pick::Piece(piece, segs),
+        _ if window.is_some() => Pick::Wider,
+        Some((_, piece, segs)) => Pick::Piece(piece, segs),
+        None => Pick::Done,
+    })
 }
 
+/// An area kept in square tiles: a window of it is quick to read, and adding a small area
+/// changes only the tiles under it.
+struct Tiled {
+    x0: f64,
+    y0: f64,
+    size: f64,
+    nx: usize,
+    ny: usize,
+    tiles: Vec<Area>,
+}
+
+impl Tiled {
+    /// Empty tiles about `size` wide over `lo`..`hi` (wider if there would be more than 200 a
+    /// side); the outermost reach on outwards.
+    fn new(lo: [f64; 2], hi: [f64; 2], size: f64) -> Tiled {
+        let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-3);
+        let size = size.max(span / 200.0).max(1e-3);
+        let nx = (((hi[0] - lo[0]) / size).ceil() as usize).clamp(1, 200);
+        let ny = (((hi[1] - lo[1]) / size).ceil() as usize).clamp(1, 200);
+        Tiled { x0: lo[0], y0: lo[1], size, nx, ny, tiles: vec![Area::empty(); nx * ny] }
+    }
+
+    /// The tiles over `lo`..`hi`: first and last across, first and last up.
+    fn span(&self, lo: [f64; 2], hi: [f64; 2]) -> (usize, usize, usize, usize) {
+        let f = |v: f64, o: f64, n: usize| (((v - o) / self.size).floor().max(0.0) as usize).min(n - 1);
+        (f(lo[0], self.x0, self.nx), f(hi[0], self.x0, self.nx), f(lo[1], self.y0, self.ny), f(hi[1], self.y0, self.ny))
+    }
+
+    fn rect(&self, i: usize, j: usize) -> Result<Area> {
+        // the outermost tiles reach a metre on, for whatever lies past the bounds
+        let far = 1000.0;
+        let x0 = if i == 0 { self.x0 - far } else { self.x0 + i as f64 * self.size };
+        let x1 = if i + 1 == self.nx { self.x0 + self.nx as f64 * self.size + far } else { self.x0 + (i + 1) as f64 * self.size };
+        let y0 = if j == 0 { self.y0 - far } else { self.y0 + j as f64 * self.size };
+        let y1 = if j + 1 == self.ny { self.y0 + self.ny as f64 * self.size + far } else { self.y0 + (j + 1) as f64 * self.size };
+        Area::rect(x0, y0, x1, y1)
+    }
+
+    fn add(&mut self, a: &Area) -> Result<()> {
+        let Some((lo, hi)) = a.bounds() else { return Ok(()) };
+        let (i0, i1, j0, j1) = self.span(lo, hi);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let part = a.intersection(&self.rect(i, j)?)?;
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some(t) = self.tiles.get_mut(j * self.nx + i) {
+                    *t = if t.is_empty() { part } else { t.union(&part)? };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The area within `lo`..`hi`.
+    fn window(&self, lo: [f64; 2], hi: [f64; 2]) -> Result<Area> {
+        let (i0, i1, j0, j1) = self.span(lo, hi);
+        let parts: Vec<&Area> =
+            (j0..=j1).flat_map(|j| (i0..=i1).map(move |i| j * self.nx + i)).filter_map(|k| self.tiles.get(k)).filter(|t| !t.is_empty()).collect();
+        Area::union_all(&parts)?.intersection(&Area::rect(lo[0], lo[1], hi[0], hi[1])?)
+    }
+}
+
+/// `lo`..`hi` of the points, grown by `m`.
+fn bbox(pts: &[[f64; 2]], m: f64) -> ([f64; 2], [f64; 2]) {
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for p in pts {
+        lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+        hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+    }
+    ([lo[0] - m, lo[1] - m], [hi[0] + m, hi[1] + m])
+}
+
+/// The open stretches of `next`'s boundary not already run (within the grid's tolerance of
+/// the visited region's edges), each climbing: the uncut side on the left.
 fn fronts(next: &Area, visited: &EdgeGrid, spacing: f64) -> Vec<Vec<[f64; 2]>> {
     let mut out = Vec::new();
     for ring in next.rings() {
@@ -439,15 +574,33 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
             2.0 * (room.max(0.0) + shrink)
         )));
     }
+    // A channel giving the centre less room across than the cutter's radius (as between two
+    // parts nested close): moving on along either side of the cleared strip, the material
+    // beside it, which the cutter's edge only just reached before, lies on a quarter of the
+    // edge however small the step. There the limit is that quarter and a straight cut's
+    // engagement at the step, and the note says so.
+    let narrow = 2.0 * room < rt;
+    let limit =
+        if narrow { p.max_engagement.max(std::f64::consts::FRAC_PI_2 + AdaptiveParams::straight_engagement(step, rt)) } else { p.max_engagement };
     b.travel_to([c[0] + rh, c[1]], from);
     b.line([c[0] + rh, c[1], from], t.plunge);
     let pitch = (std::f64::consts::TAU * rh * p.ramp.tan()).max(0.01);
     b.helix(c, rh, z, pitch, t.feed);
     cleared.stamp(c, rh + rt);
-    let mut centres = Area::circle(c[0], c[1], rh, 0.01)?.intersection(shape)?;
-    // the centres grown by the full step: offsetting a union is the union of the offsets, so
-    // each piece cut adds its own offset rather than the whole region being offset again
-    let mut grown = centres.offset(step, 0.01)?;
+    let centres = Area::circle(c[0], c[1], rh, 0.01)?.intersection(shape)?;
+    // The centres' region, the same grown by the full step, and the region itself, in tiles:
+    // each pass reads a window round the tool, and adds what it cut to the tiles under it, so
+    // a pass costs what is near it, not what the whole region holds. Offsetting a union is the
+    // union of the offsets, so each piece cut adds its own offset to the grown region.
+    let tile = (8.0 * rt).max(6.0 * step).max(2.0);
+    let margin = 2.0 * step + rt + 1.0;
+    let (blo, bhi) = ([lo[0] - margin, lo[1] - margin], [hi[0] + margin, hi[1] + margin]);
+    let mut cen = Tiled::new(blo, bhi, tile);
+    cen.add(&centres)?;
+    let mut grown = Tiled::new(blo, bhi, tile);
+    grown.add(&centres.offset(step, 0.01)?)?;
+    let mut region = Tiled::new(blo, bhi, tile);
+    region.add(shape)?;
     // the first point still over the limit at the finest step, if any
     let mut over: Option<[f64; 2]> = None;
     // the step the last pass took: the next starts at twice that (up to the full step), not
@@ -461,32 +614,49 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
         // on, instead of hopping from arm to arm every pass. Where a piece would engage more
         // than the limit anywhere (where its front meets a wall or wraps round an island), it
         // is grown again at half the step, down to a sixteenth: smaller steps, smooth fronts.
+        // The growth is looked for in a window round the tool, twice as wide each time the
+        // nearest piece might reach past it, up to the whole region.
         let here = [b.at[0], b.at[1]];
-        let mut s = if last * 2.0 >= step - 1e-12 { step } else { last * 2.0 };
-        let (piece, segs) = loop {
-            let next = if s == step { grown.clone() } else { centres.offset(s, 0.01)? };
-            let next = next.intersection(shape)?;
-            let Some((piece, segs)) = nearest_piece(&next, &centres, here, (s * 0.05).max(0.005), spacing, p.both_ways)? else {
-                break (Area::default(), Vec::new());
-            };
-            let hot = hot_points(&segs, &cleared, rt, p.max_engagement);
-            if hot.is_empty() {
-                break (piece, segs);
-            }
-            if s <= step / 16.0 + 1e-12 {
-                if over.is_none() {
-                    over = hot.first().copied();
+        let s0 = if last * 2.0 >= step - 1e-12 { step } else { last * 2.0 };
+        let mut half = tile;
+        let picked = 'window: loop {
+            let (wlo, whi) = ([here[0] - half, here[1] - half], [here[0] + half, here[1] + half]);
+            let whole = wlo[0] <= blo[0] && wlo[1] <= blo[1] && whi[0] >= bhi[0] && whi[1] >= bhi[1];
+            let (wlo, whi) = if whole { (blo, bhi) } else { (wlo, whi) };
+            // read a step and a millimetre wider: the growth inside the window is exact
+            let pad = step + 1.0;
+            let visited = cen.window([wlo[0] - pad, wlo[1] - pad], [whi[0] + pad, whi[1] + pad])?;
+            let inside = region.window(wlo, whi)?;
+            let mut s = s0;
+            loop {
+                let next = if s == step { grown.window(wlo, whi)? } else { visited.offset(s, 0.01)? };
+                let next = next.intersection(&inside)?;
+                let window = (!whole).then_some((wlo, whi));
+                match nearest_piece(&next, &visited, here, (s * 0.05).max(0.005), spacing, p.both_ways, window)? {
+                    Pick::Done => break 'window None,
+                    Pick::Wider => {
+                        half *= 2.0;
+                        continue 'window;
+                    }
+                    Pick::Piece(piece, segs) => {
+                        let hot = hot_points(&segs, &cleared, rt, limit);
+                        if hot.is_empty() {
+                            break 'window Some((piece, segs, s));
+                        }
+                        if s <= step / 16.0 + 1e-12 {
+                            if over.is_none() {
+                                over = hot.first().copied();
+                            }
+                            break 'window Some((piece, segs, s));
+                        }
+                        s /= 2.0;
+                    }
                 }
-                break (piece, segs);
             }
-            s /= 2.0;
         };
+        let Some((piece, segs, s)) = picked else { break };
         last = s;
-        if segs.is_empty() {
-            break;
-        }
-        // links at depth go through the centres' region (cleared ground), checked every 0.05 mm
-        let safe = centres.clone();
+        let maps = Maps { cen: &cen, region: &region, pad: step + rt + 1.0 };
         let mut todo = segs;
         while !todo.is_empty() {
             let here = [b.at[0], b.at[1]];
@@ -514,6 +684,8 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
                 // (at least 2 mm) each point goes from the cleared edge out to the ring in
                 // proportion, so the cut deepens from nothing to the step; round the ring; then
                 // that first stretch again at full width.
+                let (rlo, rhi) = bbox(&sg, maps.pad);
+                let near = cen.window(rlo, rhi)?;
                 let len: f64 = sg.windows(2).map(|w| w.first().zip(w.get(1)).map_or(0.0, |(a, b)| (b[0] - a[0]).hypot(b[1] - a[1]))).sum();
                 let lead_len = (len / 4.0).max(2.0).min(len * 0.9);
                 let mut along = 0.0;
@@ -521,19 +693,19 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
                 for w in sg.windows(2) {
                     let (Some(a), Some(q)) = (w.first(), w.get(1)) else { continue };
                     if lead.is_empty() {
-                        lead.push(nearest_on(&centres, *a).unwrap_or(*a));
+                        lead.push(nearest_on(&near, *a).unwrap_or(*a));
                     }
                     along += (q[0] - a[0]).hypot(q[1] - a[1]);
                     if along >= lead_len {
                         break;
                     }
                     let f = along / lead_len;
-                    let n = nearest_on(&centres, *q).unwrap_or(*q);
+                    let n = nearest_on(&near, *q).unwrap_or(*q);
                     lead.push([n[0] + (q[0] - n[0]) * f, n[1] + (q[1] - n[1]) * f]);
                 }
                 let k = lead.len();
                 let Some(&first) = lead.first() else { continue };
-                link(b, &centres, &safe, c, shape, first, z, from, t, p);
+                link(b, &maps, c, first, z, from, t, p)?;
                 for q in lead.iter().skip(1) {
                     b.line([q[0], q[1], z], t.feed);
                 }
@@ -544,86 +716,106 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
                 cleared.sweep(&sg, rt);
                 continue;
             } else {
-                link(b, &centres, &safe, c, shape, start, z, from, t, p);
+                link(b, &maps, c, start, z, from, t, p)?;
             }
             for q in sg.iter().skip(1) {
                 b.line([q[0], q[1], z], t.feed);
             }
             cleared.sweep(&sg, rt);
         }
-        // repeated offsets add a vertex at every round corner: thin them out
-        centres = centres.union(&piece)?.simplified(0.002)?;
-        grown = piece.offset(step, 0.01).and_then(|g| grown.union(&g))?.simplified(0.002)?;
+        // offsets add a vertex at every round corner: thin each piece out before it is kept
+        let piece = piece.simplified(0.002)?;
+        cen.add(&piece)?;
+        grown.add(&piece.offset(step, 0.01)?.simplified(0.002)?)?;
     }
-    Ok(over.map(|q| {
-        format!(
+    if let Some(q) = over {
+        return Ok(Some(format!(
             "adaptive: near ({:.2}, {:.2}) on z {z:.3} T{} engages more than {:.0}° even at a sixteenth of the stepover",
             q[0],
             q[1],
             t.number,
-            p.max_engagement.to_degrees()
+            limit.to_degrees()
+        )));
+    }
+    Ok(narrow.then(|| {
+        format!(
+            "adaptive: the region at {} on z {z:.3} leaves T{}'s centre {:.2} mm of room or less: passes along its sides engage up to {:.0}° (a smaller cutter or a wider gap keeps it down)",
+            at(shape),
+            t.number,
+            2.0 * (room + shrink),
+            limit.to_degrees()
         )
     }))
 }
 
-/// From where the tool is (at depth `z`) to `to`: straight at depth through cleared area, or
-/// lifted over it and back down where it is cleared, or up and over at clearance.
+/// Windows of the centres' region (cleared ground) and of the region the centre may go, for
+/// links: each read round the link's ends, `pad` wider.
+struct Maps<'a> {
+    cen: &'a Tiled,
+    region: &'a Tiled,
+    pad: f64,
+}
+
+/// From where the tool is (at depth `z`) to `to`, the quickest way: straight at depth through
+/// cleared ground; at depth through the hub (round a corner, as from one arm of a cross to
+/// another); lifted just above the level and across over the region; or up to clearance and
+/// across at rapid speed. A way slower than going up and over is not looked at.
 #[allow(clippy::too_many_arguments)]
-fn link(
-    b: &mut PathBuilder,
-    centres: &Area,
-    safe: &Area,
-    hub: [f64; 2],
-    shape: &Area,
-    to: [f64; 2],
-    z: f64,
-    from: f64,
-    t: &Tool,
-    p: &AdaptiveParams,
-) {
+fn link(b: &mut PathBuilder, maps: &Maps, hub: [f64; 2], to: [f64; 2], z: f64, from: f64, t: &Tool, p: &AdaptiveParams) -> Result<()> {
     let here = [b.at[0], b.at[1]];
     if (here[0] - to[0]).hypot(here[1] - to[1]) < 1e-9 && (b.at[2] - z).abs() < 1e-9 {
-        return;
+        return Ok(());
     }
     let down = (b.at[2] - z).abs() < 1e-9;
     let d = |a: [f64; 2], q: [f64; 2]| (a[0] - q[0]).hypot(a[1] - q[1]);
-    // the ways there, by time: straight at depth through cleared ground; at depth through the
-    // hub (round a corner, as from one arm of a cross to another); lifted just above the level
-    // and across over the pocket; up to clearance and across at rapid speed
-    let over = nearest_on(centres, to).unwrap_or(to);
+    let (tlo, thi) = bbox(&[to], maps.pad);
+    let over = nearest_on(&maps.cen.window(tlo, thi)?, to).unwrap_or(to);
     let lift = from + p.retract;
     let (feed, plunge, rapid) = (t.feed.max(1e-6), t.plunge.max(1e-6), p.rapid.max(1e-6));
     let up_feed = t.plunge.max(t.feed).max(1e-6);
-    let straight = down && inside_all_the_way(safe, here, to);
-    let via_hub = down && inside_all_the_way(safe, here, hub) && inside_all_the_way(safe, hub, to);
-    let lifted = down && inside_all_the_way(shape, here, over);
     let clear = b.h.clearance;
     let above = (from + p.retract).min(clear);
     let up_time =
         ((clear - b.at[2]).max(0.0) + d(here, over) + (clear - above).max(0.0)) / rapid + (above - z).max(0.0) / plunge + d(over, to) / feed;
-    let mut best: Option<(f64, u8)> = None;
-    for (ok, time, way) in [
-        (straight, d(here, to) / feed, 0u8),
-        (via_hub, (d(here, hub) + d(hub, to)) / feed, 1),
-        (lifted, (lift - z) / up_feed + (d(here, over) + d(over, to)) / feed + (lift - z) / plunge, 2),
-        (true, up_time, 3),
-    ] {
-        if ok && best.is_none_or(|(l, _)| time < l) {
-            best = Some((time, way));
+    let mut ways = [
+        (d(here, to) / feed, 0u8),
+        ((d(here, hub) + d(hub, to)) / feed, 1),
+        ((lift - z) / up_feed + (d(here, over) + d(over, to)) / feed + (lift - z) / plunge, 2),
+    ];
+    ways.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let inside = |tiles: &Tiled, a: [f64; 2], q: [f64; 2]| -> Result<bool> {
+        let (lo, hi) = bbox(&[a, q], 1.0);
+        Ok(inside_all_the_way(&tiles.window(lo, hi)?, a, q))
+    };
+    let mut way = 3u8;
+    if down {
+        for (time, w) in ways {
+            if time >= up_time {
+                break;
+            }
+            let ok = match w {
+                0 => inside(maps.cen, here, to)?,
+                1 => inside(maps.cen, here, hub)? && inside(maps.cen, hub, to)?,
+                _ => inside(maps.region, here, over)?,
+            };
+            if ok {
+                way = w;
+                break;
+            }
         }
     }
-    match best.map(|(_, w)| w) {
-        Some(0) => {
+    match way {
+        0 => {
             b.line([to[0], to[1], z], t.feed);
-            return;
+            return Ok(());
         }
-        Some(1) => {
+        1 => {
             b.line([hub[0], hub[1], z], t.feed);
             b.line([to[0], to[1], z], t.feed);
-            return;
+            return Ok(());
         }
-        Some(2) => {
-            // above this level's material (the levels above cleared all of `shape`), but at
+        2 => {
+            // above this level's material (the levels above cleared all of the region), but at
             // feed: rapids across run at clearance height only
             b.line([here[0], here[1], lift], up_feed);
             b.line([over[0], over[1], lift], t.feed);
@@ -635,4 +827,5 @@ fn link(
     }
     b.line([over[0], over[1], z], t.plunge);
     b.line([to[0], to[1], z], t.feed);
+    Ok(())
 }

@@ -226,7 +226,7 @@ mod part_tests {
 }
 
 mod job_tests {
-    use crate::job::{Job, ToolKind};
+    use crate::job::{CutOutMethod, Job, ToolKind, ToolLibrary};
 
     const MINIMAL: &str = r#"{"stock": {"size": [600, 400], "thickness": 10}, "parts": [{"body": "Flange"}]}"#;
 
@@ -235,10 +235,91 @@ mod job_tests {
         let j = Job::from_json(MINIMAL).unwrap();
         assert_eq!(j.version, 1);
         assert_eq!(j.stock.spoilboard_allowance, 0.2);
-        assert_eq!((j.nest.margin, j.nest.spacing, j.nest.rotate), (10.0, 10.0, true));
+        assert_eq!((j.nest.margin, j.nest.spacing, j.nest.rotate), (10.0, 8.0, true));
         assert_eq!(j.parts[0].quantity, 1);
         assert_eq!(j.parts[0].label(), "Flange");
-        assert!(j.tools.is_empty());
+        let c = &j.strategy.cut_out;
+        assert_eq!((c.method, c.skin, c.skin_stepdown), (CutOutMethod::Skin, 0.5, 0.1));
+        // no tools listed and no library named: the built-in library's
+        assert_eq!(j.tools.iter().map(|t| t.number).collect::<Vec<_>>(), vec![1, 2, 3, 6, 9, 10]);
+    }
+
+    /// The built-in library: single-flute end mills Ø1, Ø2, Ø3 and Ø6 as T1, T2, T3 and T6, and
+    /// 90° chamfer mills Ø6 and Ø12 as T9 and T10. With it, roughing takes the Ø6, finishing
+    /// the Ø3 (the largest smaller than the roughing tool), cutting out the Ø6 (its 22 mm flutes
+    /// reach through 10 mm and the 0.2 below), chamfers the first chamfer mill.
+    #[test]
+    fn the_builtin_library_holds_the_usual_tools() {
+        let lib = ToolLibrary::builtin().unwrap();
+        let got: Vec<(u32, ToolKind, f64, u32)> = lib.tools.iter().map(|t| (t.number, t.kind, t.diameter, t.flutes)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, ToolKind::Flat, 1.0, 1),
+                (2, ToolKind::Flat, 2.0, 1),
+                (3, ToolKind::Flat, 3.0, 1),
+                (6, ToolKind::Flat, 6.0, 1),
+                (9, ToolKind::Chamfer, 6.0, 1),
+                (10, ToolKind::Chamfer, 12.0, 1)
+            ]
+        );
+        assert!(lib.tools.iter().filter(|t| t.kind == ToolKind::Chamfer).all(|t| t.tip_angle() == 90.0));
+        let j = Job::from_json(MINIMAL).unwrap();
+        let n = |t: Option<&crate::job::Tool>| t.map(|t| t.number);
+        assert_eq!((n(j.rough_tool()), n(j.finish_tool()), n(j.profile_tool()), n(j.chamfer_tool())), (Some(6), Some(3), Some(6), Some(9)));
+    }
+
+    /// Holes no drill fits are milled with the finishing tool when the hole's radius is at least
+    /// 1.05 times the tool's, else with the largest end mill it is for: Ø3.2 takes the Ø3
+    /// (3.15 ≤ 3.2), Ø2.5 the Ø2 (2.1 ≤ 2.5 < 3.15), Ø1.5 the Ø1 (1.05 ≤ 1.5 < 2.1); Ø1 none.
+    #[test]
+    fn holes_take_the_largest_end_mill_that_fits() {
+        let j = Job::from_json(MINIMAL).unwrap();
+        let n = |d: f64| j.hole_tool(d).map(|t| t.number);
+        assert_eq!((n(3.2), n(2.5), n(1.5), n(1.0)), (Some(3), Some(2), Some(1), None));
+    }
+
+    /// A library file adds its tools to the job's; a job tool of the same number replaces the
+    /// library's (T6 here, fed at 1500 not 1000), and the strategy may name a library tool. A
+    /// job naming a library read where there is nothing to read it with is refused.
+    #[test]
+    fn a_library_file_adds_tools_and_the_job_replaces_by_number() {
+        let lib = r#"{"version": 1, "name": "shop", "tools": [
+            {"number": 4, "kind": "flat", "diameter": 4, "flute_length": 12, "rpm": 20000, "feed": 800, "plunge": 200},
+            {"number": 6, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1000, "plunge": 250}]}"#;
+        let text = r#"{"stock": {"size": [600, 400], "thickness": 10}, "library": "shop.json",
+            "tools": [{"number": 6, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1500, "plunge": 250}],
+            "strategy": {"finish_tool": 4}, "parts": [{"body": "B"}]}"#;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let load = |path: &str| {
+            asked.borrow_mut().push(path.to_string());
+            Ok(lib.to_string())
+        };
+        let j = Job::from_json_with(text, &load).unwrap();
+        assert_eq!(asked.borrow().as_slice(), ["shop.json"]);
+        assert_eq!(j.tools.iter().map(|t| (t.number, t.feed)).collect::<Vec<_>>(), vec![(4, 800.0), (6, 1500.0)]);
+        assert_eq!(j.finish_tool().map(|t| t.number), Some(4));
+        let err = Job::from_json(text).unwrap_err().to_string();
+        assert!(err.contains("shop.json"), "{err}");
+        let bad = Job::from_json_with(text, &|_| {
+            Ok(r#"{"version": 1, "tools": [{"number": 0, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 1, "feed": 1, "plunge": 1}]}"#
+                .into())
+        });
+        assert!(bad.unwrap_err().to_string().contains("library.tools[0].number"));
+    }
+
+    /// The skin must be thinner than the sheet; its passes at least 0.01 mm.
+    #[test]
+    fn the_skin_is_checked() {
+        let with = |extra: &str| {
+            Job::from_json(&format!(
+                r#"{{"stock": {{"size": [600, 400], "thickness": 3}}, "strategy": {{"cut_out": {{{extra}}}}}, "parts": [{{"body": "B"}}]}}"#
+            ))
+        };
+        assert!(with(r#""skin": 0.5, "skin_stepdown": 0.1"#).is_ok());
+        assert!(with(r#""skin": 3"#).unwrap_err().to_string().contains("skin"));
+        assert!(with(r#""skin_stepdown": 0"#).unwrap_err().to_string().contains("skin_stepdown"));
+        assert_eq!(with(r#""method": "profile""#).unwrap().strategy.cut_out.method, CutOutMethod::Profile);
     }
 
     #[test]
@@ -479,8 +560,18 @@ mod plan_tests {
         out
     }
 
-    fn op(ops: &[Operation], kind: OpKind) -> &Operation {
-        ops.iter().find(|o| o.kind == kind).unwrap_or_else(|| panic!("no {kind:?} operation: {:?}", ops.iter().map(|o| o.kind).collect::<Vec<_>>()))
+    /// Every operation of `kind` joined into one, in order (roughing, walls and contours come
+    /// one operation per level).
+    fn op(ops: &[Operation], kind: OpKind) -> Operation {
+        let of: Vec<&Operation> = ops.iter().filter(|o| o.kind == kind).collect();
+        let first = of.first().unwrap_or_else(|| panic!("no {kind:?} operation: {:?}", ops.iter().map(|o| o.kind).collect::<Vec<_>>()));
+        Operation {
+            kind,
+            name: first.name.clone(),
+            tool: first.tool,
+            rpm: first.rpm,
+            moves: of.iter().flat_map(|o| o.moves.iter().cloned()).collect(),
+        }
     }
 
     /// Distance from (x, y) to the outside of the axis-aligned box [x0, x1] × [y0, y1]: negative inside.
@@ -519,7 +610,7 @@ mod plan_tests {
             let text = format!("corner at ({x:.2}, {y:.2}) down to z 6.000: it leaves material up to 1.24 mm");
             assert!(plan.warnings.iter().any(|w| w.contains(&text)), "{text}: {:?}", plan.warnings);
         }
-        let rough = op(&plan.ops, OpKind::Roughing);
+        let rough = &op(&plan.ops, OpKind::Roughing);
         let pts = sample(rough, [0.0, 0.0, 15.0]);
         assert!(pts.iter().all(|a| !a.drill), "roughing has no drilling cycles");
         let cutting: Vec<&At> = pts.iter().filter(|a| !a.rapid && a.p[2] < 10.0 - 1e-9).collect();
@@ -558,7 +649,7 @@ mod plan_tests {
     fn the_floor_is_finished_at_its_height_and_covered() {
         let f = read_part(&pocket_plate()).unwrap();
         let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
-        let pts = sample(op(&plan.ops, OpKind::FloorFinish), [0.0, 0.0, 15.0]);
+        let pts = sample(&op(&plan.ops, OpKind::FloorFinish), [0.0, 0.0, 15.0]);
         let floor: Vec<[f64; 3]> = pts.iter().filter(|a| !a.rapid && (a.p[2] - 6.0).abs() < 1e-9).map(|a| a.p).collect();
         assert!(!floor.is_empty());
         for p in &floor {
@@ -586,7 +677,7 @@ mod plan_tests {
     fn walls_are_finished_climbing_at_the_tool_radius() {
         let f = read_part(&pocket_plate()).unwrap();
         let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
-        let walls = op(&plan.ops, OpKind::WallFinish);
+        let walls = &op(&plan.ops, OpKind::WallFinish);
         let pts = sample(walls, [0.0, 0.0, 15.0]);
         let at6: Vec<[f64; 2]> = pts.iter().filter(|a| !a.rapid && (a.p[2] - 6.0).abs() < 1e-9).map(|a| [a.p[0], a.p[1]]).collect();
         assert!(!at6.is_empty(), "the walls are finished down to the floor");
@@ -605,13 +696,150 @@ mod plan_tests {
         }
     }
 
+    const FLAT3: &str =
+        r#"{"number": 2, "kind": "flat", "diameter": 3, "flute_length": 12, "rpm": 22000, "feed": 700, "plunge": 150, "stepdown": 1.5}"#;
+
+    /// Distance from `p` to the nearer of the two plates (sheet coordinates).
+    fn to_plates(p: [f64; 3]) -> f64 {
+        rect_dist(p, 10.0, 10.0, 50.0, 40.0).min(rect_dist(p, 58.0, 10.0, 98.0, 40.0))
+    }
+
+    /// Two 40 × 30 plates 6 thick on a 110 × 50 sheet 6 thick, 8 apart (x 10…50 and 58…98, y
+    /// 10…40), with the `skin` cut-out (Ø6 roughing and contour, Ø3 finishing):
+    /// - roughing clears a band round them down to the skin's top, −6 + 0.5 = −5.5, in levels of
+    ///   at most 3 (−2.75, −5.5), its centre never nearer the plates than 3 + 0.2, and through
+    ///   the gap between them (centres between x 53.2 and 54.8) at −5.5; the band is narrower
+    ///   than the cutter's radius leaves room for, so a note says passes along its sides engage
+    ///   up to 90° + acos(1 − 0.9/3) = 136°;
+    /// - the contour runs 3 outside each plate at −2.75 and −5.5;
+    /// - last of all, the skin is cut through 3 outside each plate at −5.6, −5.7 … −6.2 (to the
+    ///   spoilboard allowance), both plates at each level before the next, the tool only ever
+    ///   going down while it cuts (no tabs);
+    /// - each kind of work goes level by level over the sheet, the deepest last.
+    ///
+    /// With the `profile` cut-out, none of that: a slot round each part instead.
+    #[test]
+    fn the_skin_cut_out_clears_round_the_parts_and_separates_them_last() {
+        use crate::nest::Placement;
+        use crate::plan::plan_sheet;
+        let plate = box_solid(v(-20.0, -15.0, 0.0), v(20.0, 15.0, 6.0)).unwrap();
+        let f = read_part(&plate).unwrap();
+        let sheet = |extra: &str| {
+            Job::from_json(&format!(
+                r#"{{"stock": {{"size": [110, 50], "thickness": 6}}, "tools": [{FLAT6}, {FLAT3}], "parts": [{{"body": "P"}}] {extra}}}"#
+            ))
+            .unwrap()
+        };
+        let pls = |copy: u32, x: f64| Placement { part: 0, label: "P".into(), copy, quarter_turns: 0, offset: [x, 25.0], bounds: [[0.0; 2]; 2] };
+        let j = sheet("");
+        let plan = plan_part(&f, &j, "P").unwrap();
+        let (ops, warnings) = plan_sheet(&j, &[(&f, &plan)], &[pls(0, 30.0), pls(1, 78.0)]).unwrap();
+        let limit = format!("{:.0}°", 90.0 + (1.0f64 - 0.9 / 3.0).acos().to_degrees());
+        assert!(!warnings.is_empty() && warnings.iter().all(|w| w.starts_with("round the parts: adaptive:") && w.contains(&limit)), "{warnings:#?}");
+
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // the band's roughing
+        let band: Vec<&Operation> = ops.iter().filter(|o| o.name.starts_with("round the parts")).collect();
+        let levels: Vec<f64> = band.iter().map(|o| o.deepest()).collect();
+        assert!(levels.len() == 2 && near(levels[0], -2.75) && near(levels[1], -5.5), "{levels:?}");
+        let mut in_gap = 0;
+        for o in &band {
+            for a in sample(o, [0.0, 0.0, 5.0]).iter().filter(|a| !a.rapid && a.p[2] < 0.0) {
+                assert!(a.p[2] >= -5.5 - 1e-9, "below the skin at {:?}", a.p);
+                assert!(to_plates(a.p) >= 3.2 - 0.006, "{:?} is {:.4} from a plate", a.p, to_plates(a.p));
+                if near(a.p[2], -5.5) && a.p[0] > 53.2 - 0.01 && a.p[0] < 54.8 + 0.01 && a.p[1] > 15.0 && a.p[1] < 35.0 {
+                    in_gap += 1;
+                }
+            }
+        }
+        assert!(in_gap > 50, "the gap is cut at the skin's top ({in_gap} samples)");
+
+        // the contour, 3 outside each plate down to the skin's top
+        let contour: Vec<&Operation> = ops.iter().filter(|o| o.kind == OpKind::Profile).collect();
+        let levels: Vec<f64> = contour.iter().map(|o| o.deepest()).collect();
+        assert_eq!(levels.len(), 4, "{levels:?}");
+        assert!(near(levels[0], -2.75) && near(levels[1], -2.75) && near(levels[2], -5.5) && near(levels[3], -5.5), "{levels:?}");
+        // the separation: 3 outside each plate, level by level, both plates at each
+        let sep: Vec<&Operation> = ops.iter().filter(|o| o.kind == OpKind::Separation).collect();
+        let want: Vec<f64> = (1..=7).flat_map(|k| [-5.5 - 0.1 * k as f64; 2]).collect();
+        let got: Vec<f64> = sep.iter().map(|o| o.deepest()).collect();
+        assert!(got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-9), "{got:?}");
+        for o in contour.iter().chain(&sep) {
+            assert_eq!(o.tool, 1, "the Ø6");
+            let level = o.deepest();
+            // between rapids the tool only ever goes down (no tabs to climb over)
+            let mut prev = f64::INFINITY;
+            for a in sample(o, [0.0, 0.0, 5.0]) {
+                if a.rapid {
+                    prev = f64::INFINITY;
+                    continue;
+                }
+                assert!(a.p[2] <= prev + 1e-9, "{:?} rises", a.p);
+                prev = a.p[2];
+                if a.p[2] < 0.0 {
+                    assert!((to_plates(a.p) - 3.0).abs() <= 0.006, "{:?} is {:.4} from a plate", a.p, to_plates(a.p));
+                    assert!(a.p[2] >= level - 1e-9);
+                }
+            }
+        }
+        // kind by kind, each level by level over the sheet; the separation last
+        let first_sep = ops.iter().position(|o| o.kind == OpKind::Separation).unwrap();
+        assert!(ops[first_sep..].iter().all(|o| o.kind == OpKind::Separation));
+        assert!(ops.windows(2).all(|w| w[0].kind.rank() <= w[1].kind.rank()));
+        for kind in [OpKind::Roughing, OpKind::Profile, OpKind::Separation] {
+            let d: Vec<f64> = ops.iter().filter(|o| o.kind == kind).map(|o| o.deepest()).collect();
+            assert!(d.windows(2).all(|w| w[1] <= w[0] + 1e-9), "{kind:?} by depth: {d:?}");
+        }
+
+        let j = sheet(r#", "strategy": {"cut_out": {"method": "profile"}}"#);
+        let plan = plan_part(&f, &j, "P").unwrap();
+        let (ops, _) = plan_sheet(&j, &[(&f, &plan)], &[pls(0, 30.0), pls(1, 78.0)]).unwrap();
+        assert!(ops.iter().all(|o| o.kind != OpKind::Separation && !o.name.starts_with("round the parts")));
+        assert!(ops.iter().any(|o| o.kind == OpKind::Profile && o.deepest() < -6.0));
+    }
+
+    /// A 60 × 40 plate 6 thick with a 20 × 14 cutout through its middle, `skin` cut-out: the
+    /// cutout is roughed and its walls finished down to the skin's top (z 0.5), no deeper; the
+    /// skin is cut through inside it climbing (clockwise) on the 14 × 8 rectangle 3 in from its
+    /// walls, as well as 3 round the outside, down to −0.2.
+    #[test]
+    fn the_skin_is_cut_through_inside_a_cutout_too() {
+        let plate = box_solid(v(-30.0, -20.0, 0.0), v(30.0, 20.0, 6.0)).unwrap();
+        let b = cut(plate, box_solid(v(-10.0, -7.0, -1.0), v(10.0, 7.0, 7.0)).unwrap());
+        let f = read_part(&b).unwrap();
+        let j = Job::from_json(&format!(
+            r#"{{"stock": {{"size": [300, 300], "thickness": 6}}, "tools": [{FLAT6}, {FLAT3}], "parts": [{{"body": "P"}}]}}"#
+        ))
+        .unwrap();
+        let plan = plan_part(&f, &j, "P").unwrap();
+        for kind in [OpKind::Roughing, OpKind::WallFinish] {
+            let d = plan.ops.iter().filter(|o| o.kind == kind).map(|o| o.deepest()).fold(f64::INFINITY, f64::min);
+            assert!((d - 0.5).abs() < 1e-9, "{kind:?} down to {d}");
+        }
+        let sep: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Separation).collect();
+        assert_eq!(sep.len(), 7, "0.5 to −0.2 in 0.1 steps");
+        for o in &sep {
+            let inside: Vec<[f64; 3]> =
+                sample(o, [0.0, 0.0, 11.0]).iter().filter(|a| !a.rapid && a.p[0].abs() < 10.0 && a.p[1].abs() < 7.0).map(|a| a.p).collect();
+            assert!(inside.len() > 100);
+            for p in &inside {
+                let on = (p[0].abs() - 7.0).max(p[1].abs() - 4.0);
+                assert!(on.abs() < 1e-6, "{p:?} is not on the 14 × 8 rectangle");
+            }
+            let ring: Vec<[f64; 2]> = inside.iter().map(|p| [p[0], p[1]]).collect();
+            assert!(signed_area(&ring) < 0.0, "clockwise inside the cutout");
+            let outside = sample(o, [0.0, 0.0, 11.0]).iter().filter(|a| !a.rapid && (a.p[0].abs() > 25.0 || a.p[1].abs() > 15.0)).count();
+            assert!(outside > 100, "and round the outside");
+        }
+    }
+
     /// The profile runs 3 mm outside the outline, anticlockwise (part on the left), down to the
     /// spoilboard allowance (−0.2), except over four tabs 1 mm high and 6 + 6 mm long.
     #[test]
     fn the_profile_cuts_through_round_four_tabs() {
         let f = read_part(&pocket_plate()).unwrap();
-        let plan = plan_part(&f, &job(FLAT6, 10.0, ""), "P").unwrap();
-        let prof = op(&plan.ops, OpKind::Profile);
+        let plan = plan_part(&f, &job(FLAT6, 10.0, r#", "strategy": {"cut_out": {"method": "profile"}}"#), "P").unwrap();
+        let prof = &op(&plan.ops, OpKind::Profile);
         let pts = sample(prof, [0.0, 0.0, 15.0]);
         let cutting: Vec<[f64; 3]> = pts.iter().filter(|a| !a.rapid && a.p[2] < 10.0 - 1e-9).map(|a| a.p).collect();
         for p in &cutting {
@@ -658,7 +886,7 @@ mod plan_tests {
         let f = read_part(&b).unwrap();
         let drill = r#"{"number": 5, "kind": "drill", "diameter": 10, "flute_length": 40, "rpm": 1500, "feed": 120, "plunge": 120, "peck": 2}"#;
         let plan = plan_part(&f, &job(&format!("{FLAT6}, {drill}"), 8.0, ""), "P").unwrap();
-        let d = op(&plan.ops, OpKind::Drilling);
+        let d = &op(&plan.ops, OpKind::Drilling);
         assert_eq!(d.tool, 5);
         let tip = 5.0 / 59f64.to_radians().tan();
         match d.moves.as_slice() {
@@ -671,7 +899,7 @@ mod plan_tests {
         assert!(!plan.ops.iter().any(|o| o.kind == OpKind::HoleMilling));
 
         let plan = plan_part(&f, &job(FLAT6, 8.0, ""), "P").unwrap();
-        let pts = sample(op(&plan.ops, OpKind::HoleMilling), [20.0, 20.0, 13.0]);
+        let pts = sample(&op(&plan.ops, OpKind::HoleMilling), [20.0, 20.0, 13.0]);
         let cutting: Vec<[f64; 3]> = pts.iter().filter(|a| !a.rapid && a.p[2] < 8.0).map(|a| a.p).collect();
         for p in &cutting {
             assert!((p[0] - 20.0).hypot(p[1] - 20.0) <= 2.0 + 1e-6, "the mill at {p:?} cuts the hole's wall");
@@ -692,7 +920,7 @@ mod plan_tests {
         let flat3 = r#"{"number": 2, "kind": "flat", "diameter": 3, "flute_length": 12, "rpm": 20000, "feed": 600, "plunge": 150, "stepdown": 1.5}"#;
         let plan = plan_part(&f, &job(&format!("{FLAT6}, {flat3}"), 8.0, ""), "P").unwrap();
         let ops = &plan.ops;
-        let holes = op(ops, OpKind::HoleMilling);
+        let holes = &op(ops, OpKind::HoleMilling);
         assert_eq!(holes.tool, 2, "the smaller mill finishes holes");
         let pts = sample(holes, [20.0, 20.0, 13.0]);
         for a in pts.iter().filter(|a| !a.rapid && a.p[2] < 8.0) {
@@ -768,7 +996,15 @@ mod adaptive_tests {
 
     fn roughing(b: &Body, j: &Job) -> Operation {
         let plan = plan_part(&read_part(b).unwrap(), j, "P").unwrap();
-        plan.ops.into_iter().find(|o| o.kind == OpKind::Roughing).unwrap()
+        let of: Vec<Operation> = plan.ops.into_iter().filter(|o| o.kind == OpKind::Roughing).collect();
+        let first = of.first().unwrap();
+        Operation {
+            kind: OpKind::Roughing,
+            name: first.name.clone(),
+            tool: first.tool,
+            rpm: first.rpm,
+            moves: of.iter().flat_map(|o| o.moves.iter().cloned()).collect(),
+        }
     }
 
     /// The tool's positions along the roughing every 0.05 mm, stroke by stroke (a stroke: cuts
@@ -1309,7 +1545,7 @@ mod adaptive_tests {
 
     /// Adaptive on the slot test parts (tests/cam: slot-plate, stepped-slot, cross-slot,
     /// odd-slots) with a Ø6 cutter, 0.9 mm stepover, 3 mm stepdown: for each slot, replayed on a
-    /// 0.05 mm grid round it at its last roughing level (0.2 above its floor; −0.2 through),
+    /// 0.05 mm grid round it at its last roughing level (0.2 above its floor; 0.5 through, the skin's top),
     /// engagement stays within the 90° default, every point the cutter can reach (within 3 of a
     /// point 3.2 inside the wall) is cut, and the centre stays 3.2 from the wall. A cross's reach
     /// is its two arms'; a sharp corner's tip is out of reach.
@@ -1333,7 +1569,14 @@ mod adaptive_tests {
             let slotted: Vec<&serde_json::Value> = part["features"].as_array().unwrap().iter().filter(|f| f["adaptive"] == "slotting").collect();
             let adaptive_notes = plan.warnings.iter().filter(|w| w.contains("adaptive:")).count();
             assert_eq!(adaptive_notes, slotted.len(), "{name}: {:?}", plan.warnings);
-            let op = plan.ops.iter().find(|o| o.kind == OpKind::Roughing).unwrap();
+            let of: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Roughing).collect();
+            let op = &Operation {
+                kind: OpKind::Roughing,
+                name: String::new(),
+                tool: of[0].tool,
+                rpm: of[0].rpm,
+                moves: of.iter().flat_map(|o| o.moves.iter().cloned()).collect(),
+            };
             let sampled = strokes(op);
             // the levels the roughing cuts at: heights of moves that stay level (a helix moves
             // sideways while it comes down)
@@ -1352,7 +1595,9 @@ mod adaptive_tests {
             for feat in part["features"].as_array().unwrap().iter().filter(|f| f["kind"] == "pocket" || f["kind"] == "cutout") {
                 let c = [feat["center"][0].as_f64().unwrap(), feat["center"][1].as_f64().unwrap()];
                 let slot = Slot::from_feature(feat);
-                let z = if feat["kind"] == "cutout" { -0.2 } else { feat["floor_z"].as_f64().unwrap() + 0.2 };
+                // a through slot is roughed down to the skin's top, 0.5 above the bottom (the
+                // separation cuts the rest)
+                let z = if feat["kind"] == "cutout" { 0.5 } else { feat["floor_z"].as_f64().unwrap() + 0.2 };
                 let z = *levels.iter().find(|l| (**l - z).abs() < 1e-6).unwrap_or_else(|| panic!("{name}: no roughing level at {z}: {levels:?}"));
                 let above = levels.iter().copied().filter(|l| *l > z + 1e-9).fold(top, f64::min);
                 let (lo, hi) = slot.bounds();

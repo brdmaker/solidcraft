@@ -25,8 +25,11 @@ fn run() -> Result<(), String> {
         return Err("usage: preview JOB.json OUT.png|OUT.svg [WIDTH]".into());
     };
     let width: u32 = args.get(2).and_then(|w| w.parse().ok()).unwrap_or(1600);
-    let job = Job::from_json(&std::fs::read_to_string(job_path).map_err(|e| format!("{job_path}: {e}"))?).map_err(|e| e.to_string())?;
     let base = Path::new(job_path).parent().unwrap_or(Path::new("."));
+    // a tool library named by the job is read relative to it
+    let load = |lib: &str| std::fs::read_to_string(base.join(lib)).map_err(|e| solidcraft_cam::CamError::Invalid(format!("{lib}: {e}")));
+    let text = std::fs::read_to_string(job_path).map_err(|e| format!("{job_path}: {e}"))?;
+    let job = Job::from_json_with(&text, &load).map_err(|e| e.to_string())?;
     let mut bodies = Vec::new();
     for p in &job.parts {
         let file = base.join(&p.design);

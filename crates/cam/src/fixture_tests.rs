@@ -311,7 +311,8 @@ fn plan_fixture(i: usize, thickness: f64) -> (crate::part::PartFeatures, crate::
             .unwrap();
     let f = crate::part::read_part(&read.bodies[0].body).unwrap();
     let job = crate::job::Job::from_json(&format!(
-        r#"{{"stock": {{"size": [600, 400], "thickness": {thickness}}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}]}}"#
+        r#"{{"stock": {{"size": [600, 400], "thickness": {thickness}}}, "tools": {TOOLS},
+            "strategy": {{"cut_out": {{"method": "profile"}}}}, "parts": [{{"body": "P"}}]}}"#
     ))
     .unwrap();
     let plan = crate::plan::plan_part(&f, &job, "P").unwrap();
@@ -537,10 +538,12 @@ fn placed_paths_are_turned_moved_and_lowered() {
         crate::job::Job::from_json(&format!(r#"{{"stock": {{"size": [600, 400], "thickness": 10}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}]}}"#))
             .unwrap();
     let pl = Placement { part: 0, label: "P".into(), copy: 1, quarter_turns: 1, offset: [100.0, 50.0], bounds: [[0.0; 2]; 2] };
-    let ops = plan_sheet(&job, &[(&f, &plan)], &[pl]);
+    let (all, _) = plan_sheet(&job, &[(&f, &plan)], &[pl]).unwrap();
+    assert!(all.windows(2).all(|w| w[0].kind.rank() <= w[1].kind.rank()), "in machining order");
+    // the part's own operations, besides the roughing round it
+    let ops: Vec<_> = all.iter().filter(|o| !o.name.starts_with("round the parts")).collect();
     assert_eq!(ops.len(), plan.ops.len());
     assert!(ops.iter().all(|o| o.name.starts_with("P #2: ")), "{:?}", ops.iter().map(|o| &o.name).collect::<Vec<_>>());
-    assert!(ops.windows(2).all(|w| w[0].kind.rank() <= w[1].kind.rank()), "in machining order");
     let drill = ops.iter().find(|o| o.kind == crate::toolpath::OpKind::Drilling).unwrap();
     for (m, orig) in drill.moves.iter().zip(&plan.ops.iter().find(|o| o.kind == crate::toolpath::OpKind::Drilling).unwrap().moves) {
         let (Move::Drill { at, r, .. }, Move::Drill { at: a0, r: r0, .. }) = (m, orig) else { continue };
@@ -569,8 +572,8 @@ fn the_label_recess_is_roughed_before_its_floor() {
     }
 }
 
-/// The flange sheet's preview, checked pixel by pixel where the geometry says what must be
-/// there: the profile's dark line 3 mm outside a flange's straight edge, a drilled hole's red
+/// The flange sheet's preview (cut out by the profile), checked pixel by pixel where the
+/// geometry says what must be there: the profile's dark line 3 mm outside a flange's straight edge, a drilled hole's red
 /// cross at its centre, white part face between features; and the SVG names every operation.
 #[test]
 fn the_preview_draws_the_toolpaths_where_they_are() {
@@ -581,7 +584,8 @@ fn the_preview_draws_the_toolpaths_where_they_are() {
         solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
             .unwrap();
     let job = crate::job::Job::from_json(&format!(
-        r#"{{"stock": {{"size": [220, 220], "thickness": 10}}, "nest": {{"margin": 10, "spacing": 10}}, "tools": {TOOLS}, "parts": [{{"body": "F", "quantity": 4}}]}}"#
+        r#"{{"stock": {{"size": [220, 220], "thickness": 10}}, "nest": {{"margin": 10, "spacing": 10}}, "tools": {TOOLS},
+            "strategy": {{"cut_out": {{"method": "profile"}}}}, "parts": [{{"body": "F", "quantity": 4}}]}}"#
     ))
     .unwrap();
     let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();

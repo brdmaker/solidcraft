@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::adaptive::AdaptiveParams;
-use crate::job::{Job, LevelOrder, Pattern, Tool};
+use crate::job::{CutOutMethod, Job, LevelOrder, Pattern, Strategy, Tool};
 use crate::nest::Placement;
 use crate::part::{HoleStack, PartFeatures};
 use crate::region::{Area, Ring, signed_area};
@@ -50,6 +50,9 @@ struct Ctx<'a> {
     sheet_top: f64,
     /// Where through-cuts end.
     through: f64,
+    /// How far roughing and wall finishing cut through: `through`, or the skin's top when the
+    /// parts are cut out through a skin.
+    cut_to: f64,
     h: Heights,
     warnings: Vec<String>,
 }
@@ -257,6 +260,34 @@ fn unreached_corners(pocket: &Area, allowed: &Area, rt: f64, z: f64, corners: &m
     Ok(())
 }
 
+/// Adaptive clearing's settings for roughing with `t`.
+fn adaptive_params(st: &Strategy, t: &Tool, ramp: f64) -> AdaptiveParams {
+    let rt = t.diameter / 2.0;
+    AdaptiveParams {
+        step: t.stepover(),
+        max_engagement: st.roughing.max_engagement_deg.map(f64::to_radians).unwrap_or_else(|| {
+            (AdaptiveParams::straight_engagement(t.stepover().min(rt * 0.9), rt) * 1.3).clamp(std::f64::consts::FRAC_PI_2, std::f64::consts::PI)
+        }),
+        both_ways: st.roughing.both_ways,
+        ramp,
+        retract: st.retract,
+        rapid: st.rapid_feed,
+    }
+}
+
+/// Rough `area` (where the cutter's centre may go) at `z`, the material's top there being
+/// `from`, in the strategy's pattern; returns adaptive clearing's notes.
+fn rough_area(b: &mut PathBuilder, area: &Area, z: f64, from: f64, t: &Tool, st: &Strategy, params: &AdaptiveParams) -> Result<Vec<String>> {
+    match st.roughing.pattern {
+        Pattern::Adaptive => crate::adaptive::clear_level(b, area, z, from, t, params),
+        Pattern::Offset => {
+            let rings = fill_rings(area, t.stepover())?;
+            clear_rings(b, &rings, area, z, from, t, params.ramp);
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// Plan one part.
 pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
     let st = &job.strategy;
@@ -272,6 +303,10 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         label,
         sheet_top,
         through: f.bottom_z - job.stock.spoilboard_allowance,
+        cut_to: match st.cut_out.method {
+            CutOutMethod::Skin => f.bottom_z + st.cut_out.skin,
+            CutOutMethod::Profile => f.bottom_z - job.stock.spoilboard_allowance,
+        },
         h: Heights { clearance: sheet_top + st.clearance, retract: st.retract },
         warnings: f.unsupported.iter().map(|n| format!("{label}: face {} ({}) is not machined: {}", n.face, n.surface, n.reason)).collect(),
     };
@@ -304,7 +339,7 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
     let pocket_floors: Vec<(f64, Area)> = f.floors.iter().filter(|fl| !fl.top && !fl.in_hole).map(|fl| (fl.z, fl.region.clone())).collect();
     let mut targets: Vec<f64> = pocket_floors.iter().map(|(z, _)| *z).collect();
     if !f.cutouts.is_empty() {
-        targets.push(cx.through);
+        targets.push(cx.cut_to);
     }
 
     // Roughing, leaving stock on walls and floors: each pocket region at each level, in the
@@ -314,7 +349,8 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
     {
         let rt = t.diameter / 2.0;
         let leave = st.stock_to_leave;
-        let rough_targets: Vec<f64> = targets.iter().map(|z| if *z > cx.through + Z_EPS { z + leave } else { *z }).collect();
+        // floors get the stock to leave; a cut through (to the skin or below the sheet) none
+        let rough_targets: Vec<f64> = targets.iter().map(|z| if *z > cx.cut_to + Z_EPS { z + leave } else { *z }).collect();
         let mut tasks: Vec<RoughTask> = Vec::new();
         let mut roots: Vec<Area> = Vec::new();
         let mut from = f.top_z;
@@ -342,33 +378,17 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         if st.roughing.order == LevelOrder::Area {
             tasks.sort_by(|a, b| a.root.cmp(&b.root).then(b.z.total_cmp(&a.z)));
         }
-        let params = AdaptiveParams {
-            step: t.stepover(),
-            max_engagement: st.roughing.max_engagement_deg.map(f64::to_radians).unwrap_or_else(|| {
-                (AdaptiveParams::straight_engagement(t.stepover().min(rt * 0.9), rt) * 1.3).clamp(std::f64::consts::FRAC_PI_2, std::f64::consts::PI)
-            }),
-            both_ways: st.roughing.both_ways,
-            ramp,
-            retract: st.retract,
-            rapid: st.rapid_feed,
-        };
-        let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+        let params = adaptive_params(st, t, ramp);
+        // one operation per level and region, so a sheet can be cut level by level
         for task in &tasks {
-            match st.roughing.pattern {
-                Pattern::Adaptive => {
-                    for note in crate::adaptive::clear_level(&mut b, &task.area, task.z, task.from, t, &params)? {
-                        cx.warn(format!("{label}: {note}"));
-                    }
-                }
-                Pattern::Offset => {
-                    let rings = fill_rings(&task.area, t.stepover())?;
-                    clear_rings(&mut b, &rings, &task.area, task.z, task.from, t, ramp);
-                }
+            let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+            for note in rough_area(&mut b, &task.area, task.z, task.from, t, st, &params)? {
+                cx.warn(format!("{label}: {note}"));
             }
             b.up();
-        }
-        if !b.moves.is_empty() {
-            ops.push(cx.op(OpKind::Roughing, "roughing", t, b.moves));
+            if !b.moves.is_empty() {
+                ops.push(cx.op(OpKind::Roughing, "roughing", t, b.moves));
+            }
         }
     }
 
@@ -378,18 +398,17 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
     {
         let rt = t.diameter / 2.0;
         let leave = st.stock_to_leave;
-        let mut fb = PathBuilder::new(cx.h, [0.0, 0.0]);
         for (z, region) in &pocket_floors {
+            let mut fb = PathBuilder::new(cx.h, [0.0, 0.0]);
             let pocket = cx.pocket(*z)?;
             let allowed = pocket.offset(-rt, PATH_TOL)?.intersection(&region.offset(rt, PATH_TOL)?)?;
             let rings = fill_rings(&allowed, t.stepover())?;
             clear_rings(&mut fb, &rings, &pocket.offset(-rt, PATH_TOL)?, *z, z + leave, t, ramp);
             fb.up();
+            if !fb.moves.is_empty() {
+                ops.push(cx.op(OpKind::FloorFinish, "floors", t, fb.moves));
+            }
         }
-        if !fb.moves.is_empty() {
-            ops.push(cx.op(OpKind::FloorFinish, "floors", t, fb.moves));
-        }
-        let mut wb = PathBuilder::new(cx.h, [0.0, 0.0]);
         let mut from = f.top_z;
         let mut corners: Vec<Corner> = Vec::new();
         for z in levels(f.top_z, &targets, t.stepdown()) {
@@ -399,6 +418,7 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
                 cx.warn(format!("{label}: a pocket at z {z:.3} is narrower than T{} (Ø{}) can finish", t.number, t.diameter));
             }
             unreached_corners(&pocket, &allowed, rt, z, &mut corners)?;
+            let mut wb = PathBuilder::new(cx.h, [0.0, 0.0]);
             let walls: Vec<Ring> = allowed.rings().cloned().collect();
             for r in &walls {
                 let r = climb_inside(r);
@@ -409,10 +429,10 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
                 wb.ring(&r, start, z, t.feed);
                 wb.up();
             }
+            if !wb.moves.is_empty() {
+                ops.push(cx.op(OpKind::WallFinish, "walls", t, wb.moves));
+            }
             from = z;
-        }
-        if !wb.moves.is_empty() {
-            ops.push(cx.op(OpKind::WallFinish, "walls", t, wb.moves));
         }
         for c in &corners {
             cx.warn(format!(
@@ -424,7 +444,10 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
 
     holes(&mut cx, &mut ops)?;
     chamfers(&mut cx, &mut ops)?;
-    profile(&mut cx, &mut ops, ramp)?;
+    match st.cut_out.method {
+        CutOutMethod::Skin => contour_and_separate(&mut cx, &mut ops, ramp)?,
+        CutOutMethod::Profile => profile(&mut cx, &mut ops, ramp)?,
+    }
     Ok(PartPlan { ops, warnings: cx.warnings })
 }
 
@@ -433,7 +456,7 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
     let job = cx.job;
     let label = cx.label;
     let mut drills: Vec<(u32, Vec<Move>)> = Vec::new();
-    let mut milled: Option<PathBuilder> = None;
+    let mut milled: Vec<(u32, PathBuilder)> = Vec::new();
     let mut cones: Option<PathBuilder> = None;
     let holes = cx.f.holes.clone();
     for h in &holes {
@@ -474,25 +497,17 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
                 top = s.z_bottom;
                 continue;
             }
-            let Some(t) = job.finish_tool() else {
-                cx.warn(format!("{label}: hole Ø{:.3} at ({:.3}, {:.3}): no drill of its size and no end mill", 2.0 * r, c[0], c[1]));
+            let Some(t) = job.hole_tool(2.0 * r) else {
+                let why = match job.finish_tool() {
+                    Some(f) => format!("T{} (Ø{}) is too wide, no smaller end mill fits and no drill matches", f.number, f.diameter),
+                    None => "no drill of its size and no end mill".to_string(),
+                };
+                cx.warn(format!("{label}: hole Ø{:.3} at ({:.3}, {:.3}): {why}", 2.0 * r, c[0], c[1]));
                 top = s.z_bottom;
                 continue;
             };
             let rt = t.diameter / 2.0;
             let outer = r - rt;
-            if outer < 0.05 * rt {
-                cx.warn(format!(
-                    "{label}: hole Ø{:.3} at ({:.3}, {:.3}): T{} (Ø{}) is too wide and no drill matches",
-                    2.0 * r,
-                    c[0],
-                    c[1],
-                    t.number,
-                    t.diameter
-                ));
-                top = s.z_bottom;
-                continue;
-            }
             if top - bottom > t.flute_length {
                 cx.warn(format!("{label}: hole Ø{:.3} at ({:.3}, {:.3}) is deeper than T{}'s flutes", 2.0 * r, c[0], c[1], t.number));
             }
@@ -507,7 +522,14 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
                 radii.push(next);
             }
             radii.reverse();
-            let b = milled.get_or_insert_with(|| PathBuilder::new(cx.h, c));
+            let k = match milled.iter().position(|(n, _)| *n == t.number) {
+                Some(k) => k,
+                None => {
+                    milled.push((t.number, PathBuilder::new(cx.h, c)));
+                    milled.len() - 1
+                }
+            };
+            let Some((_, b)) = milled.get_mut(k) else { continue };
             let first = radii.first().copied().unwrap_or(outer);
             b.travel_to([c[0] + first, c[1]], top);
             let mut from = top;
@@ -567,8 +589,10 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
             ops.push(cx.op(OpKind::Drilling, "drilling", t, moves));
         }
     }
-    if let (Some(b), Some(t)) = (milled, job.finish_tool()) {
-        ops.push(cx.op(OpKind::HoleMilling, "holes", t, b.moves));
+    for (n, b) in milled {
+        if let Some(t) = job.tool(n) {
+            ops.push(cx.op(OpKind::HoleMilling, "holes", t, b.moves));
+        }
     }
     if let (Some(b), Some(t)) = (cones, job.chamfer_tool()) {
         ops.push(cx.op(OpKind::Chamfer, "countersinks", t, b.moves));
@@ -705,6 +729,72 @@ fn profile(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Result<()> {
     Ok(())
 }
 
+/// The `skin` cut-out of one part with the profile tool: a contour round the outline finishing
+/// it level by level down to the skin's top (roughing cleared round it, leaving the stock to
+/// leave), then the skin cut through `skin_stepdown` at a time, round the outline and inside
+/// each through cutout, down past the sheet's bottom: each level an operation of its own, so
+/// the whole sheet is cut through level by level. Climbing: anticlockwise round the outside,
+/// clockwise inside a cutout.
+fn contour_and_separate(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Result<()> {
+    let Some(t) = cx.job.profile_tool() else { return Ok(()) };
+    let rt = t.diameter / 2.0;
+    let depth = cx.sheet_top - cx.through;
+    if depth > t.flute_length + 1e-6 {
+        cx.warn(format!("{}: the contour is {depth:.3} deep; T{}'s flutes are {}", cx.label, t.number, t.flute_length));
+    }
+    let outside: Vec<Ring> = cx.f.outline.offset(rt, PATH_TOL)?.shapes.iter().filter_map(|sh| sh.first().cloned()).collect();
+    let mut inside: Vec<Ring> = Vec::new();
+    for c in &cx.f.cutouts {
+        let hole = Area::union_of(&[c.ring.iter().rev().copied().collect()])?;
+        let path = hole.offset(-rt, PATH_TOL)?;
+        if path.is_empty() {
+            cx.warn(format!(
+                "{}: the cutout at ({:.3}, {:.3}) is narrower than T{} (Ø{}): its skin is not cut through",
+                cx.label,
+                (c.bounds[0][0] + c.bounds[1][0]) / 2.0,
+                (c.bounds[0][1] + c.bounds[1][1]) / 2.0,
+                t.number,
+                t.diameter
+            ));
+        }
+        inside.extend(path.shapes.iter().filter_map(|sh| sh.first().map(climb_inside)));
+    }
+    let skin_top = cx.cut_to;
+    let mut from = cx.sheet_top;
+    for z in levels(cx.sheet_top, &[skin_top], t.stepdown()) {
+        let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+        for r in &outside {
+            let start = nearest_vertex(r, [b.at[0], b.at[1]]);
+            let Some(&p) = r.get(start) else { continue };
+            b.travel_to(p, from);
+            b.line([p[0], p[1], from], t.plunge);
+            b.ramp_ring(r, start, z, ramp, t.feed, t.plunge);
+            b.up();
+        }
+        if !b.moves.is_empty() {
+            ops.push(cx.op(OpKind::Profile, "contour", t, b.moves));
+        }
+        from = z;
+    }
+    let step = cx.job.strategy.cut_out.skin_stepdown;
+    for z in levels(skin_top, &[cx.through], step) {
+        let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+        for r in outside.iter().chain(&inside) {
+            let start = nearest_vertex(r, [b.at[0], b.at[1]]);
+            let Some(&p) = r.get(start) else { continue };
+            b.travel_to(p, from);
+            b.line([p[0], p[1], from], t.plunge);
+            b.ramp_ring(r, start, z, ramp, t.feed, t.plunge);
+            b.up();
+        }
+        if !b.moves.is_empty() {
+            ops.push(cx.op(OpKind::Separation, "separation", t, b.moves));
+        }
+        from = z;
+    }
+    Ok(())
+}
+
 /// A move turned `q` quarter turns about the origin, moved by `d`, and lowered by `dz`.
 fn place_move(m: &Move, q: u8, d: [f64; 2], dz: f64) -> Move {
     let t = |p: [f64; 2]| {
@@ -730,22 +820,86 @@ fn place_move(m: &Move, q: u8, d: [f64; 2], dz: f64) -> Move {
     }
 }
 
-/// The whole sheet's operations, in sheet coordinates: every placed copy's, in the order they
-/// must run (material off before parts are cut free), grouped by tool within each step.
-pub fn plan_sheet(job: &Job, parts: &[(&PartFeatures, &PartPlan)], placements: &[Placement]) -> Vec<Operation> {
-    let mut all: Vec<(u8, u32, usize, Operation)> = Vec::new();
+/// The whole sheet's operations, in sheet coordinates, and what could not be done.
+///
+/// Every placed copy's operations, and with the `skin` cut-out the roughing of a band round
+/// the parts (the nest's spacing wide, so the gaps between parts are cleared whole) down to the
+/// skin. They run kind by kind (material off before parts are cut free, the skin last), each
+/// kind tool by tool and, over the whole sheet, level by level from the top down, so the sheet
+/// is thinned evenly and stays held; by `area` roughing order, each part's roughing as planned.
+pub fn plan_sheet(job: &Job, parts: &[(&PartFeatures, &PartPlan)], placements: &[Placement]) -> Result<(Vec<Operation>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let mut all: Vec<(usize, Operation)> = Vec::new();
+    let mut outlines = Area::empty();
     for (i, pl) in placements.iter().enumerate() {
         let Some((f, plan)) = parts.get(pl.part) else { continue };
+        outlines = outlines.union(&f.outline.placed(pl.quarter_turns, pl.offset[0], pl.offset[1]))?;
         // part Z → sheet Z: the part's bottom on the sheet's bottom, Z0 on the sheet's top
         let dz = f.bottom_z + job.stock.thickness;
         for op in &plan.ops {
             let moves = op.moves.iter().map(|m| place_move(m, pl.quarter_turns, pl.offset, dz)).collect();
             let name = op.name.replacen(&pl.label, &format!("{} #{}", pl.label, pl.copy + 1), 1);
-            all.push((op.kind.rank(), op.tool, i, Operation { kind: op.kind, name, tool: op.tool, rpm: op.rpm, moves }));
+            all.push((i, Operation { kind: op.kind, name, tool: op.tool, rpm: op.rpm, moves }));
         }
     }
-    all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    all.into_iter().map(|(.., op)| op).collect()
+    let st = &job.strategy;
+    if st.cut_out.method == CutOutMethod::Skin
+        && !outlines.is_empty()
+        && let Some(t) = job.rough_tool()
+    {
+        let rt = t.diameter / 2.0;
+        let leave = st.stock_to_leave;
+        let spacing = job.nest.spacing;
+        if spacing < t.diameter + 2.0 * leave + 0.5 {
+            warnings.push(format!(
+                "nest.spacing {spacing} mm leaves T{} (Ø{}) no room to clear between the parts (it needs {:.1} mm): the contour cuts what is left there",
+                t.number,
+                t.diameter,
+                t.diameter + 2.0 * leave + 0.5
+            ));
+        }
+        let [w, d] = job.stock.size;
+        let sheet = Area::union_of(&[vec![[0.0, 0.0], [w, 0.0], [w, d], [0.0, d]]])?;
+        let band = outlines.offset(spacing, PATH_TOL)?.intersection(&sheet)?;
+        let allowed = band.offset(-rt, PATH_TOL)?.difference(&outlines.offset(rt + leave, PATH_TOL)?)?;
+        let h = Heights { clearance: st.clearance, retract: st.retract };
+        let ramp = st.ramp_angle_deg.to_radians();
+        let params = adaptive_params(st, t, ramp);
+        let skin_top = -job.stock.thickness + st.cut_out.skin;
+        let mut from = 0.0;
+        for z in levels(0.0, &[skin_top], t.stepdown()) {
+            let mut b = PathBuilder::new(h, [0.0, 0.0]);
+            for note in rough_area(&mut b, &allowed, z, from, t, st, &params)? {
+                // the same note at every level once: without its height
+                let note = match (note.find(" on z "), note.find(" on z ").and_then(|i| note.get(i + 6..)).and_then(|r| r.find(' '))) {
+                    (Some(i), Some(j)) => format!("{}{}", note.get(..i).unwrap_or(""), note.get(i + 6 + j..).unwrap_or("")),
+                    _ => note,
+                };
+                let w = format!("round the parts: {note}");
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            b.up();
+            if !b.moves.is_empty() {
+                all.push((
+                    usize::MAX,
+                    Operation { kind: OpKind::Roughing, name: "round the parts: roughing".into(), tool: t.number, rpm: t.rpm, moves: b.moves },
+                ));
+            }
+            from = z;
+        }
+    }
+    let by_depth = |op: &Operation| match (op.kind, st.roughing.order) {
+        (OpKind::Roughing, LevelOrder::Area) => 0.0,
+        _ => -op.deepest(),
+    };
+    // a stable sort: copies (in nesting order) and each copy's operations keep their order
+    // within a level
+    all.sort_by(|a, b| {
+        a.1.kind.rank().cmp(&b.1.kind.rank()).then(a.1.tool.cmp(&b.1.tool)).then(by_depth(&a.1).total_cmp(&by_depth(&b.1))).then(a.0.cmp(&b.0))
+    });
+    Ok((all.into_iter().map(|(_, op)| op).collect(), warnings))
 }
 
 /// A whole job planned: each part's features and toolpaths, the nesting, and the sheet's
@@ -783,7 +937,8 @@ pub fn plan_job(job: &Job, bodies: &[solidcraft_kernel::Body]) -> Result<JobPlan
     let nesting = crate::nest::nest(&job.stock, &job.nest, &items);
     warnings.extend(nesting.unplaced.iter().map(|u| format!("{} #{} is not on the sheet: {}", u.label, u.copy + 1, u.reason)));
     let pairs: Vec<(&PartFeatures, &PartPlan)> = features.iter().zip(&plans).collect();
-    let ops = plan_sheet(job, &pairs, &nesting.placements);
+    let (ops, sheet_warnings) = plan_sheet(job, &pairs, &nesting.placements)?;
+    warnings.extend(sheet_warnings);
     Ok(JobPlan { features, plans, nesting, ops, warnings })
 }
 

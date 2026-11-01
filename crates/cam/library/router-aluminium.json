@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "name": "Router, aluminium sheet: single-flute end mills Ø1, Ø2, Ø3, Ø6 and 90° chamfer mills",
+  "note": "Starting values for single-flute carbide in aluminium on a 24000 rpm spindle; check them against the tool maker's data and your machine. Tool numbers are the LinuxCNC pockets: T1, T2, T3 and T6 are the end mills by diameter, T9 and T10 the chamfer mills.",
+  "tools": [
+    {"number": 1, "name": "Ø1 single-flute end mill", "kind": "flat", "diameter": 1, "flute_length": 3, "flutes": 1, "rpm": 24000, "feed": 200, "plunge": 60, "stepdown": 0.3, "stepover": 0.2},
+    {"number": 2, "name": "Ø2 single-flute end mill", "kind": "flat", "diameter": 2, "flute_length": 6, "flutes": 1, "rpm": 24000, "feed": 360, "plunge": 100, "stepdown": 0.8, "stepover": 0.2},
+    {"number": 3, "name": "Ø3 single-flute end mill", "kind": "flat", "diameter": 3, "flute_length": 12, "flutes": 1, "rpm": 22000, "feed": 550, "plunge": 150, "stepdown": 1.5, "stepover": 0.15},
+    {"number": 6, "name": "Ø6 single-flute end mill", "kind": "flat", "diameter": 6, "flute_length": 22, "flutes": 1, "rpm": 18000, "feed": 1000, "plunge": 250, "stepdown": 3, "stepover": 0.15},
+    {"number": 9, "name": "Ø6 90° chamfer mill", "kind": "chamfer", "diameter": 6, "flute_length": 3, "flutes": 1, "tip_angle_deg": 90, "rpm": 18000, "feed": 600, "plunge": 200},
+    {"number": 10, "name": "Ø12 90° chamfer mill", "kind": "chamfer", "diameter": 12, "flute_length": 6, "flutes": 1, "tip_angle_deg": 90, "rpm": 15000, "feed": 600, "plunge": 200}
+  ]
+}

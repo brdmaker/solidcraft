@@ -37,6 +37,7 @@ pub fn colour(kind: OpKind) -> &'static str {
         OpKind::Chamfer => "#9b59b6",
         OpKind::Profile => "#222222",
         OpKind::EdgeChamfer => "#c2185b",
+        OpKind::Separation => "#6d4c41",
     }
 }
 
@@ -52,6 +53,7 @@ pub fn legend() -> Vec<(OpKind, &'static str, &'static str)> {
         (OpKind::Chamfer, "countersinks, chamfers"),
         (OpKind::Profile, "profile"),
         (OpKind::EdgeChamfer, "edge chamfer"),
+        (OpKind::Separation, "separation"),
     ]
     .into_iter()
     .map(|(k, n)| (k, colour(k), n))

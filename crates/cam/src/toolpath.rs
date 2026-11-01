@@ -50,6 +50,9 @@ pub enum OpKind {
     /// A chamfer round the part's outline, cut after the profile so the cutter's tip runs in
     /// the profile's slot.
     EdgeChamfer,
+    /// Cutting through the skin left under and round the parts (the `skin` cut-out), level by
+    /// level over the whole sheet: last of all, while the vacuum still holds every part.
+    Separation,
 }
 
 impl OpKind {
@@ -65,6 +68,7 @@ impl OpKind {
             OpKind::Chamfer => 6,
             OpKind::Profile => 7,
             OpKind::EdgeChamfer => 8,
+            OpKind::Separation => 9,
         }
     }
 }
@@ -80,6 +84,21 @@ pub struct Operation {
     pub rpm: f64,
     /// Every move starts and ends at `clearance`.
     pub moves: Vec<Move>,
+}
+
+impl Operation {
+    /// The lowest height it cuts at: its moves' ends (rapids aside) and drilling depths;
+    /// infinity when it cuts nothing.
+    pub fn deepest(&self) -> f64 {
+        self.moves
+            .iter()
+            .filter_map(|m| match m {
+                Move::Rapid { .. } => None,
+                Move::Line { to, .. } | Move::Arc { to, .. } => Some(to[2]),
+                Move::Drill { bottom, .. } => Some(*bottom),
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
 }
 
 /// Heights an operation moves at.

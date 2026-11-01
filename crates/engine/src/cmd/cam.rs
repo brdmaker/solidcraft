@@ -92,20 +92,34 @@ fn job_nest(s: &mut Session, p: &Value) -> Result<Value> {
 /// The job from the parameter, and the folder its parts' designs are relative to.
 pub(crate) fn read_job(s: &Session, v: &Value) -> Result<(Job, Option<PathBuf>)> {
     let cmd = "cam.job";
-    match v {
+    let (job, base): (Job, Option<PathBuf>) = match v {
         Value::String(path) => {
             let bytes = solidcraft_io::vfs::read(path, MAX_JOB_BYTES).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
             let text = String::from_utf8(bytes).map_err(|_| EngineError::Other(format!("{path}: not UTF-8 text")))?;
-            let job = Job::from_json(&text).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-            Ok((job, Path::new(path).parent().map(Path::to_path_buf)))
+            let job = serde_json::from_str(&text).map_err(|e| EngineError::Other(format!("{path}: job: {e}")))?;
+            (job, Path::new(path).parent().map(Path::to_path_buf))
         }
         Value::Object(_) => {
-            let job: Job = serde_json::from_value(v.clone()).map_err(|e| bad(cmd, format!("job: {e}")))?;
-            job.validate().map_err(|e| bad(cmd, e.to_string()))?;
-            Ok((job, s.path.as_deref().and_then(|p| Path::new(p).parent()).map(Path::to_path_buf)))
+            let job = serde_json::from_value(v.clone()).map_err(|e| bad(cmd, format!("job: {e}")))?;
+            (job, s.path.as_deref().and_then(|p| Path::new(p).parent()).map(Path::to_path_buf))
         }
-        _ => Err(bad(cmd, "job: a job object or the path of a job file")),
-    }
+        _ => return Err(bad(cmd, "job: a job object or the path of a job file")),
+    };
+    // its tool library, if it names one, relative to the job (or the open design)
+    let load = |lib: &str| -> solidcraft_cam::Result<String> {
+        let path = match &base {
+            Some(dir) if Path::new(lib).is_relative() => dir.join(lib),
+            _ => PathBuf::from(lib),
+        };
+        let shown = path.display().to_string();
+        let bytes = solidcraft_io::vfs::read(&shown, MAX_JOB_BYTES).map_err(|e| solidcraft_cam::CamError::Invalid(format!("{shown}: {e}")))?;
+        String::from_utf8(bytes).map_err(|_| solidcraft_cam::CamError::Invalid(format!("{shown}: not UTF-8 text")))
+    };
+    let job = job.with_library(&load).map_err(|e| match v {
+        Value::String(path) => EngineError::Other(format!("{path}: {e}")),
+        _ => bad(cmd, e.to_string()),
+    })?;
+    Ok((job, base))
 }
 
 /// The body a part cuts: from the open design, a design file or a STEP file.

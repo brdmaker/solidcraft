@@ -25,11 +25,51 @@ pub struct Job {
     pub stock: Stock,
     #[serde(default)]
     pub nest: NestOptions,
+    /// A tool library file (relative to the job file) whose tools are in the machine besides
+    /// `tools`; a tool in `tools` replaces the library's of the same number. A job with neither
+    /// uses the built-in library (`crates/cam/library/router-aluminium.json`).
+    #[serde(default)]
+    pub library: String,
     #[serde(default)]
     pub tools: Vec<Tool>,
     #[serde(default)]
     pub strategy: Strategy,
     pub parts: Vec<PartRef>,
+}
+
+/// A tool library: the tools usually in the machine, as a file of their own.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolLibrary {
+    /// The library format's version: 1.
+    #[serde(default = "one")]
+    pub version: u32,
+    #[serde(default)]
+    pub name: String,
+    /// Free text: where the cutting data comes from.
+    #[serde(default)]
+    pub note: String,
+    pub tools: Vec<Tool>,
+}
+
+/// The built-in library's text.
+pub const BUILTIN_LIBRARY: &str = include_str!("../library/router-aluminium.json");
+
+impl ToolLibrary {
+    /// Read a library from its JSON text.
+    pub fn from_json(text: &str) -> Result<ToolLibrary> {
+        let lib: ToolLibrary = serde_json::from_str(text).map_err(|e| CamError::Invalid(format!("tool library: {e}")))?;
+        if lib.version != 1 {
+            return Err(CamError::Unsupported(format!("tool library version {} (this build reads version 1)", lib.version)));
+        }
+        validate_tools(&lib.tools, "library.tools")?;
+        Ok(lib)
+    }
+
+    /// The built-in library: single-flute end mills Ø1, Ø2, Ø3 and Ø6 and 90° chamfer mills.
+    pub fn builtin() -> Result<ToolLibrary> {
+        ToolLibrary::from_json(BUILTIN_LIBRARY)
+    }
 }
 
 /// How the toolpaths are made: which tool does what, and the cutting allowances.
@@ -56,13 +96,47 @@ pub struct Strategy {
     /// The machine's rapid traverse speed, mm/min (default 5000): used to choose the quicker
     /// way between passes (up to clearance and across, or along cleared ground at depth).
     pub rapid_feed: f64,
-    /// Tabs holding each part to the sheet as its outline is cut through.
+    /// How parts are cut out of the sheet.
+    pub cut_out: CutOut,
+    /// Tabs holding each part to the sheet as its outline is cut through (`profile` cut-out).
     pub tabs: Tabs,
     /// How pockets are roughed.
     pub roughing: Roughing,
     /// How far below a chamfer's foot the chamfer cutter's tip goes, mm (default 0.3): the cut
     /// uses the flank, not the fragile tip.
     pub chamfer_tip_below: f64,
+}
+
+/// How parts come out of the sheet.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CutOutMethod {
+    /// For a sheet held by vacuum: roughing clears a band round every part (the nest's
+    /// spacing wide) down to `skin` above the sheet's bottom, a contour finishes each outline
+    /// down to the skin, and last of all, level by level over the whole sheet, the contour
+    /// cuts through the skin `skin_stepdown` at a time. No tabs.
+    #[default]
+    Skin,
+    /// The profile tool cuts a slot round each part all the way down, over tabs.
+    Profile,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct CutOut {
+    /// `skin` (default: vacuum hold) or `profile` (a slot round each part, with tabs).
+    pub method: CutOutMethod,
+    /// Skin: material roughing leaves above the sheet's bottom round the parts and in through
+    /// cutouts, mm (default 0.5).
+    pub skin: f64,
+    /// Skin: depth of each pass cutting through it, mm (default 0.1).
+    pub skin_stepdown: f64,
+}
+
+impl Default for CutOut {
+    fn default() -> Self {
+        CutOut { method: CutOutMethod::Skin, skin: 0.5, skin_stepdown: 0.1 }
+    }
 }
 
 /// The roughing pattern.
@@ -141,6 +215,7 @@ impl Default for Strategy {
             clearance: 5.0,
             retract: 1.0,
             rapid_feed: 5000.0,
+            cut_out: CutOut::default(),
             tabs: Tabs::default(),
             chamfer_tip_below: 0.3,
             roughing: Roughing::default(),
@@ -179,9 +254,10 @@ pub struct NestOptions {
     /// Clear border round the sheet's edge, mm (default 10).
     #[serde(default = "ten")]
     pub margin: f64,
-    /// Gap between parts, mm (default 10). Make it at least the profile cutter's diameter plus
-    /// a little, so the cutter's paths round neighbouring parts don't meet.
-    #[serde(default = "ten")]
+    /// Gap between parts, mm (default 8). With the `skin` cut-out the roughing tool clears it
+    /// (and a band this wide round the nest): at least its diameter, twice the stock to leave
+    /// and a little room to move; with `profile`, at least the profile cutter's diameter.
+    #[serde(default = "eight")]
     pub spacing: f64,
     /// May parts be turned by 90° to fit (default true)?
     #[serde(default = "yes")]
@@ -192,13 +268,17 @@ fn ten() -> f64 {
     10.0
 }
 
+fn eight() -> f64 {
+    8.0
+}
+
 fn yes() -> bool {
     true
 }
 
 impl Default for NestOptions {
     fn default() -> Self {
-        NestOptions { margin: 10.0, spacing: 10.0, rotate: true }
+        NestOptions { margin: 10.0, spacing: 8.0, rotate: true }
     }
 }
 
@@ -300,12 +380,80 @@ fn length(what: &str, v: f64, min: f64) -> Result<()> {
     Ok(())
 }
 
+/// Check every tool's numbers.
+fn validate_tools(tools: &[Tool], what: &str) -> Result<()> {
+    if tools.len() > MAX_TOOLS {
+        return Err(CamError::Invalid(format!("at most {MAX_TOOLS} tools")));
+    }
+    for (i, t) in tools.iter().enumerate() {
+        let at = |field: &str| format!("{what}[{i}] (T{}).{field}", t.number);
+        if t.number == 0 || t.number > 99_999 {
+            return Err(CamError::Invalid(format!("{what}[{i}].number must be 1 to 99999; it is {}", t.number)));
+        }
+        if tools.iter().take(i).any(|o| o.number == t.number) {
+            return Err(CamError::Invalid(format!("tool number T{} is listed twice", t.number)));
+        }
+        length(&at("diameter"), t.diameter, 0.05)?;
+        length(&at("flute_length"), t.flute_length, 0.05)?;
+        for (field, v) in [("rpm", t.rpm), ("feed", t.feed), ("plunge", t.plunge)] {
+            if !v.is_finite() || v <= 0.0 || v > 1e6 {
+                return Err(CamError::Invalid(format!("{} must be positive and at most 1e6; it is {v}", at(field))));
+            }
+        }
+        if let Some(a) = t.tip_angle_deg
+            && !(a.is_finite() && a > 1.0 && a < 179.0)
+        {
+            return Err(CamError::Invalid(format!("{} must be between 1 and 179 degrees; it is {a}", at("tip_angle_deg"))));
+        }
+        if let Some(d) = t.stepdown {
+            length(&at("stepdown"), d, 0.01)?;
+        }
+        if let Some(p) = t.peck {
+            length(&at("peck"), p, 0.01)?;
+        }
+        if let Some(f) = t.stepover
+            && !(f.is_finite() && f > 0.0 && f <= 1.0)
+        {
+            return Err(CamError::Invalid(format!("{} is a fraction of the diameter, above 0 and at most 1; it is {f}", at("stepover"))));
+        }
+    }
+    Ok(())
+}
+
 impl Job {
-    /// Read a job from its JSON text.
+    /// Read a job from its JSON text; a job naming a library file is refused (there is nothing
+    /// to read it with: see [`Job::from_json_with`]).
     pub fn from_json(text: &str) -> Result<Job> {
+        Job::from_json_with(text, &|path| Err(CamError::Invalid(format!("library {path}: no library files can be read here"))))
+    }
+
+    /// Read a job from its JSON text, reading its tool library (if it names one) with `load`.
+    pub fn from_json_with(text: &str, load: &dyn Fn(&str) -> Result<String>) -> Result<Job> {
         let job: Job = serde_json::from_str(text).map_err(|e| CamError::Invalid(format!("job: {e}")))?;
-        job.validate()?;
-        Ok(job)
+        job.with_library(load)
+    }
+
+    /// The job with its library's tools added (the built-in library's when it lists no tools
+    /// and names no library), then checked.
+    pub fn with_library(mut self, load: &dyn Fn(&str) -> Result<String>) -> Result<Job> {
+        validate_tools(&self.tools, "tools")?;
+        let lib = if !self.library.is_empty() {
+            Some(ToolLibrary::from_json(&load(&self.library)?).map_err(|e| CamError::Invalid(format!("library {}: {e}", self.library)))?)
+        } else if self.tools.is_empty() {
+            Some(ToolLibrary::builtin()?)
+        } else {
+            None
+        };
+        if let Some(lib) = lib {
+            for t in lib.tools {
+                if self.tool(t.number).is_none() {
+                    self.tools.push(t);
+                }
+            }
+            self.tools.sort_by_key(|t| t.number);
+        }
+        self.validate()?;
+        Ok(self)
     }
 
     /// Check every number and reference before anything is planned.
@@ -329,47 +477,21 @@ impl Job {
         if 2.0 * self.nest.margin >= s.size[0].min(s.size[1]) {
             return Err(CamError::Invalid("nest.margin leaves no room on the sheet".into()));
         }
-        if self.tools.len() > MAX_TOOLS {
-            return Err(CamError::Invalid(format!("at most {MAX_TOOLS} tools")));
-        }
-        for (i, t) in self.tools.iter().enumerate() {
-            let at = |field: &str| format!("tools[{i}] (T{}).{field}", t.number);
-            if t.number == 0 || t.number > 99_999 {
-                return Err(CamError::Invalid(format!("tools[{i}].number must be 1 to 99999; it is {}", t.number)));
-            }
-            if self.tools.iter().take(i).any(|o| o.number == t.number) {
-                return Err(CamError::Invalid(format!("tool number T{} is listed twice", t.number)));
-            }
-            length(&at("diameter"), t.diameter, 0.05)?;
-            length(&at("flute_length"), t.flute_length, 0.05)?;
-            for (field, v) in [("rpm", t.rpm), ("feed", t.feed), ("plunge", t.plunge)] {
-                if !v.is_finite() || v <= 0.0 || v > 1e6 {
-                    return Err(CamError::Invalid(format!("{} must be positive and at most 1e6; it is {v}", at(field))));
-                }
-            }
-            if let Some(a) = t.tip_angle_deg
-                && !(a.is_finite() && a > 1.0 && a < 179.0)
-            {
-                return Err(CamError::Invalid(format!("{} must be between 1 and 179 degrees; it is {a}", at("tip_angle_deg"))));
-            }
-            if let Some(d) = t.stepdown {
-                length(&at("stepdown"), d, 0.01)?;
-            }
-            if let Some(p) = t.peck {
-                length(&at("peck"), p, 0.01)?;
-            }
-            if let Some(f) = t.stepover
-                && !(f.is_finite() && f > 0.0 && f <= 1.0)
-            {
-                return Err(CamError::Invalid(format!("{} is a fraction of the diameter, above 0 and at most 1; it is {f}", at("stepover"))));
-            }
-        }
+        validate_tools(&self.tools, "tools")?;
         let st = &self.strategy;
         length("strategy.stock_to_leave", st.stock_to_leave, 0.0)?;
         length("strategy.clearance", st.clearance, 0.5)?;
         length("strategy.retract", st.retract, 0.1)?;
         length("strategy.chamfer_tip_below", st.chamfer_tip_below, 0.0)?;
         length("strategy.tabs.width", st.tabs.width, 0.0)?;
+        length("strategy.cut_out.skin", st.cut_out.skin, 0.0)?;
+        length("strategy.cut_out.skin_stepdown", st.cut_out.skin_stepdown, 0.01)?;
+        if st.cut_out.skin >= s.thickness {
+            return Err(CamError::Invalid(format!(
+                "strategy.cut_out.skin {} mm is not less than the sheet's thickness {} mm",
+                st.cut_out.skin, s.thickness
+            )));
+        }
         length("strategy.tabs.height", st.tabs.height, 0.0)?;
         if !(st.rapid_feed.is_finite() && (1.0..=1e6).contains(&st.rapid_feed)) {
             return Err(CamError::Invalid(format!("strategy.rapid_feed must be from 1 to 1000000 mm/min; it is {}", st.rapid_feed)));
@@ -430,9 +552,21 @@ impl Job {
         self.strategy.rough_tool.and_then(|n| self.tool(n)).or_else(|| self.flats().max_by(|a, b| a.diameter.total_cmp(&b.diameter)))
     }
 
-    /// The tool for finishing and for holes no drill fits.
+    /// The tool for finishing and for holes no drill fits: by default the largest flat end
+    /// mill smaller than the roughing tool (a Ø3 beside a Ø6, not a Ø1), else the roughing tool.
     pub fn finish_tool(&self) -> Option<&Tool> {
-        self.strategy.finish_tool.and_then(|n| self.tool(n)).or_else(|| self.flats().min_by(|a, b| a.diameter.total_cmp(&b.diameter)))
+        self.strategy.finish_tool.and_then(|n| self.tool(n)).or_else(|| {
+            let rough = self.rough_tool()?;
+            self.flats().filter(|t| t.diameter < rough.diameter - 1e-9).max_by(|a, b| a.diameter.total_cmp(&b.diameter)).or(Some(rough))
+        })
+    }
+
+    /// The end mill for a hole of `diameter` no drill fits: the finishing tool if the hole's
+    /// radius is at least 1.05 times its radius (room for a helix), else the largest flat end
+    /// mill it is for.
+    pub fn hole_tool(&self, diameter: f64) -> Option<&Tool> {
+        let fits = |t: &&Tool| t.diameter * 1.05 <= diameter + 1e-9;
+        self.finish_tool().filter(fits).or_else(|| self.flats().filter(fits).max_by(|a, b| a.diameter.total_cmp(&b.diameter)))
     }
 
     /// The tool for cutting parts out of the sheet.
