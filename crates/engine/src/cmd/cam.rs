@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use solidcraft_cam::job::{Job, PartRef};
 use solidcraft_cam::nest::{NestItem, nest};
-use solidcraft_cam::part::{PartFeatures, read_part};
+use solidcraft_cam::part::{PartFeatures, oriented};
 
 use super::CommandSpec;
 use crate::params::bad;
@@ -39,9 +39,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         .output(output_schema_for::<JobNestResult>)
         .params(
             "job: a job object or the path of a job file: {stock: {size: [width, depth], thickness, material?, spoilboard_allowance? (0.2)}, \
-             nest?: {margin? (10), spacing? (10), rotate? (true)}, tools?: [{number, kind: flat|drill|chamfer, diameter, flute_length, \
+             nest?: {margin? (10), spacing? (8), rotate? (true)}, tools?: [{number, kind: flat|drill|chamfer, diameter, flute_length, \
              rpm, feed, plunge, flutes?, tip_angle_deg?, stepdown?, stepover? (fraction), peck?}], parts: [{body, design? (.sc or STEP, \
-             relative to the job file; empty: the open design), quantity? (1), name?}]} → each part's height, box and outline area, \
+             relative to the job file; empty: the open design), quantity? (1), name?, orient? (auto | +z | -z | +x | -x | +y | -y: which \
+             of the part's axes is up; auto picks one that fits the sheet, then with the fewest faces unreachable from the top, then \
+             the largest flat bottom)}]} → each part's axis up, height, box and outline area, \
              and the layout on the sheet (work zero at the sheet's top front-left corner, X right, Y back): placements {part, copy, \
              quarter_turns, offset, bounds}, unplaced copies with the reason, utilisation. Bounding-box nesting with 90° turns. Read-only",
         ),
@@ -63,10 +65,11 @@ fn job_nest(s: &mut Session, p: &Value) -> Result<Value> {
     let mut features: Vec<PartFeatures> = Vec::new();
     for part in &job.parts {
         let body = part_body(s, base.as_deref(), part)?;
-        let f = read_part(&body).map_err(|e| EngineError::Other(format!("{}: {e}", part.label())))?;
+        let (up, _, f) = oriented(&body, part.orient, job.stock.thickness).map_err(|e| EngineError::Other(format!("{}: {e}", part.label())))?;
         let height = f.top_z - f.bottom_z;
         parts.push(NestedPart {
             label: part.label().to_string(),
+            up,
             design: part.design.clone(),
             body: part.body.clone(),
             quantity: part.quantity,

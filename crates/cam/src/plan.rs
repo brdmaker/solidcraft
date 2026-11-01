@@ -1034,6 +1034,8 @@ pub fn plan_sheet(job: &Job, parts: &[(&PartFeatures, &PartPlan)], placements: &
 /// operations in the order they run.
 pub struct JobPlan {
     pub features: Vec<PartFeatures>,
+    /// Which of each part's axes is up on the machine (its `orient`, or the one `auto` chose).
+    pub ups: Vec<crate::job::Up>,
     pub plans: Vec<PartPlan>,
     pub nesting: crate::nest::Nesting,
     pub ops: Vec<Operation>,
@@ -1049,8 +1051,10 @@ pub fn plan_job(job: &Job, bodies: &[solidcraft_kernel::Body]) -> Result<JobPlan
     let mut features = Vec::new();
     let mut plans = Vec::new();
     let mut warnings = Vec::new();
+    let mut ups = Vec::new();
     for (p, b) in job.parts.iter().zip(bodies) {
-        let f = crate::part::read_part(b).map_err(|e| CamError::Invalid(format!("{}: {e}", p.label())))?;
+        let (up, _, f) = crate::part::oriented(b, p.orient, job.stock.thickness).map_err(|e| CamError::Invalid(format!("{}: {e}", p.label())))?;
+        ups.push(up);
         let plan = plan_part(&f, job, p.label())?;
         warnings.extend(plan.warnings.iter().cloned());
         features.push(f);
@@ -1067,7 +1071,7 @@ pub fn plan_job(job: &Job, bodies: &[solidcraft_kernel::Body]) -> Result<JobPlan
     let pairs: Vec<(&PartFeatures, &PartPlan)> = features.iter().zip(&plans).collect();
     let (ops, sheet_warnings) = plan_sheet(job, &pairs, &nesting.placements)?;
     warnings.extend(sheet_warnings);
-    Ok(JobPlan { features, plans, nesting, ops, warnings })
+    Ok(JobPlan { features, ups, plans, nesting, ops, warnings })
 }
 
 impl JobPlan {

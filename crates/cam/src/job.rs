@@ -380,6 +380,61 @@ impl Tool {
     }
 }
 
+/// Which of the part's own axes points up on the machine (the side machined).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum Up {
+    /// As modelled.
+    #[serde(rename = "+z")]
+    PlusZ,
+    /// Upside down.
+    #[serde(rename = "-z")]
+    MinusZ,
+    #[serde(rename = "+x")]
+    PlusX,
+    #[serde(rename = "-x")]
+    MinusX,
+    #[serde(rename = "+y")]
+    PlusY,
+    #[serde(rename = "-y")]
+    MinusY,
+}
+
+/// How a part is turned before it is machined: `auto` (default: the best of the six axes up,
+/// see [`crate::part::oriented`]) or one axis up, `+z` (as modelled), `-z`, `+x`, `-x`, `+y`, `-y`.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+pub enum Orient {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "+z")]
+    PlusZ,
+    #[serde(rename = "-z")]
+    MinusZ,
+    #[serde(rename = "+x")]
+    PlusX,
+    #[serde(rename = "-x")]
+    MinusX,
+    #[serde(rename = "+y")]
+    PlusY,
+    #[serde(rename = "-y")]
+    MinusY,
+}
+
+impl Orient {
+    /// The axis it names; `None` for `auto`.
+    pub fn up(self) -> Option<Up> {
+        match self {
+            Orient::Auto => None,
+            Orient::PlusZ => Some(Up::PlusZ),
+            Orient::MinusZ => Some(Up::MinusZ),
+            Orient::PlusX => Some(Up::PlusX),
+            Orient::MinusX => Some(Up::MinusX),
+            Orient::PlusY => Some(Up::PlusY),
+            Orient::MinusY => Some(Up::MinusY),
+        }
+    }
+}
+
 /// Copies of one body of one design.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -394,6 +449,10 @@ pub struct PartRef {
     pub body: String,
     #[serde(default = "one")]
     pub quantity: u32,
+    /// Which way up it is machined: `auto` (default) or `+z` (as modelled), `-z`, `+x`, `-x`,
+    /// `+y`, `-y`.
+    #[serde(default)]
+    pub orient: Orient,
 }
 
 impl PartRef {

@@ -25,6 +25,8 @@ pub struct JobNestParams {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct NestedPart {
     pub label: String,
+    /// Which of the part's own axes is up on the machine.
+    pub up: solidcraft_cam::job::Up,
     pub design: String,
     pub body: String,
     pub quantity: u32,

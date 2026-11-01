@@ -39,6 +39,9 @@ fn run() -> Result<(), String> {
         bodies.push(body.body.clone());
     }
     let plan = plan_job(&job, &bodies).map_err(|e| e.to_string())?;
+    for (p, up) in job.parts.iter().zip(&plan.ups) {
+        println!("{}: {} up", p.label(), serde_json::to_string(up).unwrap_or_default().trim_matches('"'));
+    }
     let outlines = plan.placed_outlines();
     let scene = Scene { sheet: job.stock.size, margin: job.nest.margin, outlines: &outlines, ops: &plan.ops, clearance: job.strategy.clearance };
     if out.ends_with(".svg") {

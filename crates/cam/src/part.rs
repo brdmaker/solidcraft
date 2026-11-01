@@ -11,6 +11,8 @@ use serde::Serialize;
 use solidcraft_geom::{Mesh, Plane, Vec2, Vec3};
 use solidcraft_kernel::{Body, FaceSurface, face_surface};
 
+use crate::job::Up;
+
 use crate::region::{Area, Ring, signed_area};
 use crate::{CamError, Result};
 
@@ -106,6 +108,8 @@ pub struct PartFeatures {
     pub silhouette_area: f64,
     /// Area inside the outer outline (openings included).
     pub outline_area: f64,
+    /// Area of the flat faces at the bottom: what rests on the table (and the vacuum holds).
+    pub bottom_area: f64,
     pub floors: Vec<Floor>,
     pub holes: Vec<HoleStack>,
     pub chamfers: Vec<Chamfer>,
@@ -332,6 +336,7 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
     for b in &bottoms {
         silhouette = silhouette.union(b)?;
     }
+    let bottom_area = silhouette.area();
     for f in &floors {
         silhouette = silhouette.union(&f.region)?;
     }
@@ -368,6 +373,7 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
         bounds,
         silhouette_area: silhouette.area(),
         outline_area: outline.area(),
+        bottom_area,
         floors,
         holes,
         chamfers,
@@ -549,4 +555,58 @@ fn chamfer_bands(faces: Vec<(usize, f64, f64, f64, Area)>, outline: &Area, mesh_
         }
     }
     Ok(bands)
+}
+
+/// `body` turned so that its `up` axis points up (the machining direction): a quarter or half
+/// turn about X or Y.
+pub fn turned(body: &Body, up: Up) -> Result<Body> {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let (axis, angle) = match up {
+        Up::PlusZ => return Ok(body.clone()),
+        Up::MinusZ => (Vec3::new(1.0, 0.0, 0.0), PI),
+        // a quarter turn about Y takes +X to +Z the clockwise way round
+        Up::PlusX => (Vec3::new(0.0, 1.0, 0.0), -FRAC_PI_2),
+        Up::MinusX => (Vec3::new(0.0, 1.0, 0.0), FRAC_PI_2),
+        Up::PlusY => (Vec3::new(1.0, 0.0, 0.0), FRAC_PI_2),
+        Up::MinusY => (Vec3::new(1.0, 0.0, 0.0), -FRAC_PI_2),
+    };
+    Ok(solidcraft_kernel::transform(body, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0), axis, angle)?)
+}
+
+/// The part turned as `orient` says, with its features: a given axis up, or (`auto`) the best of
+/// the six: one that fits a sheet `thickness` thick, then with the fewest faces a router cannot
+/// reach from the top, then resting on the most flat bottom (what the vacuum holds), then the
+/// first of +Z, −Z, +X, −X, +Y, −Y (as modelled first).
+pub fn oriented(body: &Body, orient: crate::job::Orient, thickness: f64) -> Result<(Up, Body, PartFeatures)> {
+    let ups: Vec<Up> = match orient.up() {
+        None => vec![Up::PlusZ, Up::MinusZ, Up::PlusX, Up::MinusX, Up::PlusY, Up::MinusY],
+        Some(up) => vec![up],
+    };
+    let mut best: Option<(Up, Body, PartFeatures)> = None;
+    let mut last_err = None;
+    for up in ups {
+        let b = turned(body, up)?;
+        let f = match read_part(&b) {
+            Ok(f) => f,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let better = match &best {
+            None => true,
+            Some((_, _, g)) => {
+                let fits = |f: &PartFeatures| f.top_z - f.bottom_z <= thickness + 1e-6;
+                let same = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs()) + 1e-6;
+                (fits(&f), std::cmp::Reverse(f.unsupported.len())) > (fits(g), std::cmp::Reverse(g.unsupported.len()))
+                    || ((fits(&f), f.unsupported.len()) == (fits(g), g.unsupported.len())
+                        && !same(f.bottom_area, g.bottom_area)
+                        && f.bottom_area > g.bottom_area)
+            }
+        };
+        if better {
+            best = Some((up, b, f));
+        }
+    }
+    best.ok_or_else(|| last_err.unwrap_or_else(|| CamError::Geometry("no orientation could be read".into())))
 }

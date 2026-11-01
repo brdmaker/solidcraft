@@ -147,6 +147,61 @@ mod part_tests {
         boolean(&a, &b, BoolOp::Cut).unwrap().unwrap()
     }
 
+    /// A 40 × 30 × 10 plate with a 20 × 10 pocket 4 deep cut into its bottom, as if modelled
+    /// upside down: as modelled the pocket's floor faces down (unreachable from the top); turned
+    /// over (−Z up) it is an ordinary pocket, 4 deep from the top, nothing unreachable, resting on
+    /// the 40 × 30 face. `auto` picks that; `+z` keeps it as modelled.
+    #[test]
+    fn auto_orientation_turns_an_upside_down_part_over() {
+        use crate::job::{Orient, Up};
+        use crate::part::oriented;
+        let b = cut(box_solid(v(-20.0, -15.0, 0.0), v(20.0, 15.0, 10.0)).unwrap(), box_solid(v(-10.0, -5.0, -1.0), v(10.0, 5.0, 4.0)).unwrap());
+        let as_modelled = read_part(&b).unwrap();
+        assert!(!as_modelled.unsupported.is_empty(), "the pocket's floor faces down");
+        let (up, _, f) = oriented(&b, Orient::Auto, 10.0).unwrap();
+        assert_eq!(up, Up::MinusZ);
+        assert!(f.unsupported.is_empty(), "{:?}", f.unsupported);
+        assert!((f.top_z - f.bottom_z - 10.0).abs() < 1e-6);
+        let floor = f.floors.iter().find(|fl| !fl.top).unwrap();
+        assert!((f.top_z - floor.z - 4.0).abs() < 1e-6, "the pocket 4 deep from the top");
+        assert!((f.bottom_area - 1200.0).abs() < 1e-6, "resting on 40 × 30: {}", f.bottom_area);
+        let (up, _, f) = oriented(&b, Orient::PlusZ, 10.0).unwrap();
+        assert_eq!(up, Up::PlusZ);
+        assert!(!f.unsupported.is_empty());
+    }
+
+    /// A plain 10 × 20 × 30 block: every way up is reachable, so `auto` rests it on its largest
+    /// face, 20 × 30 (X up, 10 tall; +X before −X); given an axis it turns as told: +Y up is 20
+    /// tall, −Z up 30, each resting on the face across that axis.
+    #[test]
+    fn auto_orientation_rests_a_part_on_its_largest_face() {
+        use crate::job::{Orient, Up};
+        use crate::part::oriented;
+        let b = box_solid(v(0.0, 0.0, 0.0), v(10.0, 20.0, 30.0)).unwrap();
+        let height = |f: &crate::part::PartFeatures| f.top_z - f.bottom_z;
+        let (up, _, f) = oriented(&b, Orient::Auto, 40.0).unwrap();
+        assert_eq!(up, Up::PlusX);
+        assert!((height(&f) - 10.0).abs() < 1e-6 && (f.bottom_area - 600.0).abs() < 1e-6, "{} {}", height(&f), f.bottom_area);
+        for (o, h, area) in [(Orient::PlusY, 20.0, 300.0), (Orient::MinusZ, 30.0, 200.0), (Orient::MinusX, 10.0, 600.0)] {
+            let (_, _, f) = oriented(&b, o, 40.0).unwrap();
+            assert!((height(&f) - h).abs() < 1e-6 && (f.bottom_area - area).abs() < 1e-6, "{o:?}: {} tall on {}", height(&f), f.bottom_area);
+        }
+        // the job's `orient` field
+        let j = crate::job::Job::from_json(
+            r#"{"stock": {"size": [300, 300], "thickness": 10}, "parts": [{"body": "A"}, {"body": "B", "orient": "-y"}]}"#,
+        )
+        .unwrap();
+        assert_eq!((j.parts[0].orient, j.parts[1].orient), (Orient::Auto, Orient::MinusY));
+        assert!(crate::job::Job::from_json(r#"{"stock": {"size": [300, 300], "thickness": 10}, "parts": [{"body": "A", "orient": "up"}]}"#).is_err());
+        // planned as a job: the axis it chose is reported
+        let plan = crate::plan::plan_job(
+            &crate::job::Job::from_json(r#"{"stock": {"size": [300, 300], "thickness": 12}, "parts": [{"body": "A"}]}"#).unwrap(),
+            &[b],
+        )
+        .unwrap();
+        assert_eq!(plan.ups, vec![Up::PlusX]);
+    }
+
     /// A 40 × 30 × 10 plate: a Ø6 through hole at (10, 10); a counterbore (Ø10 × 4 deep over a
     /// Ø5 through hole) at (−10, 5); a 10 × 8 pocket 3 deep centred on (0, −8).
     fn plate() -> Body {
