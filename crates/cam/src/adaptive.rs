@@ -41,9 +41,30 @@ pub struct AdaptiveParams {
     pub retract: f64,
     /// The machine's rapid traverse speed, mm/min: links take the quickest way.
     pub rapid: f64,
+    /// The most chip thinning raises the feed, times the tool's feed (1: the tool's feed).
+    pub max_thinning: f64,
+    /// The feed in a full slot, times the tool's feed.
+    pub slotting: f64,
+    /// The feed through cleared ground between passes, mm/min.
+    pub link: f64,
 }
 
 impl AdaptiveParams {
+    /// The feed factor for a cut engaging `e` (radians) of the cutter's edge: the chip is as
+    /// thick as the tool's chip load where 1 / sin(e) is applied below 90°, up to
+    /// `max_thinning`, in steps of 0.1 (rounded down); the tool's feed from 90° to 170°; the
+    /// slotting factor past it.
+    pub fn feed_factor(&self, e: f64) -> f64 {
+        if e > 170f64.to_radians() {
+            self.slotting
+        } else if e >= std::f64::consts::FRAC_PI_2 || self.max_thinning <= 1.0 {
+            1.0
+        } else {
+            let f = (1.0 / e.sin().max(1e-6)).min(self.max_thinning);
+            ((f * 10.0 + 1e-9).floor() / 10.0).max(1.0)
+        }
+    }
+
     /// The engagement of a straight cut `step` deep into the side of a cutter of radius `rt`:
     /// the arc of its edge, from straight ahead round to where the uncut material ends,
     /// acos(1 − step/rt) (180° in a full slot).
@@ -210,6 +231,37 @@ fn hot_points(segs: &[Vec<[f64; 2]>], cleared: &Cleared, rt: f64, limit: f64, wa
         }
     }
     hot
+}
+
+/// Cut along `path` (from its first point, where the tool is) at `z`, each piece at the tool's
+/// feed times the factor (`AdaptiveParams::feed_factor`) for the most engagement measured every
+/// 0.1 mm along it and the two pieces either side (the feed changes before the load does), at
+/// most the rapid feed.
+fn cut(b: &mut PathBuilder, cleared: &Cleared, path: &[[f64; 2]], z: f64, t: &Tool, p: &AdaptiveParams) {
+    let rt = t.diameter / 2.0;
+    let most: Vec<f64> = path
+        .windows(2)
+        .map(|w| {
+            let (Some(a), Some(q)) = (w.first(), w.get(1)) else { return std::f64::consts::PI };
+            let len = (q[0] - a[0]).hypot(q[1] - a[1]);
+            if len <= 1e-9 {
+                return 0.0;
+            }
+            let dir = [(q[0] - a[0]) / len, (q[1] - a[1]) / len];
+            let n = (len / 0.1).ceil().clamp(1.0, 10_000.0) as usize;
+            (0..=n)
+                .map(|k| {
+                    let s = k as f64 / n as f64;
+                    cleared.engagement([a[0] + (q[0] - a[0]) * s, a[1] + (q[1] - a[1]) * s], dir, rt)
+                })
+                .fold(0.0, f64::max)
+        })
+        .collect();
+    for (i, q) in path.iter().skip(1).enumerate() {
+        let e = most.get(i.saturating_sub(2)..(i + 3).min(most.len())).map_or(std::f64::consts::PI, |w| w.iter().copied().fold(0.0, f64::max));
+        let feed = if p.max_thinning > 1.0 || p.slotting < 1.0 { t.feed * p.feed_factor(e) } else { t.feed };
+        b.line([q[0], q[1], z], feed.min(p.rapid.max(t.feed)));
+    }
 }
 
 /// Edges no longer than `max`, ring closed (first point repeated last).
@@ -595,7 +647,7 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
             let Some(&q) = r.get(start) else { continue };
             b.travel_to(q, from);
             b.line([q[0], q[1], from], t.plunge);
-            b.ramp_ring(&r, start, z, p.ramp, t.feed, t.plunge);
+            b.ramp_ring(&r, start, z, p.ramp, t.feed * p.slotting, t.plunge);
             cleared.sweep(&densify(&r, spacing), rt);
             b.up();
         }
@@ -614,7 +666,8 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
     b.travel_to([c[0] + rh, c[1]], from);
     b.line([c[0] + rh, c[1], from], t.plunge);
     let pitch = (std::f64::consts::TAU * rh * p.ramp.tan()).max(0.01);
-    b.helix(c, rh, z, pitch, t.feed);
+    // a helix as wide as half the cutter is a slot going down
+    b.helix(c, rh, z, pitch, t.feed * p.slotting);
     cleared.stamp(c, rh + rt);
     let centres = Area::circle(c[0], c[1], rh, 0.01)?.intersection(shape)?;
     // The centres' region, the same grown by the full step, and the region itself, in tiles:
@@ -739,21 +792,15 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
                 let k = lead.len();
                 let Some(&first) = lead.first() else { continue };
                 link(b, &maps, c, first, z, from, t, p)?;
-                for q in lead.iter().skip(1) {
-                    b.line([q[0], q[1], z], t.feed);
-                }
                 // on to the ring where the lead-in reaches it, round, and over the start again
-                for q in sg.iter().skip(k).chain(sg.iter().skip(1).take(k)) {
-                    b.line([q[0], q[1], z], t.feed);
-                }
+                let path: Vec<[f64; 2]> = lead.iter().chain(sg.iter().skip(k)).chain(sg.iter().skip(1).take(k)).copied().collect();
+                cut(b, &cleared, &path, z, t, p);
                 cleared.sweep(&sg, rt);
                 continue;
             } else {
                 link(b, &maps, c, start, z, from, t, p)?;
             }
-            for q in sg.iter().skip(1) {
-                b.line([q[0], q[1], z], t.feed);
-            }
+            cut(b, &cleared, &sg, z, t, p);
             cleared.sweep(&sg, rt);
         }
         // offsets add a vertex at every round corner: thin each piece out before it is kept
@@ -800,16 +847,17 @@ fn link(b: &mut PathBuilder, maps: &Maps, hub: [f64; 2], to: [f64; 2], z: f64, f
     let (tlo, thi) = bbox(&[to], maps.pad);
     let over = nearest_on(&maps.cen.window(tlo, thi)?, to).unwrap_or(to);
     let lift = from + p.retract;
-    let (feed, plunge, rapid) = (t.feed.max(1e-6), t.plunge.max(1e-6), p.rapid.max(1e-6));
+    let (feed, plunge, rapid) = (p.link.max(t.feed).max(1e-6), t.plunge.max(1e-6), p.rapid.max(1e-6));
     let up_feed = t.plunge.max(t.feed).max(1e-6);
     let clear = b.h.clearance;
     let above = (from + p.retract).min(clear);
-    let up_time =
-        ((clear - b.at[2]).max(0.0) + d(here, over) + (clear - above).max(0.0)) / rapid + (above - z).max(0.0) / plunge + d(over, to) / feed;
+    let up_time = ((clear - b.at[2]).max(0.0) + d(here, over) + (clear - above).max(0.0)) / rapid
+        + (above - z).max(0.0) / plunge
+        + d(over, to) / t.feed.max(1e-6);
     let mut ways = [
         (d(here, to) / feed, 0u8),
         ((d(here, hub) + d(hub, to)) / feed, 1),
-        ((lift - z) / up_feed + (d(here, over) + d(over, to)) / feed + (lift - z) / plunge, 2),
+        ((lift - z) / up_feed + d(here, over) / feed + d(over, to) / t.feed.max(1e-6) + (lift - z) / plunge, 2),
     ];
     ways.sort_by(|a, b| a.0.total_cmp(&b.0));
     let inside = |tiles: &Tiled, a: [f64; 2], q: [f64; 2]| -> Result<bool> {
@@ -835,19 +883,19 @@ fn link(b: &mut PathBuilder, maps: &Maps, hub: [f64; 2], to: [f64; 2], z: f64, f
     }
     match way {
         0 => {
-            b.line([to[0], to[1], z], t.feed);
+            b.line([to[0], to[1], z], feed);
             return Ok(());
         }
         1 => {
-            b.line([hub[0], hub[1], z], t.feed);
-            b.line([to[0], to[1], z], t.feed);
+            b.line([hub[0], hub[1], z], feed);
+            b.line([to[0], to[1], z], feed);
             return Ok(());
         }
         2 => {
             // above this level's material (the levels above cleared all of the region), but at
             // feed: rapids across run at clearance height only
             b.line([here[0], here[1], lift], up_feed);
-            b.line([over[0], over[1], lift], t.feed);
+            b.line([over[0], over[1], lift], feed);
         }
         _ => {
             b.up();

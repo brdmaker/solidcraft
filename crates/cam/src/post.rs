@@ -74,6 +74,9 @@ pub fn tool_line(job: &Job, ops: &[Operation], n: u32, decimals: u32) -> String 
         }
     }
     line.push_str(&format!(" rpm={} feed={} plunge={}", f(t.rpm), f(t.feed), f(t.plunge)));
+    if let Some(c) = t.chip_load {
+        line.push_str(&format!(" chip_load={}", f(c)));
+    }
     if z_min.is_finite() {
         line.push_str(&format!(" z_min={}", f(z_min)));
     }

@@ -322,6 +322,36 @@ mod job_tests {
         assert_eq!(j.strategy.cut_out.final_skin, 0.0, "cut free");
     }
 
+    /// A chip load gives the feed: 0.05 mm × 2 flutes × 12000 rpm = 1200 mm/min, held to the
+    /// rapid feed (0.2 × 2 × 24000 = 9600 → 5000); the built-in Ø6 runs 0.055 × 1 × 18000 =
+    /// 990 mm/min; a tool needs a feed or a chip load.
+    #[test]
+    fn a_chip_load_gives_the_feed() {
+        let tool = |t: &str| {
+            Job::from_json(&format!(
+                r#"{{"stock": {{"size": [600, 400], "thickness": 10}}, "tools": [{{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, {t}, "plunge": 300}}], "parts": [{{"body": "F"}}]}}"#
+            ))
+        };
+        let feed = |t: &str| tool(t).unwrap().tools[0].feed;
+        assert!((feed(r#""flutes": 2, "rpm": 12000, "chip_load": 0.05"#) - 1200.0).abs() < 1e-9);
+        assert!((feed(r#""flutes": 2, "rpm": 24000, "chip_load": 0.2"#) - 5000.0).abs() < 1e-9);
+        assert!((feed(r#""flutes": 2, "rpm": 12000, "chip_load": 0.05, "feed": 700"#) - 1200.0).abs() < 1e-9, "the chip load wins");
+        assert!((feed(r#""rpm": 12000, "feed": 700"#) - 700.0).abs() < 1e-9);
+        let err = tool(r#""rpm": 12000"#).unwrap_err().to_string();
+        assert!(err.contains("feed or its chip_load"), "{err}");
+        assert!(tool(r#""rpm": 12000, "chip_load": -1"#).is_err());
+        assert!(tool(r#""rpm": 12000, "flutes": 0, "feed": 700"#).is_err());
+        let j = Job::from_json(MINIMAL).unwrap();
+        assert!((j.tool(6).unwrap().feed - 990.0).abs() < 1e-9);
+        assert!((j.tool(1).unwrap().feed - 192.0).abs() < 1e-9, "0.008 × 24000");
+        let f = &j.strategy.feeds;
+        assert_eq!((f.chip_thinning, f.max_thinning, f.slotting, f.link), (true, 2.0, 0.8, 3000.0));
+        for bad in [r#"{"max_thinning": 0.5}"#, r#"{"slotting": 0}"#, r#"{"link": -1}"#] {
+            let text = MINIMAL.replace(r#""parts""#, &format!(r#""strategy": {{"feeds": {bad}}}, "parts""#));
+            assert!(Job::from_json(&text).is_err(), "{bad}");
+        }
+    }
+
     /// The built-in library: single-flute end mills Ø1, Ø2, Ø3 and Ø6 as T1, T2, T3 and T6, and
     /// a 90° chamfer mill Ø6 as T5: all in the six-fork rack (T1 to T6). With it, roughing takes
     /// the Ø6, finishing the Ø3 (the largest smaller than the roughing tool), cutting out the Ø6
@@ -1204,6 +1234,8 @@ mod adaptive_tests {
     struct Sample {
         p: [f64; 3],
         dir: [f64; 2],
+        /// The move's feed (NaN where not read).
+        feed: f64,
     }
 
     fn strokes(op: &Operation) -> Vec<Vec<Sample>> {
@@ -1220,11 +1252,43 @@ mod adaptive_tests {
                 let dir = if len > 1e-12 { [(b[0] - a[0]) / len, (b[1] - a[1]) / len] } else { [0.0, 0.0] };
                 for k in 1..=n {
                     let t = k as f64 / n as f64;
-                    st.push(Sample { p: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t], dir });
+                    st.push(Sample { p: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t], dir, feed: f64::NAN });
                 }
             }
             out.push(st);
         }
+        out
+    }
+
+    /// The same, move by move, each sample with its move's feed: strokes end at rapids.
+    fn strokes_fed(op: &Operation) -> Vec<Vec<Sample>> {
+        let mut out: Vec<Vec<Sample>> = vec![Vec::new()];
+        let mut at = [f64::NAN, f64::NAN, 15.0];
+        for m in &op.moves {
+            let feed = match m {
+                Move::Line { feed, .. } | Move::Arc { feed, .. } => *feed,
+                _ => {
+                    out.push(Vec::new());
+                    at = m.end();
+                    continue;
+                }
+            };
+            let one = Operation { kind: op.kind, name: String::new(), tool: op.tool, rpm: op.rpm, moves: vec![m.clone()] };
+            let pts: Vec<[f64; 3]> = trace(&one, at, 1f64.to_radians()).into_iter().flat_map(|s| s.pts).collect();
+            let st = out.last_mut().unwrap();
+            for w in pts.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+                let n = ((len.max((b[2] - a[2]).abs())) / 0.05).ceil().max(1.0) as usize;
+                let dir = if len > 1e-12 { [(b[0] - a[0]) / len, (b[1] - a[1]) / len] } else { [0.0, 0.0] };
+                for k in 1..=n {
+                    let t = k as f64 / n as f64;
+                    st.push(Sample { p: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t], dir, feed });
+                }
+            }
+            at = m.end();
+        }
+        out.retain(|s| !s.is_empty());
         out
     }
 
@@ -1334,6 +1398,7 @@ mod adaptive_tests {
     struct Seen {
         engaged: Vec<(f64, usize, usize)>,
         at: Vec<[f64; 3]>,
+        feeds: Vec<f64>,
         replay: Replay,
     }
 
@@ -1347,6 +1412,7 @@ mod adaptive_tests {
     fn replay_level_on(all: &[Vec<Sample>], z: f64, above: f64, mut r: Replay) -> Seen {
         let mut engaged = Vec::new();
         let mut at = Vec::new();
+        let mut feeds = Vec::new();
         for st in all {
             // positions are marked cut once the tool is 1 mm further along: nearer ones would
             // cover the forward ring (anything within 0.2 r behind does) and hide the cut
@@ -1384,6 +1450,7 @@ mod adaptive_tests {
                 let e = r.engagement(s.p, s.dir, 3.0);
                 engaged.push(e);
                 at.push(s.p);
+                feeds.push(s.feed);
                 trail.push_back((s.p, along));
             }
             let rest: Vec<[f64; 3]> = trail.into_iter().map(|(p, _)| p).collect();
@@ -1396,7 +1463,7 @@ mod adaptive_tests {
                 last_stamped = Some(*p);
             }
         }
-        Seen { engaged, at, replay: r }
+        Seen { engaged, at, feeds, replay: r }
     }
 
     /// The pocket's region the cutter's centre may reach at a level: the 40 × 24 pocket shrunk
@@ -1471,6 +1538,83 @@ mod adaptive_tests {
         }
     }
 
+    /// The feed follows the chip: where the replay finds the cutter engaged θ, the chip is the
+    /// feed per tooth times sin(θ) (θ up to 90°), and it is never thicker than at the tool's own
+    /// feed (1200 mm/min: two flutes at 18000 rpm, 0.0333 mm), to within the replay's
+    /// resolution; most of the cutting runs faster than the tool's feed, none above twice it;
+    /// links through cleared ground run at 3000 mm/min.
+    #[test]
+    fn adaptive_feeds_keep_the_chip_load() {
+        let op = roughing(&plate(&[[-20.0, -12.0, 20.0, 12.0]]), &job(""));
+        let all = strokes_fed(&op);
+        let (mut faster, mut n) = (0usize, 0usize);
+        for (z, above) in [(7.1, 10.0), (4.2, 7.1)] {
+            let seen = replay_level_on(&all, z, above, Replay::new());
+            let mut chips: Vec<f64> = Vec::new();
+            let mut linked: Vec<f64> = Vec::new();
+            for ((e, ..), f) in seen.engaged.iter().zip(&seen.feeds) {
+                if (*f - 3000.0).abs() < 1e-9 {
+                    linked.push(*e);
+                    continue;
+                }
+                assert!(f.is_finite() && *f <= 2400.0 + 1e-6 && *f >= 300.0 - 1e-6, "feed {f}");
+                if *e > 1.0 {
+                    chips.push(f / 1200.0 * e.min(90.0).to_radians().sin());
+                    n += 1;
+                    faster += usize::from(*f > 1200.0 * 1.15);
+                }
+            }
+            // links cut nothing, to within the replay's resolution
+            linked.sort_by(f64::total_cmp);
+            if let Some(&worst) = linked.last() {
+                assert!(linked[(linked.len() - 1) * 99 / 100] <= 4.0 && worst <= 12.0, "level {z}: a link engages {worst:.1}°");
+            }
+            chips.sort_by(f64::total_cmp);
+            let (p99, max) = (chips[(chips.len() - 1) * 99 / 100], *chips.last().unwrap());
+            assert!(p99 <= 1.04 && max <= 1.1, "level {z}: chip p99 {p99:.3}, max {max:.3} of the chip load");
+        }
+        assert!(faster * 2 > n, "{faster} of {n} cutting samples above the tool's feed");
+        let links = op.moves.iter().filter(|m| matches!(m, Move::Line { feed, .. } if (*feed - 3000.0).abs() < 1e-9)).count();
+        assert!(links > 10, "{links} links at the link feed");
+        // off: every cut at the tool's feed, the helix and slots aside
+        let plain = roughing(
+            &plate(&[[-20.0, -12.0, 20.0, 12.0]]),
+            &Job::from_json(
+                r#"{"stock": {"size": [300, 300], "thickness": 10},
+                "tools": [{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3, "stepover": 0.15}],
+                "strategy": {"feeds": {"chip_thinning": false, "link": 1}}, "parts": [{"body": "P"}]}"#,
+            )
+            .unwrap(),
+        );
+        assert!(plain.moves.iter().all(|m| match m {
+            Move::Line { feed, .. } | Move::Arc { feed, .. } => [1200.0, 960.0, 300.0].iter().any(|f| (feed - f).abs() < 1e-9),
+            _ => true,
+        }));
+    }
+
+    /// 1 / sin of the engagement below 90°, in tenths rounded down, at most twice; the tool's
+    /// feed to 170°; the slotting factor past it.
+    #[test]
+    fn feed_factors_follow_the_engagement() {
+        let p = crate::adaptive::AdaptiveParams {
+            step: 0.9,
+            max_engagement: 1.6,
+            both_ways: false,
+            ramp: 0.05,
+            retract: 1.0,
+            rapid: 5000.0,
+            max_thinning: 2.0,
+            slotting: 0.8,
+            link: 3000.0,
+        };
+        // acos(1 − 0.9/3) = 45.57°: 1 / 0.7141 = 1.400; 60°: 1.1547; 35°: 1.743; 20°: 2.92, held to 2
+        for (deg, want) in [(45.573, 1.4), (60.0, 1.1), (35.0, 1.7), (20.0, 2.0), (0.0, 2.0), (90.0, 1.0), (135.0, 1.0), (175.0, 0.8)] {
+            assert!((p.feed_factor(f64::to_radians(deg)) - want).abs() < 1e-9, "{deg}°: {}", p.feed_factor(f64::to_radians(deg)));
+        }
+        let off = crate::adaptive::AdaptiveParams { max_thinning: 1.0, ..p };
+        assert_eq!(off.feed_factor(0.5), 1.0);
+    }
+
     /// The time a roughing takes, minutes: each move's length over its feed, rapids at `rapid`
     /// mm/min. An arc's length is its turn (a full turn where it ends where it starts) times
     /// its radius, with its drop.
@@ -1507,6 +1651,8 @@ mod adaptive_tests {
     fn rapid_job(rapid: f64) -> Job {
         let mut j = job("");
         j.strategy.rapid_feed = rapid;
+        // links through cleared ground at the tool's feed in both
+        j.strategy.feeds.link = 1.0;
         j
     }
 

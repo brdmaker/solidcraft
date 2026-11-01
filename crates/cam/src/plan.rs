@@ -272,6 +272,9 @@ fn adaptive_params(st: &Strategy, t: &Tool, ramp: f64) -> AdaptiveParams {
         ramp,
         retract: st.retract,
         rapid: st.rapid_feed,
+        max_thinning: if st.feeds.chip_thinning { st.feeds.max_thinning } else { 1.0 },
+        slotting: st.feeds.slotting,
+        link: st.feeds.link.max(t.feed).min(st.rapid_feed.max(t.feed)),
     }
 }
 

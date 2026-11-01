@@ -123,6 +123,8 @@ impl ToolLibrary {
             return Err(CamError::Unsupported(format!("tool library version {} (this build reads version 1)", lib.version)));
         }
         validate_tools(&lib.tools, "library.tools")?;
+        let mut lib = lib;
+        resolve_feeds(&mut lib.tools);
         Ok(lib)
     }
 
@@ -174,6 +176,8 @@ pub struct Strategy {
     pub tabs: Tabs,
     /// How pockets are roughed.
     pub roughing: Roughing,
+    /// How feeds follow the cut.
+    pub feeds: Feeds,
     /// How far below a chamfer's foot the chamfer cutter's tip goes, mm (default 0.3): the cut
     /// uses the flank, not the fragile tip.
     pub chamfer_tip_below: f64,
@@ -285,6 +289,30 @@ pub struct Tabs {
     pub height: f64,
 }
 
+/// How feeds follow the cut: faster where the cutter's chip is thinner than its chip load,
+/// slower in a full slot, quick across cleared ground.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Feeds {
+    /// Adaptive roughing raises the feed where the cutter's edge is engaged less than 90°, by
+    /// 1 / sin(engagement), so the chip stays as thick as at the tool's feed (default true).
+    pub chip_thinning: bool,
+    /// The most chip thinning raises a feed, times the tool's feed (default 2).
+    pub max_thinning: f64,
+    /// Feed in a full slot (engaged more than 170°: a region too narrow to clear adaptively),
+    /// times the tool's feed (default 0.8).
+    pub slotting: f64,
+    /// Feed of moves through cleared ground between adaptive passes, mm/min (default 3000; at
+    /// least the tool's feed, at most the rapid feed).
+    pub link: f64,
+}
+
+impl Default for Feeds {
+    fn default() -> Self {
+        Feeds { chip_thinning: true, max_thinning: 2.0, slotting: 0.8, link: 3000.0 }
+    }
+}
+
 impl Default for Tabs {
     fn default() -> Self {
         Tabs { count: 4, width: 6.0, height: 1.0 }
@@ -311,6 +339,7 @@ impl Default for Strategy {
             tabs: Tabs::default(),
             chamfer_tip_below: 0.3,
             roughing: Roughing::default(),
+            feeds: Feeds::default(),
         }
     }
 }
@@ -432,8 +461,14 @@ pub struct Tool {
     pub tip_angle_deg: Option<f64>,
     /// Spindle speed, rpm.
     pub rpm: f64,
-    /// Cutting feed, mm/min.
+    /// Cutting feed, mm/min; with `chip_load` given, worked out from it.
+    #[serde(default)]
     pub feed: f64,
+    /// Feed per tooth, mm: the feed is `chip_load` × `flutes` × `rpm` (at most the rapid feed),
+    /// and adaptive roughing raises it where the cutter is engaged less than 90° to keep the
+    /// chip this thick.
+    #[serde(default)]
+    pub chip_load: Option<f64>,
     /// Plunge or ramp feed, mm/min.
     pub plunge: f64,
     /// Depth of one pass, mm (default: the diameter).
@@ -556,6 +591,15 @@ fn length(what: &str, v: f64, min: f64) -> Result<()> {
     Ok(())
 }
 
+/// Each tool's feed from its chip load, where it has one.
+fn resolve_feeds(tools: &mut [Tool]) {
+    for t in tools {
+        if let Some(c) = t.chip_load {
+            t.feed = c * t.flutes as f64 * t.rpm;
+        }
+    }
+}
+
 /// Check every tool's numbers.
 fn validate_tools(tools: &[Tool], what: &str) -> Result<()> {
     if tools.len() > MAX_TOOLS {
@@ -571,7 +615,19 @@ fn validate_tools(tools: &[Tool], what: &str) -> Result<()> {
         }
         length(&at("diameter"), t.diameter, 0.05)?;
         length(&at("flute_length"), t.flute_length, 0.05)?;
-        for (field, v) in [("rpm", t.rpm), ("feed", t.feed), ("plunge", t.plunge)] {
+        if let Some(c) = t.chip_load
+            && !(c.is_finite() && (0.0001..=2.0).contains(&c))
+        {
+            return Err(CamError::Invalid(format!("{} must be from 0.0001 to 2 mm per tooth; it is {c}", at("chip_load"))));
+        }
+        if t.flutes == 0 || t.flutes > 100 {
+            return Err(CamError::Invalid(format!("{} must be 1 to 100; it is {}", at("flutes"), t.flutes)));
+        }
+        let feed = t.chip_load.map_or(t.feed, |c| c * t.flutes as f64 * t.rpm);
+        if t.chip_load.is_none() && t.feed == 0.0 {
+            return Err(CamError::Invalid(format!("{}: give its feed or its chip_load", at("feed"))));
+        }
+        for (field, v) in [("rpm", t.rpm), ("feed", feed), ("plunge", t.plunge)] {
             if !v.is_finite() || v <= 0.0 || v > 1e6 {
                 return Err(CamError::Invalid(format!("{} must be positive and at most 1e6; it is {v}", at(field))));
             }
@@ -613,6 +669,7 @@ impl Job {
     /// and names no library), then checked.
     pub fn with_library(mut self, load: &dyn Fn(&str) -> Result<String>) -> Result<Job> {
         validate_tools(&self.tools, "tools")?;
+        resolve_feeds(&mut self.tools);
         let lib = if !self.library.is_empty() {
             Some(ToolLibrary::from_json(&load(&self.library)?).map_err(|e| CamError::Invalid(format!("library {}: {e}", self.library)))?)
         } else if self.tools.is_empty() {
@@ -627,6 +684,11 @@ impl Job {
                 }
             }
             self.tools.sort_by_key(|t| t.number);
+        }
+        // a feed from a chip load runs no faster than the machine's rapids
+        let rapid = self.strategy.rapid_feed;
+        for t in self.tools.iter_mut().filter(|t| t.chip_load.is_some()) {
+            t.feed = t.feed.min(rapid);
         }
         self.validate()?;
         Ok(self)
@@ -707,6 +769,16 @@ impl Job {
             )));
         }
         length("strategy.tabs.height", st.tabs.height, 0.0)?;
+        let fd = &st.feeds;
+        if !(fd.max_thinning.is_finite() && (1.0..=5.0).contains(&fd.max_thinning)) {
+            return Err(CamError::Invalid(format!("strategy.feeds.max_thinning must be from 1 to 5; it is {}", fd.max_thinning)));
+        }
+        if !(fd.slotting.is_finite() && (0.1..=1.0).contains(&fd.slotting)) {
+            return Err(CamError::Invalid(format!("strategy.feeds.slotting must be from 0.1 to 1; it is {}", fd.slotting)));
+        }
+        if !(fd.link.is_finite() && (1.0..=1e6).contains(&fd.link)) {
+            return Err(CamError::Invalid(format!("strategy.feeds.link must be from 1 to 1000000 mm/min; it is {}", fd.link)));
+        }
         if !(st.rapid_feed.is_finite() && (1.0..=1e6).contains(&st.rapid_feed)) {
             return Err(CamError::Invalid(format!("strategy.rapid_feed must be from 1 to 1000000 mm/min; it is {}", st.rapid_feed)));
         }
