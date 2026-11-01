@@ -9,13 +9,16 @@ use solidcraft_cam::part::{PartFeatures, oriented};
 
 use super::CommandSpec;
 use crate::params::bad;
-use crate::schema::cam::{JobExportSceneParams, JobExportSceneResult, JobNestParams, JobNestResult, NestedPart, PartInspectParams};
+use crate::schema::cam::{
+    JobExportSceneParams, JobExportSceneResult, JobGcodeParams, JobGcodeResult, JobNestParams, JobNestResult, NestedPart, PartInspectParams,
+};
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
 
 const PART_INSPECT_CONTRACT: TypedContract<PartInspectParams> = TypedContract::new();
 const JOB_NEST_CONTRACT: TypedContract<JobNestParams> = TypedContract::new();
 const JOB_EXPORT_SCENE_CONTRACT: TypedContract<JobExportSceneParams> = TypedContract::new();
+const JOB_GCODE_CONTRACT: TypedContract<JobGcodeParams> = TypedContract::new();
 
 /// Largest job file read (bytes).
 const MAX_JOB_BYTES: usize = 4 << 20;
@@ -45,6 +48,18 @@ pub static COMMANDS: &[CommandSpec] = &[
              machined and placed), placed.stl (all copies) and scene.json (version, units mm, work_zero, stock {size [w, d, t], min, \
              max, material, model}, parts [{name, design, body, up, copies [{copy, model, rotation_deg (for reference), min, max}]}], \
              placed_model, unplaced). Returns the files written, the scene and the plan's warnings",
+        ),
+    CommandSpec::new("cam.job.gcode", "Write Job G-code", crate::checked!("cam.job.gcode", job_gcode))
+        .icon("export")
+        .noundo()
+        .contract(&JOB_GCODE_CONTRACT)
+        .output(output_schema_for::<JobGcodeResult>)
+        .params(
+            "job: as for cam.job.nest (post?: {coolant? off|mist|flood, spindle_wait? (2 s), decimals? (4), blend_tolerance? \
+             (0.01 mm, 0: exact stop)}); path: the .ngc file → plans the job and writes its LinuxCNC program: G21 G90 G17 G94 G54, \
+             work zero at stock.origin (top_center by default, Z0 the sheet's top), each tool T<n> M6 with G43 H<n> and S M3, \
+             G0/G1/G2/G3 (I J from the arc's start; helices change Z), drilling as G98 G81 or G83 with Q, M30. Returns the path, \
+             line count, tools in order, operations in order and the plan's warnings",
         ),
     CommandSpec::new("cam.job.nest", "Nest Job", crate::checked!("cam.job.nest", job_nest))
         .icon("list")
@@ -105,6 +120,31 @@ fn job_nest(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let nesting = nest(&job.stock, &job.nest, &items).in_work(job.stock.work_zero());
     let result = JobNestResult { sheet: job.stock.size, thickness: job.stock.thickness, parts, nesting };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+fn job_gcode(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.job.gcode";
+    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad(cmd, "path: the .ngc file to write"))?.to_string();
+    let (job, base) = read_job(s, p.get("job").ok_or_else(|| bad(cmd, "job: a job object or the path of a job file"))?)?;
+    let bodies = job.parts.iter().map(|part| part_body(s, base.as_deref(), part)).collect::<Result<Vec<_>>>()?;
+    let plan = solidcraft_cam::plan::plan_job(&job, &bodies).map_err(|e| EngineError::Other(e.to_string()))?;
+    let title = job.parts.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ");
+    let program = solidcraft_cam::post::linuxcnc(&job, &plan.ops, &title).map_err(|e| EngineError::Other(e.to_string()))?;
+    solidcraft_io::vfs::write(&path, program.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut tools: Vec<u32> = Vec::new();
+    for op in &plan.ops {
+        if !tools.contains(&op.tool) {
+            tools.push(op.tool);
+        }
+    }
+    let result = JobGcodeResult {
+        path,
+        lines: program.lines().count(),
+        tools,
+        operations: plan.ops.iter().map(|o| o.name.clone()).collect(),
+        warnings: plan.warnings,
+    };
     serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
 }
 

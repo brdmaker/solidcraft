@@ -4,7 +4,8 @@
 //! Every model is ready placed, in work coordinates (mm): Z0 the sheet's top, X right, Y back,
 //! work zero where `stock.origin` puts it. Each copy of each part has its own STL, turned as it
 //! is machined and moved to where it lies on the sheet, so a viewer just loads the files;
-//! `placed.stl` holds every copy in one. [`zip`] packs the lot into one archive.
+//! `placed.stl` holds every copy in one, `job.ngc` the LinuxCNC program. [`zip`] packs the lot
+//! into one archive.
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -31,6 +32,8 @@ pub struct SceneDoc {
     pub parts: Vec<ScenePart>,
     /// Every copy placed, in one model (work coordinates).
     pub placed_model: String,
+    /// The LinuxCNC program for the job (same work zero).
+    pub program: String,
     /// Copies that did not fit on the sheet.
     pub unplaced: Vec<String>,
 }
@@ -171,6 +174,8 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
         parts.push(ScenePart { name: p.label().to_string(), design: p.design.clone(), body: p.body.clone(), up: *up, copies });
     }
     files.push(("placed.stl".to_string(), stl("placed parts", &placed)));
+    let title = job.parts.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ");
+    files.push(("job.ngc".to_string(), crate::post::linuxcnc(job, &plan.ops, &title)?.into_bytes()));
     let doc = SceneDoc {
         version: 1,
         units: "mm".into(),
@@ -178,6 +183,7 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
         stock: SceneStock { size: [w, d, t], min: smin, max: smax, material: job.stock.material.clone(), model: "stock.stl".into() },
         parts,
         placed_model: "placed.stl".into(),
+        program: "job.ngc".into(),
         unplaced: plan.nesting.unplaced.iter().map(|u| format!("{} #{}: {}", u.label, u.copy + 1, u.reason)).collect(),
     };
     let json = serde_json::to_string_pretty(&doc).map_err(|e| CamError::Invalid(format!("scene: {e}")))?;

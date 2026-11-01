@@ -1980,7 +1980,7 @@ mod scene_tests {
         let mut z = ::zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let mut names: Vec<String> = z.file_names().map(|n| n.unwrap().to_string()).collect();
         names.sort();
-        assert_eq!(names, ["parts/1-plate-1.stl", "parts/1-plate-2.stl", "placed.stl", "scene.json", "stock.stl"]);
+        assert_eq!(names, ["job.ngc", "parts/1-plate-1.stl", "parts/1-plate-2.stl", "placed.stl", "scene.json", "stock.stl"]);
         let mut read = |name: &str| {
             let mut v = Vec::new();
             z.by_name(name).unwrap().read_to_end(&mut v).unwrap();

@@ -73,3 +73,27 @@ pub struct JobExportSceneResult {
     /// The plan's warnings (faces not machined, copies not placed...).
     pub warnings: Vec<String>,
 }
+
+/// A job to plan and write as a LinuxCNC program.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct JobGcodeParams {
+    /// The job (as for `cam.job.nest`): an object or the path of a job file.
+    pub job: serde_json::Value,
+    /// The program file to write (`.ngc`).
+    pub path: String,
+}
+
+/// What `cam.job.gcode` returns.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct JobGcodeResult {
+    pub path: String,
+    /// Lines in the program.
+    pub lines: usize,
+    /// The tools it loads, in order of first use.
+    pub tools: Vec<u32>,
+    /// Operations in the order they run.
+    pub operations: Vec<String>,
+    /// The plan's warnings.
+    pub warnings: Vec<String>,
+}

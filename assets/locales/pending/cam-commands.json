@@ -1,7 +1,7 @@
 {
-  "en": { "cmd.cam_job_export_scene": "Export Job Scene", "cmd.cam_job_nest": "Nest Job", "cmd.cam_part_inspect": "Inspect Machining Features" },
-  "de": { "cmd.cam_job_export_scene": "Auftragsszene exportieren", "cmd.cam_job_nest": "Auftrag verschachteln", "cmd.cam_part_inspect": "Bearbeitungsmerkmale prüfen" },
-  "ja": { "cmd.cam_job_export_scene": "ジョブのシーンを書き出し", "cmd.cam_job_nest": "ジョブをネスティング", "cmd.cam_part_inspect": "加工フィーチャを検査" },
-  "ko": { "cmd.cam_job_export_scene": "작업 장면 내보내기", "cmd.cam_job_nest": "작업 네스팅", "cmd.cam_part_inspect": "가공 형상 검사" },
-  "zh": { "cmd.cam_job_export_scene": "导出作业场景", "cmd.cam_job_nest": "作业排样", "cmd.cam_part_inspect": "检查加工特征" }
+  "en": { "cmd.cam_job_export_scene": "Export Job Scene", "cmd.cam_job_gcode": "Write Job G-code", "cmd.cam_job_nest": "Nest Job", "cmd.cam_part_inspect": "Inspect Machining Features" },
+  "de": { "cmd.cam_job_export_scene": "Auftragsszene exportieren", "cmd.cam_job_gcode": "G-Code des Auftrags schreiben", "cmd.cam_job_nest": "Auftrag verschachteln", "cmd.cam_part_inspect": "Bearbeitungsmerkmale prüfen" },
+  "ja": { "cmd.cam_job_export_scene": "ジョブのシーンを書き出し", "cmd.cam_job_gcode": "ジョブのGコードを書き出し", "cmd.cam_job_nest": "ジョブをネスティング", "cmd.cam_part_inspect": "加工フィーチャを検査" },
+  "ko": { "cmd.cam_job_export_scene": "작업 장면 내보내기", "cmd.cam_job_gcode": "작업 G 코드 쓰기", "cmd.cam_job_nest": "작업 네스팅", "cmd.cam_part_inspect": "가공 형상 검사" },
+  "zh": { "cmd.cam_job_export_scene": "导出作业场景", "cmd.cam_job_gcode": "写出作业 G 代码", "cmd.cam_job_nest": "作业排样", "cmd.cam_part_inspect": "检查加工特征" }
 }

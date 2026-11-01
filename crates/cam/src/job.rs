@@ -36,7 +36,43 @@ pub struct Job {
     pub tools: Vec<Tool>,
     #[serde(default)]
     pub strategy: Strategy,
+    /// How the G-code is written.
+    #[serde(default)]
+    pub post: Post,
     pub parts: Vec<PartRef>,
+}
+
+/// Coolant the program turns on with each tool.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Coolant {
+    /// None (default).
+    #[default]
+    Off,
+    /// Mist (`M7`).
+    Mist,
+    /// Flood (`M8`).
+    Flood,
+}
+
+/// The LinuxCNC program's settings.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Post {
+    /// Coolant with each tool: `off` (default), `mist` (M7) or `flood` (M8).
+    pub coolant: Coolant,
+    /// Seconds to wait after starting the spindle (`G4`), default 2.
+    pub spindle_wait: f64,
+    /// Decimals of coordinates and feeds, default 4.
+    pub decimals: u32,
+    /// Path blending tolerance (`G64 P`), mm, default 0.01; 0 for exact stop (`G61`).
+    pub blend_tolerance: f64,
+}
+
+impl Default for Post {
+    fn default() -> Self {
+        Post { coolant: Coolant::Off, spindle_wait: 2.0, decimals: 4, blend_tolerance: 0.01 }
+    }
 }
 
 /// A tool library: the tools usually in the machine, as a file of their own.
@@ -593,6 +629,16 @@ impl Job {
             return Err(CamError::Invalid("nest.margin leaves no room on the sheet".into()));
         }
         validate_tools(&self.tools, "tools")?;
+        let post = &self.post;
+        if !(post.spindle_wait.is_finite() && (0.0..=60.0).contains(&post.spindle_wait)) {
+            return Err(CamError::Invalid(format!("post.spindle_wait must be from 0 to 60 s; it is {}", post.spindle_wait)));
+        }
+        if !(3..=6).contains(&post.decimals) {
+            return Err(CamError::Invalid(format!("post.decimals must be from 3 to 6; it is {}", post.decimals)));
+        }
+        if !(post.blend_tolerance.is_finite() && (0.0..=1.0).contains(&post.blend_tolerance)) {
+            return Err(CamError::Invalid(format!("post.blend_tolerance must be from 0 to 1 mm; it is {}", post.blend_tolerance)));
+        }
         let st = &self.strategy;
         length("strategy.stock_to_leave", st.stock_to_leave, 0.0)?;
         length("strategy.floor_stock_to_leave", st.floor_stock_to_leave, 0.0)?;

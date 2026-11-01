@@ -181,3 +181,42 @@ fn export_scene_writes_ready_placed_models() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// cam.job.gcode writes the job's LinuxCNC program: it starts and ends with %, is metric and
+/// absolute, loads the tools it reports in that order of first use (T<n> M6 with G43 H<n>; again
+/// when a later kind of work needs one, never twice in a row), and its line
+/// count is the file's.
+#[test]
+fn gcode_writes_the_program() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-cam-gcode-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("panel.ngc");
+    let job = json!({
+        "stock": {"size": [240, 130], "thickness": 3},
+        "strategy": {"roughing": {"pattern": "offset"}},
+        "parts": [{"design": fixtures().join("front-panel.step").to_string_lossy(), "body": "Panel"}]
+    });
+    let mut s = Session::default();
+    let r = run(&mut s, "cam.job.gcode", json!({"job": job, "path": file.to_string_lossy()}));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.starts_with("%\n") && text.trim_end().ends_with("%"));
+    assert!(text.contains("G21 G90 G17 G40 G49 G80 G94") && text.contains("M30"));
+    assert_eq!(r["lines"].as_u64().unwrap() as usize, text.lines().count());
+    let loaded: Vec<u64> =
+        text.lines().filter_map(|l| l.strip_prefix('T').and_then(|t| t.strip_suffix(" M6")).and_then(|n| n.parse().ok())).collect();
+    let tools: Vec<u64> = r["tools"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap()).collect();
+    // a tool is loaded again when a later kind of work needs it, never twice in a row
+    assert!(loaded.windows(2).all(|w| w[0] != w[1]), "{loaded:?}");
+    let mut first: Vec<u64> = Vec::new();
+    for t in &loaded {
+        if !first.contains(t) {
+            first.push(*t);
+        }
+    }
+    assert_eq!(first, tools);
+    for t in &tools {
+        assert!(text.contains(&format!("T{t} M6\nG43 H{t}\n")), "T{t} with its length offset");
+    }
+    assert!(!r["operations"].as_array().unwrap().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}

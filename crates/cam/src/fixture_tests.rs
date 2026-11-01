@@ -747,3 +747,223 @@ fn traces_follow_arcs_and_drilling_cycles() {
     let drill = strokes.iter().find(|s| s.kind == StrokeKind::Cut && s.pts.first() == Some(&[30.0, 0.0, 1.0])).unwrap();
     assert_eq!(drill.pts.last(), Some(&[30.0, 0.0, -6.0]));
 }
+
+/// One move as read back from a program: what kind, where it ends, the feed, the arc's centre
+/// and turn, the tool loaded and the spindle's speed.
+#[derive(Debug, Clone, PartialEq)]
+enum Read {
+    Rapid([f64; 3]),
+    Feed([f64; 3], f64),
+    Arc([f64; 3], [f64; 2], bool, f64),
+    Drill([f64; 2], f64, f64, Option<f64>, f64),
+}
+
+/// A small RS274 reader, independent of the post-processor: modal motion and feed, absolute
+/// positions, arcs' I and J from their start, G98 G81/G83 cycles, tools and spindle. Returns
+/// each move with the tool and spindle speed it ran with, and the program's other facts.
+fn read_program(p: &str) -> (Vec<(Read, u32, f64)>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut facts = Vec::new();
+    let mut pos = [f64::NAN; 3];
+    let (mut motion, mut feed, mut tool, mut h, mut spindle): (u32, f64, u32, u32, f64) = (0, 0.0, 0, 0, 0.0);
+    let mut cycle: Option<u32> = None;
+    for raw in p.lines() {
+        assert!(raw.len() <= 256, "line too long: {raw}");
+        // comments out
+        let mut line = String::new();
+        let mut depth = 0;
+        for c in raw.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                c if depth == 0 => line.push(c),
+                _ => {}
+            }
+        }
+        let line = line.trim();
+        if line.is_empty() || line == "%" {
+            continue;
+        }
+        let mut words: Vec<(char, f64)> = Vec::new();
+        let mut cur: Option<(char, String)> = None;
+        for c in line.chars().filter(|c| !c.is_whitespace()) {
+            if c.is_ascii_alphabetic() {
+                if let Some((l, v)) = cur.take() {
+                    words.push((l, v.parse().unwrap_or_else(|_| panic!("bad number in {raw}"))));
+                }
+                cur = Some((c.to_ascii_uppercase(), String::new()));
+            } else if let Some((_, v)) = cur.as_mut() {
+                v.push(c);
+            } else {
+                panic!("stray {c} in {raw}");
+            }
+        }
+        if let Some((l, v)) = cur.take() {
+            words.push((l, v.parse().unwrap_or_else(|_| panic!("bad number in {raw}"))));
+        }
+        let word = |l: char| words.iter().find(|w| w.0 == l).map(|w| w.1);
+        let mut axes = false;
+        for (l, v) in &words {
+            match l {
+                'G' => match (*v * 10.0).round() as u32 {
+                    0 => motion = 0,
+                    10 => motion = 1,
+                    20 => motion = 2,
+                    30 => motion = 3,
+                    800 => cycle = None,
+                    810 => cycle = Some(81),
+                    830 => cycle = Some(83),
+                    430 => h = word('H').unwrap() as u32,
+                    490 => h = 0,
+                    980 | 210 | 900 | 170 | 400 | 940 | 540 | 640 | 610 | 40 => facts.push(format!("G{v}")),
+                    g => panic!("unexpected G{} in {raw}", g as f64 / 10.0),
+                },
+                'M' => match *v as u32 {
+                    6 => tool = word('T').unwrap() as u32,
+                    3 => spindle = word('S').unwrap(),
+                    5 => spindle = 0.0,
+                    7..=9 => {}
+                    30 => facts.push("M30".into()),
+                    m => panic!("unexpected M{m} in {raw}"),
+                },
+                'F' => feed = *v,
+                'X' | 'Y' | 'Z' => axes = true,
+                _ => {}
+            }
+        }
+        if !axes {
+            continue;
+        }
+        let mut to = pos;
+        for (k, l) in ['X', 'Y', 'Z'].into_iter().enumerate() {
+            if let Some(v) = word(l) {
+                to[k] = v;
+            }
+        }
+        if let Some(c) = cycle {
+            assert!(words.iter().any(|w| w.0 == 'G' && (w.1 - 98.0).abs() < 1e-9), "cycles return to the start height (G98): {raw}");
+            let q = word('Q');
+            assert_eq!(c == 83, q.is_some(), "{raw}");
+            out.push((Read::Drill([to[0], to[1]], to[2], word('R').unwrap(), q, feed), tool, spindle));
+            // G98: back to the height it started from
+            pos = [to[0], to[1], pos[2]];
+            continue;
+        }
+        assert_eq!(h, tool, "the tool's length offset (G43 H) is the loaded tool's: {raw}");
+        let r = match motion {
+            0 => Read::Rapid(to),
+            1 => Read::Feed(to, feed),
+            m => Read::Arc(to, [pos[0] + word('I').unwrap(), pos[1] + word('J').unwrap()], m == 3, feed),
+        };
+        if motion != 0 {
+            assert!(spindle > 0.0, "cutting with the spindle off: {raw}");
+        }
+        out.push((r, tool, spindle));
+        pos = to;
+    }
+    (out, facts)
+}
+
+/// Two NEMA 23 flanges on a 220 × 120 × 10 sheet (drilled holes, helical bores, end-milled
+/// countersinks, contours, separation), written for LinuxCNC and read back by `read_program`:
+/// every move of every operation comes back in order (the same kind, end, feed, arc centre and
+/// turn, drilling depth, retract and peck), each with its operation's tool loaded and the spindle
+/// at its speed; the program is metric, absolute and ends with M30.
+#[test]
+fn the_linuxcnc_program_reads_back_as_planned() {
+    use crate::toolpath::Move;
+    let part = &expected()["parts"][0];
+    let read =
+        solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
+            .unwrap();
+    let job = crate::job::Job::from_json(&format!(
+        r#"{{"stock": {{"size": [220, 120], "thickness": 10}}, "tools": {TOOLS}, "post": {{"coolant": "mist"}}, "parts": [{{"body": "F", "quantity": 2}}]}}"#
+    ))
+    .unwrap();
+    let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();
+    assert_eq!(plan.nesting.placements.len(), 2);
+    let program = crate::post::linuxcnc(&job, &plan.ops, "flanges").unwrap();
+    assert!(program.starts_with("%\n") && program.trim_end().ends_with("%"));
+    assert!(program.contains("M7"), "mist with each tool");
+    let (got, facts) = read_program(&program);
+    for f in ["G21", "G90", "G17", "G94", "G54", "G98", "M30"] {
+        assert!(facts.iter().any(|x| x == f), "{f} in {facts:?}");
+    }
+    // what the plan says, move by move, with its operation's tool and speed; moves that go
+    // nowhere at the program's resolution (4 decimals) are left out
+    let mut want: Vec<(Read, u32, f64)> = Vec::new();
+    let mut at = [f64::NAN; 3];
+    for op in &plan.ops {
+        for m in &op.moves {
+            let r = match m {
+                Move::Rapid { to } => Read::Rapid(*to),
+                Move::Line { to, feed } => Read::Feed(*to, *feed),
+                Move::Arc { to, center, ccw, feed } => Read::Arc(*to, *center, *ccw, *feed),
+                Move::Drill { at: c, back, r, bottom, peck, feed } => {
+                    at = [c[0], c[1], *back];
+                    want.push((Read::Drill(*c, *bottom, *r, *peck, *feed), op.tool, op.rpm));
+                    continue;
+                }
+            };
+            let to = m.end();
+            // the same to the program's 4 decimals: no move at all for the control
+            let same = |a: f64, b: f64| crate::post::num(a, 4) == crate::post::num(b, 4);
+            if !matches!(r, Read::Arc(..)) && (0..3).all(|k| same(to[k], at[k])) {
+                continue;
+            }
+            at = to;
+            want.push((r, op.tool, op.rpm));
+        }
+    }
+    // the program also goes straight up to clearance after each tool change, and over each hole
+    // before its cycle: rapids the plan has as part of its own moves
+    let got: Vec<(Read, u32, f64)> = got.into_iter().filter(|(r, ..)| !matches!(r, Read::Rapid(p) if p[0].is_nan() || p[1].is_nan())).collect();
+    let near = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 2e-4);
+    let mut gi = 0;
+    for (k, (w, tool, rpm)) in want.iter().enumerate() {
+        // skip the program's own rapids that the plan does not have (to clearance, over a hole)
+        while let Some((Read::Rapid(p), ..)) = got.get(gi)
+            && !matches!(w, Read::Rapid(q) if near(p, q))
+        {
+            gi += 1;
+        }
+        let Some((g, gt, gs)) = got.get(gi) else { panic!("the program stops before move {k}: {w:?}") };
+        let same = match (w, g) {
+            (Read::Rapid(a), Read::Rapid(b)) => near(a, b),
+            (Read::Feed(a, f), Read::Feed(b, h)) => near(a, b) && (f - h).abs() < 1e-3,
+            (Read::Arc(a, c, cc, f), Read::Arc(b, d, dd, h)) => near(a, b) && near(c, d) && cc == dd && (f - h).abs() < 1e-3,
+            (Read::Drill(a, z, r, q, f), Read::Drill(b, y, s, p, h)) => {
+                near(a, b)
+                    && (z - y).abs() < 2e-4
+                    && (r - s).abs() < 2e-4
+                    && q.zip(*p).is_none_or(|(x, v)| (x - v).abs() < 2e-4)
+                    && (f - h).abs() < 1e-3
+            }
+            _ => false,
+        };
+        assert!(same, "move {k}: planned {w:?}, the program has {g:?}");
+        assert_eq!((gt, gs), (tool, rpm), "move {k}: tool and speed");
+        gi += 1;
+    }
+    assert!(want.len() > 1000);
+    assert!(got[gi..].iter().all(|(r, ..)| matches!(r, Read::Rapid(_))), "only the last move up after the plan's moves");
+}
+
+/// Numbers: at most the decimals asked for, no trailing zeros, no negative zero.
+#[test]
+fn gcode_numbers_are_short_and_exact() {
+    use crate::post::num;
+    assert_eq!(num(1.0, 4), "1");
+    assert_eq!(num(-0.00001, 4), "0");
+    assert_eq!(num(2.345_67, 4), "2.3457");
+    assert_eq!(num(-12.5, 4), "-12.5");
+    assert_eq!(num(1200.0, 4), "1200");
+}
+
+/// Comments: in parentheses, none inside, plain ASCII.
+#[test]
+fn gcode_comments_are_plain_ascii() {
+    use crate::post::comment;
+    assert_eq!(comment("Ø6 90° chamfer mill (T9)"), "(D6 90 deg chamfer mill [T9])");
+    assert_eq!(comment("Fräs\nteil"), "(Fr?s teil)");
+}
