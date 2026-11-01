@@ -990,3 +990,70 @@ fn simulated_flanges_are_cut_clean_and_free() {
     assert!(r.parts.len() == 2 && r.parts.iter().all(|p| p.free), "{:?}", r.parts);
     assert!(r.removed_volume > 0.0);
 }
+
+/// The program's tool table: one `(TOOL T<n> key=value ... name=...)` line per tool, in order of
+/// first use, before any G-code; each line's values are the job's tool's (kind, diameter,
+/// flutes, flute length, stepdown and stepover or tip angle and peck, rpm, feeds) and `z_min` the
+/// lowest point of that tool's moves in the plan, worked out here from the moves themselves.
+#[test]
+fn the_program_opens_with_a_tool_table() {
+    use crate::toolpath::Move;
+    let part = &expected()["parts"][0];
+    let read =
+        solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
+            .unwrap();
+    let job =
+        crate::job::Job::from_json(&format!(r#"{{"stock": {{"size": [120, 120], "thickness": 10}}, "tools": {TOOLS}, "parts": [{{"body": "F"}}]}}"#))
+            .unwrap();
+    let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();
+    let program = crate::post::linuxcnc(&job, &plan.ops, "flange").unwrap();
+    let first_g = program.lines().position(|l| l.starts_with('G')).unwrap();
+    let table: Vec<&str> = program.lines().take(first_g).filter(|l| l.starts_with("(TOOL ")).collect();
+    let mut order: Vec<u32> = Vec::new();
+    for op in &plan.ops {
+        if !order.contains(&op.tool) {
+            order.push(op.tool);
+        }
+    }
+    assert_eq!(table.len(), order.len(), "{table:?}");
+    for (line, n) in table.iter().zip(&order) {
+        let body = line.trim_start_matches('(').trim_end_matches(')');
+        let (head, name) = body.split_once(" name=").unwrap();
+        let mut words = head.split(' ');
+        assert_eq!(words.next(), Some("TOOL"));
+        assert_eq!(words.next(), Some(format!("T{n}").as_str()));
+        let kv: std::collections::HashMap<&str, &str> = words.map(|w| w.split_once('=').unwrap()).collect();
+        let t = job.tool(*n).unwrap();
+        let num = |k: &str| kv[k].parse::<f64>().unwrap();
+        assert_eq!(
+            kv["kind"],
+            match t.kind {
+                crate::job::ToolKind::Flat => "flat",
+                crate::job::ToolKind::Drill => "drill",
+                crate::job::ToolKind::Chamfer => "chamfer",
+            }
+        );
+        assert_eq!((num("D"), num("flutes") as u32, num("flute_length")), (t.diameter, t.flutes, t.flute_length));
+        assert_eq!((num("rpm"), num("feed"), num("plunge")), (t.rpm, t.feed, t.plunge));
+        match t.kind {
+            crate::job::ToolKind::Flat => assert!((num("stepdown") - t.stepdown()).abs() < 1e-4 && (num("stepover") - t.stepover()).abs() < 1e-4),
+            _ => {
+                assert_eq!(num("tip_angle"), t.tip_angle());
+                assert_eq!(kv.get("peck").map(|p| p.parse::<f64>().unwrap()), t.peck);
+            }
+        }
+        let low = plan
+            .ops
+            .iter()
+            .filter(|o| o.tool == *n)
+            .flat_map(|o| &o.moves)
+            .map(|m| match m {
+                Move::Drill { bottom, .. } => *bottom,
+                Move::Rapid { .. } => f64::INFINITY,
+                _ => m.end()[2],
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!((num("z_min") - low).abs() < 1e-4, "T{n}: z_min {} vs {low}", kv["z_min"]);
+        assert!(!name.is_empty());
+    }
+}

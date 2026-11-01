@@ -1,5 +1,9 @@
 //! The LinuxCNC post-processor: a planned job as an RS274/NGC program.
 //!
+//! The program opens with a comment block: the parts, the stock and work zero, then a tool
+//! table, one `(TOOL T<n> key=value ... name=...)` line per tool in order of first use (see
+//! [`tool_line`]), for a machine's own screen to read.
+//!
 //! Metric, absolute, XY plane, feed per minute, work offset G54 with work zero where
 //! `stock.origin` puts it (Z0 the sheet's top). Each tool is loaded with `T<n> M6` and its length
 //! taken from the tool table (`G43 H<n>`); the spindle runs `M3` at the operation's speed. Arcs are
@@ -41,6 +45,41 @@ pub fn comment(text: &str) -> String {
         }
     }
     format!("({t})")
+}
+
+/// The tool table line for tool `n`, one `key=value` after another, the name last (it may hold
+/// spaces): `TOOL T6 kind=flat D=6 flutes=1 flute_length=22 stepdown=3 stepover=0.9 rpm=18000
+/// feed=1000 plunge=250 z_min=-10.2 name=...`. A drill or chamfer mill has `tip_angle` (a drill
+/// `peck` if it pecks) instead of stepdown and stepover; `rpm` is the tool's own, `z_min` the
+/// deepest it goes in `ops`.
+pub fn tool_line(job: &Job, ops: &[Operation], n: u32, decimals: u32) -> String {
+    let f = |x: f64| num(x, decimals);
+    let z_min = ops.iter().filter(|o| o.tool == n).map(Operation::deepest).fold(f64::INFINITY, f64::min);
+    let Some(t) = job.tool(n) else { return format!("TOOL T{n}") };
+    let kind = match t.kind {
+        crate::job::ToolKind::Flat => "flat",
+        crate::job::ToolKind::Drill => "drill",
+        crate::job::ToolKind::Chamfer => "chamfer",
+    };
+    let mut line = format!("TOOL T{n} kind={kind} D={} flutes={} flute_length={}", f(t.diameter), t.flutes, f(t.flute_length));
+    match t.kind {
+        crate::job::ToolKind::Flat => {
+            line.push_str(&format!(" stepdown={} stepover={}", f(t.stepdown()), f(t.stepover())));
+        }
+        crate::job::ToolKind::Drill | crate::job::ToolKind::Chamfer => {
+            line.push_str(&format!(" tip_angle={}", f(t.tip_angle())));
+            if let Some(q) = t.peck {
+                line.push_str(&format!(" peck={}", f(q)));
+            }
+        }
+    }
+    line.push_str(&format!(" rpm={} feed={} plunge={}", f(t.rpm), f(t.feed), f(t.plunge)));
+    if z_min.is_finite() {
+        line.push_str(&format!(" z_min={}", f(z_min)));
+    }
+    let name = if t.name.is_empty() { format!("{kind} D{}", f(t.diameter)) } else { t.name.clone() };
+    line.push_str(&format!(" name={name}"));
+    line
 }
 
 /// The program for `ops` (a planned job's operations, in work coordinates).
@@ -85,8 +124,7 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str) -> Result<String> {
         }
     }
     for t in &used {
-        let what = job.tool(*t).map(|t| format!("{} D{}", if t.name.is_empty() { format!("{:?}", t.kind) } else { t.name.clone() }, n(t.diameter)));
-        out(&mut g, comment(&format!("T{t}: {}", what.unwrap_or_default())))?;
+        out(&mut g, comment(&tool_line(job, ops, *t, dec)))?;
     }
     out(&mut g, "G21 G90 G17 G40 G49 G80 G94".into())?;
     out(&mut g, "G54".into())?;
