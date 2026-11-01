@@ -838,6 +838,182 @@
      "curved_length": 37.6991
     }
    ]
+  },
+  {
+   "design": "relieved-corners.sc",
+   "body": "Relieved",
+   "material": "aluminium",
+   "stock_thickness": 10,
+   "top_z": 10,
+   "volume_mm3": 175140.48,
+   "bbox": [
+    [
+     -80,
+     -60,
+     0
+    ],
+    [
+     80,
+     60,
+     10
+    ]
+   ],
+   "floor_levels": [
+    10,
+    6,
+    5,
+    4,
+    0
+   ],
+   "face_types": {
+    "plane": 27,
+    "cylinder": 25
+   },
+   "note": "odd-slots with its inner corners relieved for a Ø3 finishing cutter: the dogleg's five 90 degree corners dogboned (circles of R1.75 through each corner, centred on its bisector), the triangle's corners rounded R3, the island pocket's R4; the slot at 30 degrees and the kidney slot as in odd-slots. Each pocket's centre is the middle of its floor's bounds",
+   "features": [
+    {
+     "kind": "outline",
+     "shape": "rounded_rect",
+     "size": [
+      160,
+      120
+     ],
+     "corner_radius": 0,
+     "center": [
+      0,
+      0
+     ],
+     "from_z": 10,
+     "to_z": 0
+    },
+    {
+     "kind": "pocket",
+     "shape": "angled_slot",
+     "width": 12,
+     "centres": [
+      [
+       -65,
+       15
+      ],
+      [
+       -30.359,
+       35
+      ]
+     ],
+     "center": [
+      -47.6795,
+      25
+     ],
+     "from_z": 10,
+     "floor_z": 6,
+     "floor_area": 593.0973,
+     "curved_length": 37.6991
+    },
+    {
+     "kind": "pocket",
+     "shape": "arc_slot",
+     "width": 10,
+     "arc_center": [
+      25,
+      20
+     ],
+     "arc_radius": 25,
+     "from_deg": 30,
+     "sweep_deg": 120,
+     "center": [
+      25,
+      38.75
+     ],
+     "from_z": 10,
+     "floor_z": 5,
+     "floor_area": 602.1386,
+     "curved_length": 136.1357
+    },
+    {
+     "kind": "pocket",
+     "shape": "dogboned_polygon",
+     "points": [
+      [
+       -70,
+       -50
+      ],
+      [
+       -30,
+       -50
+      ],
+      [
+       -30,
+       -10
+      ],
+      [
+       -42,
+       -10
+      ],
+      [
+       -42,
+       -38
+      ],
+      [
+       -70,
+       -38
+      ]
+     ],
+     "center": [
+      -50,
+      -30
+     ],
+     "from_z": 10,
+     "floor_z": 5,
+     "floor_area": 824.7403,
+     "curved_length": 27.4889,
+     "dogbone_radius": 1.75
+    },
+    {
+     "kind": "pocket",
+     "shape": "rounded_polygon",
+     "points": [
+      [
+       0,
+       -50
+      ],
+      [
+       30,
+       -50
+      ],
+      [
+       15,
+       -20
+      ]
+     ],
+     "center": [
+      15,
+      -36.8541
+     ],
+     "from_z": 10,
+     "floor_z": 4,
+     "floor_area": 431.1497,
+     "curved_length": 18.8496,
+     "corner_radius": 3
+    },
+    {
+     "kind": "pocket",
+     "shape": "rect_round_island",
+     "size": [
+      36,
+      30
+     ],
+     "island_diameter": 12,
+     "center": [
+      58,
+      -35
+     ],
+     "from_z": 10,
+     "floor_z": 5,
+     "floor_area": 953.1681,
+     "curved_length": 62.8319,
+     "corner_radius": 4
+    }
+   ]
   }
  ]
 }

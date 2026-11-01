@@ -12,3 +12,5 @@
 | tests/cam/cross-slot.step | SolidCraft contributors | original CAM test part with crossing slots, exported by SolidCraft from tests/cam/cross-slot.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/odd-slots.png | SolidCraft contributors | original render of the CAM odd slots test part, drawn by solidcraft-cli from tests/cam/odd-slots.sc | MIT OR Apache-2.0 |
 | tests/cam/odd-slots.step | SolidCraft contributors | original CAM test part with angled, curved, L-shaped, triangular and island pockets, exported by SolidCraft from tests/cam/odd-slots.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/relieved-corners.png | SolidCraft contributors | original render of the CAM relieved-corners test part, drawn by solidcraft-cli from tests/cam/relieved-corners.sc | MIT OR Apache-2.0 |
+| tests/cam/relieved-corners.step | SolidCraft contributors | original CAM test part with dogboned and rounded pocket corners, exported by SolidCraft from tests/cam/relieved-corners.sc; no external CAD geometry | MIT OR Apache-2.0 |

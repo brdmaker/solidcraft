@@ -238,6 +238,39 @@ fn odd_slots_features_match_the_design() {
     check_part(&with_step(&expected()["parts"][5]));
 }
 
+#[test]
+fn relieved_corners_features_match_the_design() {
+    check_part(&with_step(&expected()["parts"][6]));
+}
+
+/// odd-slots and the same part with its inner corners relieved (dogbones of R1.75 on the
+/// dogleg, R3 on the triangle, R4 round the island), planned with the built-in tools (Ø3
+/// finishing, r 1.5) and simulated on 0.1 mm cells: odd-slots is warned about and left with
+/// material in its sharp corners; the relieved part has no corner warning, nothing left on it
+/// past the simulation's 0.05, nothing cut into it, and comes out free.
+#[test]
+fn relieved_corners_are_cut_clean() {
+    let run = |i: usize| {
+        let part = &expected()["parts"][i];
+        let read = solidcraft_kernel::step_import(
+            &std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap(),
+        )
+        .unwrap();
+        let body = read.bodies[0].body.clone();
+        let job = crate::job::Job::from_json(r#"{"stock": {"size": [180, 140], "thickness": 10}, "parts": [{"body": "P"}]}"#).unwrap();
+        let plan = crate::plan::plan_job(&job, std::slice::from_ref(&body)).unwrap();
+        let corners = plan.warnings.iter().filter(|w| w.contains("pocket corner")).count();
+        (corners, crate::sim::simulate(&job, &[body], &plan, 0.1).unwrap().0)
+    };
+    let (sharp, odd) = run(5);
+    assert!(sharp == 12 && odd.max_left > 0.3, "odd-slots: {sharp} corner warnings, {} mm left", odd.max_left);
+    let (warned, r) = run(6);
+    assert_eq!(warned, 0);
+    assert!(r.left.is_empty(), "{:?}", r.left);
+    assert!(r.gouges.is_empty(), "{:?}", r.gouges);
+    assert!(r.rapid_hits.is_empty() && r.parts.iter().all(|p| p.free), "{:?} {:?}", r.rapid_hits, r.parts);
+}
+
 /// The STEP file exported from the part's design.
 fn with_step(part: &Value) -> Value {
     let mut p = part.clone();
@@ -405,7 +438,8 @@ fn countersinks_are_end_milled_first_and_holes_bored_last() {
 /// angle a and r 1.5. odd-slots has twelve: the L's five 90° corners (its sixth, at (−42, −38),
 /// points into the pocket and is cut), the island pocket's four, and the triangle's (base
 /// angles atan(30/15) = 63.43°, apex 53.13°). The other test parts have none: their corners are
-/// rounded R2 or more, and a cross's or an island's corners point into the pocket. Roughing by
+/// rounded R2 or more or dogboned (relieved-corners), and a cross's or an island's corners point
+/// into the pocket. Roughing by
 /// offsets keeps the test quick.
 #[test]
 fn corners_too_sharp_for_the_finishing_tool_are_warned_about() {
