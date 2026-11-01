@@ -4303,6 +4303,7 @@ dependencies = [
  "solidcraft-kernel",
  "thiserror 2.0.21",
  "tiny-skia",
+ "zip",
 ]
 
 [[package]]

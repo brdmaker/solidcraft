@@ -1943,4 +1943,66 @@ mod scene_tests {
         let vol: f64 = stock.iter().map(|t| t[0].dot(t[1].cross(t[2])) / 6.0).sum();
         assert!((vol - 6.0).abs() < 1e-12, "{vol}");
     }
+
+    /// The bounds of a binary STL's corners.
+    fn stl_bounds(b: &[u8]) -> (usize, [f64; 3], [f64; 3]) {
+        let n = u32::from_le_bytes([b[80], b[81], b[82], b[83]]) as usize;
+        assert_eq!(b.len(), 84 + 50 * n);
+        let f = |o: usize| f64::from(f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]));
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for t in 0..n {
+            for k in 0..3 {
+                let o = 84 + 50 * t + 12 + 12 * k;
+                for i in 0..3 {
+                    lo[i] = lo[i].min(f(o + 4 * i));
+                    hi[i] = hi[i].max(f(o + 4 * i));
+                }
+            }
+        }
+        (n, lo, hi)
+    }
+
+    /// Two 40 × 30 × 6 plates on a 120 × 60 × 6 sheet, work zero in its top centre, packed in a
+    /// zip: scene.json, stock.stl, one ready-placed model per copy and placed.stl. Each copy's
+    /// model lies where scene.json says (its box), 40 × 30 or 30 × 40 across, from the sheet's
+    /// bottom (−6) to its top (0), inside the sheet (±60, ±30); placed.stl holds both.
+    #[test]
+    fn the_scene_zip_holds_ready_placed_models() {
+        use std::io::Read as _;
+        let b = solidcraft_kernel::box_solid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 30.0, 6.0)).unwrap();
+        let job = crate::job::Job::from_json(
+            r#"{"stock": {"size": [120, 60], "thickness": 6}, "strategy": {"roughing": {"pattern": "offset"}}, "parts": [{"body": "P", "name": "Plate", "quantity": 2}]}"#,
+        )
+        .unwrap();
+        let plan = crate::plan::plan_job(&job, std::slice::from_ref(&b)).unwrap();
+        let scene = crate::scene::export(&job, &[b], &plan).unwrap();
+        let bytes = crate::scene::zip(&scene).unwrap();
+        let mut z = ::zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut names: Vec<String> = z.file_names().map(|n| n.unwrap().to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["parts/1-plate-1.stl", "parts/1-plate-2.stl", "placed.stl", "scene.json", "stock.stl"]);
+        let mut read = |name: &str| {
+            let mut v = Vec::new();
+            z.by_name(name).unwrap().read_to_end(&mut v).unwrap();
+            v
+        };
+        let doc: serde_json::Value = serde_json::from_slice(&read("scene.json")).unwrap();
+        let (_, slo, shi) = stl_bounds(&read("stock.stl"));
+        assert_eq!((slo, shi), ([-60.0, -30.0, -6.0], [60.0, 30.0, 0.0]));
+        let mut tris = 0;
+        for c in doc["parts"][0]["copies"].as_array().unwrap() {
+            let (n, lo, hi) = stl_bounds(&read(c["model"].as_str().unwrap()));
+            tris += n;
+            let v3 = |v: &serde_json::Value| [0, 1, 2].map(|i| v[i].as_f64().unwrap());
+            let (clo, chi) = (v3(&c["min"]), v3(&c["max"]));
+            for i in 0..3 {
+                assert!((lo[i] - clo[i]).abs() < 1e-4 && (hi[i] - chi[i]).abs() < 1e-4, "{lo:?} {hi:?} vs {clo:?} {chi:?}");
+            }
+            let (w, d) = (hi[0] - lo[0], hi[1] - lo[1]);
+            assert!(((w - 40.0).abs() < 1e-4 && (d - 30.0).abs() < 1e-4) || ((w - 30.0).abs() < 1e-4 && (d - 40.0).abs() < 1e-4), "{w} × {d}");
+            assert!((lo[2] + 6.0).abs() < 1e-4 && hi[2].abs() < 1e-4);
+            assert!(lo[0] >= -60.0 && hi[0] <= 60.0 && lo[1] >= -30.0 && hi[1] <= 30.0);
+        }
+        assert_eq!(stl_bounds(&read("placed.stl")).0, tris, "every copy");
+    }
 }

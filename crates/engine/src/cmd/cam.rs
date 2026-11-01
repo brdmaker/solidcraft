@@ -39,12 +39,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&JOB_EXPORT_SCENE_CONTRACT)
         .output(output_schema_for::<JobExportSceneResult>)
         .params(
-            "job: as for cam.job.nest; path: a folder → plans the job and writes, for a machine's own viewer (a LinuxCNC screen), \
-             scene.json (version, units mm, work_zero, stock {size [w, d, t], min, max, material, model}, parts [{name, design, body, \
-             up, model, copies [{copy, rotation_deg, translation, matrix (row-major 4x4: work point = matrix x model point), min, max}]}], \
-             placed_model, unplaced), stock.stl, parts/<n>-<name>.stl (each part as machined, its own coordinates) and placed.stl \
-             (every copy placed). Work coordinates: Z0 the sheet's top, X right, Y back, work zero at stock.origin (top_center by \
-             default). Returns the files written, the scene and the plan's warnings",
+            "job: as for cam.job.nest; path: a .zip file or a folder → plans the job and writes, for a machine's own viewer (a \
+             LinuxCNC screen), every model ready placed in work coordinates (Z0 the sheet's top, X right, Y back, work zero at \
+             stock.origin: top_center by default), no transforms needed: stock.stl, parts/<n>-<name>-<copy>.stl (each copy turned as \
+             machined and placed), placed.stl (all copies) and scene.json (version, units mm, work_zero, stock {size [w, d, t], min, \
+             max, material, model}, parts [{name, design, body, up, copies [{copy, model, rotation_deg (for reference), min, max}]}], \
+             placed_model, unplaced). Returns the files written, the scene and the plan's warnings",
         ),
     CommandSpec::new("cam.job.nest", "Nest Job", crate::checked!("cam.job.nest", job_nest))
         .icon("list")
@@ -115,16 +115,21 @@ fn job_export_scene(s: &mut Session, p: &Value) -> Result<Value> {
     let bodies = job.parts.iter().map(|part| part_body(s, base.as_deref(), part)).collect::<Result<Vec<_>>>()?;
     let plan = solidcraft_cam::plan::plan_job(&job, &bodies).map_err(|e| EngineError::Other(e.to_string()))?;
     let out = solidcraft_cam::scene::export(&job, &bodies, &plan).map_err(|e| EngineError::Other(e.to_string()))?;
-    let folder = Path::new(&dir);
     let fail = |f: &Path, e: String| EngineError::Other(format!("{}: {e}", f.display()));
-    solidcraft_io::vfs::create_dir_all(&folder.join("parts").to_string_lossy()).map_err(|e| fail(folder, e.to_string()))?;
     let mut files = vec!["scene.json".to_string()];
-    let json_path = folder.join("scene.json");
-    solidcraft_io::vfs::write(&json_path.to_string_lossy(), out.json.as_bytes()).map_err(|e| fail(&json_path, e.to_string()))?;
-    for (name, bytes) in &out.files {
-        let f = folder.join(name);
-        solidcraft_io::vfs::write(&f.to_string_lossy(), bytes).map_err(|e| fail(&f, e.to_string()))?;
-        files.push(name.clone());
+    files.extend(out.files.iter().map(|(name, _)| name.clone()));
+    if dir.to_ascii_lowercase().ends_with(".zip") {
+        let bytes = solidcraft_cam::scene::zip(&out).map_err(|e| EngineError::Other(e.to_string()))?;
+        solidcraft_io::vfs::write(&dir, &bytes).map_err(|e| fail(Path::new(&dir), e.to_string()))?;
+    } else {
+        let folder = Path::new(&dir);
+        solidcraft_io::vfs::create_dir_all(&folder.join("parts").to_string_lossy()).map_err(|e| fail(folder, e.to_string()))?;
+        let json_path = folder.join("scene.json");
+        solidcraft_io::vfs::write(&json_path.to_string_lossy(), out.json.as_bytes()).map_err(|e| fail(&json_path, e.to_string()))?;
+        for (name, bytes) in &out.files {
+            let f = folder.join(name);
+            solidcraft_io::vfs::write(&f.to_string_lossy(), bytes).map_err(|e| fail(&f, e.to_string()))?;
+        }
     }
     let result = JobExportSceneResult { path: dir, files, scene: out.doc, warnings: plan.warnings };
     serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))

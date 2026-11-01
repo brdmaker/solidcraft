@@ -1,8 +1,8 @@
 //! Plan a job and write its scene for a machine's own viewer: `scene.json`, `stock.stl`,
-//! `placed.stl` and `parts/*.stl`, in work coordinates.
+//! `placed.stl` and `parts/*.stl`, every model ready placed in work coordinates.
 //!
-//! `cargo run -p solidcraft-cam --example scene -- JOB.json OUT_DIR`; the parts' `design`s are
-//! STEP files relative to the job.
+//! `cargo run -p solidcraft-cam --example scene -- JOB.json OUT.zip` (or an output folder); the
+//! parts' `design`s are STEP files relative to the job.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(job_path), Some(out)) = (args.first(), args.get(1)) else {
-        return Err("usage: scene JOB.json OUT_DIR".into());
+        return Err("usage: scene JOB.json OUT.zip|OUT_DIR".into());
     };
     let base = Path::new(job_path).parent().unwrap_or(Path::new("."));
     let load = |lib: &str| std::fs::read_to_string(base.join(lib)).map_err(|e| solidcraft_cam::CamError::Invalid(format!("{lib}: {e}")));
@@ -39,13 +39,18 @@ fn run() -> Result<(), String> {
     }
     let plan = plan_job(&job, &bodies).map_err(|e| e.to_string())?;
     let scene = solidcraft_cam::scene::export(&job, &bodies, &plan).map_err(|e| e.to_string())?;
-    let out = Path::new(out);
-    std::fs::create_dir_all(out.join("parts")).map_err(|e| format!("{}: {e}", out.display()))?;
-    std::fs::write(out.join("scene.json"), &scene.json).map_err(|e| e.to_string())?;
-    for (name, bytes) in &scene.files {
-        std::fs::write(out.join(name), bytes).map_err(|e| format!("{name}: {e}"))?;
+    if out.to_ascii_lowercase().ends_with(".zip") {
+        std::fs::write(out, solidcraft_cam::scene::zip(&scene).map_err(|e| e.to_string())?).map_err(|e| format!("{out}: {e}"))?;
+        println!("{} files in {out}", scene.files.len() + 1);
+    } else {
+        let out = Path::new(out);
+        std::fs::create_dir_all(out.join("parts")).map_err(|e| format!("{}: {e}", out.display()))?;
+        std::fs::write(out.join("scene.json"), &scene.json).map_err(|e| e.to_string())?;
+        for (name, bytes) in &scene.files {
+            std::fs::write(out.join(name), bytes).map_err(|e| format!("{name}: {e}"))?;
+        }
+        println!("{} files in {}", scene.files.len() + 1, out.display());
     }
-    println!("{} files in {}", scene.files.len() + 1, out.display());
     for w in &plan.warnings {
         println!("warning: {w}");
     }

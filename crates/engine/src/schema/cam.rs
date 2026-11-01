@@ -56,16 +56,17 @@ pub struct JobNestResult {
 pub struct JobExportSceneParams {
     /// The job (as for `cam.job.nest`): an object or the path of a job file.
     pub job: serde_json::Value,
-    /// The folder to write into: `scene.json`, `stock.stl`, `placed.stl` and `parts/*.stl`.
+    /// Where to write `scene.json`, `stock.stl`, `placed.stl` and `parts/*.stl`: a `.zip` file
+    /// holding them all, or a folder.
     pub path: String,
 }
 
 /// What `cam.job.export_scene` returns.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct JobExportSceneResult {
-    /// The folder written into.
+    /// The archive or folder written.
     pub path: String,
-    /// The files written, relative to it.
+    /// The files written, relative to the folder or as named in the archive.
     pub files: Vec<String>,
     /// What `scene.json` says.
     pub scene: solidcraft_cam::scene::SceneDoc,

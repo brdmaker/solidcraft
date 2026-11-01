@@ -117,11 +117,11 @@ fn nest_refuses_bad_jobs() {
 }
 
 /// The scene of two front panels (200 × 100 × 3) on a 300 × 250 × 3 sheet, work zero in its
-/// top centre: the stock spans −150…150, −125…125, −3…0; the files are written; each copy's
-/// matrix, applied to its part's model as written, gives the copy's box; the copies lie on the
-/// sheet, from its bottom (−3) to its top (0).
+/// top centre, as a folder: the stock spans −150…150, −125…125, −3…0; each copy's own model,
+/// ready placed, lies where scene.json says (its box), 200 × 100 or 100 × 200 across, on the
+/// sheet from −3 to 0; placed.stl holds both. As a `.zip`, the same files in one archive.
 #[test]
-fn export_scene_writes_models_and_where_they_go() {
+fn export_scene_writes_ready_placed_models() {
     let dir = std::env::temp_dir().join(format!("solidcraft-cam-scene-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let job = json!({
@@ -138,36 +138,46 @@ fn export_scene_writes_models_and_where_they_go() {
     for f in ["scene.json", "stock.stl", "placed.stl"] {
         assert!(dir.join(f).is_file(), "{f}");
     }
-    let model = dir.join(sc["parts"][0]["model"].as_str().unwrap());
-    let bytes = std::fs::read(&model).unwrap();
-    let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
-    assert_eq!(bytes.len(), 84 + 50 * n);
-    let fl = |o: usize| f64::from(f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]));
-    let copies = sc["parts"][0]["copies"].as_array().unwrap();
-    assert_eq!(copies.len(), 2);
-    for c in copies {
-        let m: Vec<Vec<f64>> =
-            c["matrix"].as_array().unwrap().iter().map(|row| row.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect()).collect();
+    let bounds = |b: &[u8]| {
+        let n = u32::from_le_bytes([b[80], b[81], b[82], b[83]]) as usize;
+        assert_eq!(b.len(), 84 + 50 * n);
+        let fl = |o: usize| f64::from(f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]));
         let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
         for t in 0..n {
             for k in 0..3 {
-                let o = 84 + 50 * t + 12 + 12 * k;
-                let p = [fl(o), fl(o + 4), fl(o + 8), 1.0];
-                for (i, row) in m.iter().take(3).enumerate() {
-                    let x: f64 = row.iter().zip(&p).map(|(a, b)| a * b).sum();
+                for i in 0..3 {
+                    let x = fl(84 + 50 * t + 12 + 12 * k + 4 * i);
                     lo[i] = lo[i].min(x);
                     hi[i] = hi[i].max(x);
                 }
             }
         }
+        (n, lo, hi)
+    };
+    let copies = sc["parts"][0]["copies"].as_array().unwrap();
+    assert_eq!(copies.len(), 2);
+    let mut tris = 0;
+    for c in copies {
+        let (n, lo, hi) = bounds(&std::fs::read(dir.join(c["model"].as_str().unwrap())).unwrap());
+        tris += n;
         let (cmin, cmax) = (v3(&c["min"]), v3(&c["max"]));
         for i in 0..3 {
             assert!((lo[i] - cmin[i]).abs() < 1e-3 && (hi[i] - cmax[i]).abs() < 1e-3, "{lo:?} {hi:?} vs {cmin:?} {cmax:?}");
         }
-        assert!((cmin[2] + 3.0).abs() < 1e-3 && cmax[2].abs() < 1e-3, "on the sheet: {cmin:?} {cmax:?}");
-        assert!(cmin[0] >= -150.0 && cmax[0] <= 150.0 && cmin[1] >= -125.0 && cmax[1] <= 125.0);
+        let (w, d) = (hi[0] - lo[0], hi[1] - lo[1]);
+        assert!(((w - 200.0).abs() < 1e-3 && (d - 100.0).abs() < 1e-3) || ((w - 100.0).abs() < 1e-3 && (d - 200.0).abs() < 1e-3), "{w} × {d}");
+        assert!((lo[2] + 3.0).abs() < 1e-3 && hi[2].abs() < 1e-3, "on the sheet: {lo:?} {hi:?}");
+        assert!(lo[0] >= -150.0 && hi[0] <= 150.0 && lo[1] >= -125.0 && hi[1] <= 125.0);
     }
-    let placed = std::fs::read(dir.join("placed.stl")).unwrap();
-    assert_eq!(u32::from_le_bytes([placed[80], placed[81], placed[82], placed[83]]) as usize, 2 * n, "both copies");
+    assert_eq!(bounds(&std::fs::read(dir.join("placed.stl")).unwrap()).0, tris, "both copies");
+
+    let zip = dir.join("scene.zip");
+    let r = run(&mut s, "cam.job.export_scene", json!({"job": job, "path": zip.to_string_lossy()}));
+    let bytes = std::fs::read(&zip).unwrap();
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "a zip archive");
+    let files: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+    for f in ["scene.json", "stock.stl", "placed.stl", copies[0]["model"].as_str().unwrap(), copies[1]["model"].as_str().unwrap()] {
+        assert!(files.contains(&f), "{f} in {files:?}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }

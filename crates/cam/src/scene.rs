@@ -1,10 +1,10 @@
 //! The sheet and its placed parts as models, for a machine's own viewer (a LinuxCNC screen, say):
 //! binary STL files and a JSON file saying where everything is.
 //!
-//! Everything is in work coordinates (mm): Z0 the sheet's top, X right, Y back, work zero where
-//! `stock.origin` puts it. Each part's model is in the orientation it is machined in, in its own
-//! coordinates; each copy has the rigid transform (a turn about Z, then a move) that places it.
-//! `placed.stl` holds every copy already placed, for a viewer that just wants to draw the job.
+//! Every model is ready placed, in work coordinates (mm): Z0 the sheet's top, X right, Y back,
+//! work zero where `stock.origin` puts it. Each copy of each part has its own STL, turned as it
+//! is machined and moved to where it lies on the sheet, so a viewer just loads the files;
+//! `placed.stl` holds every copy in one. [`zip`] packs the lot into one archive.
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -53,8 +53,6 @@ pub struct ScenePart {
     pub body: String,
     /// Which of the design's axes is up (the model is turned so).
     pub up: Up,
-    /// The model, turned as machined, in its own coordinates.
-    pub model: String,
     pub copies: Vec<SceneCopy>,
 }
 
@@ -62,11 +60,11 @@ pub struct ScenePart {
 pub struct SceneCopy {
     /// 1-based, as in the operations' names (`Bracket #2`).
     pub copy: u32,
-    /// Turn about Z, counter-clockwise, degrees (0 or 90), applied before `translation`.
+    /// The copy's model, already turned and placed (work coordinates).
+    pub model: String,
+    /// How the nesting turned it about Z, counter-clockwise, degrees (0 or 90); for reference,
+    /// the model already is.
     pub rotation_deg: f64,
-    pub translation: [f64; 3],
-    /// The same as a row-major 4 × 4 matrix: work point = matrix × model point.
-    pub matrix: [[f64; 4]; 4],
     /// The copy's box in work coordinates.
     pub min: [f64; 3],
     pub max: [f64; 3],
@@ -138,10 +136,8 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
         let turned = crate::part::turned(body, *up)?;
         let mesh = turned.tessellate(MODEL_TOL)?;
         let tris: Tris = mesh.triangles.iter().filter_map(|tr| mesh.tri(tr)).collect();
-        let model = format!("parts/{}-{}.stl", i + 1, slug(p.label()));
         let mut copies = Vec::new();
         for pl in plan.nesting.placements.iter().filter(|pl| pl.part == i) {
-            let a = f64::from(pl.quarter_turns % 4) * std::f64::consts::FRAC_PI_2;
             // exact quarter turns
             let (s, c) = match pl.quarter_turns % 4 {
                 1 => (1.0, 0.0),
@@ -154,6 +150,7 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
             let place = |v: Vec3| Vec3::new(c * v.x - s * v.y + tr[0], s * v.x + c * v.y + tr[1], v.z + tr[2]);
             let mut lo = [f64::INFINITY; 3];
             let mut hi = [f64::NEG_INFINITY; 3];
+            let mut mine: Tris = Vec::with_capacity(tris.len());
             for tri in &tris {
                 let q = [place(tri[0]), place(tri[1]), place(tri[2])];
                 for v in &q {
@@ -162,22 +159,16 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
                         hi[k] = hi[k].max(x);
                     }
                 }
-                placed.push(q);
+                mine.push(q);
             }
             // to a nanometre: no 2.9999999999999 in the file
             let r = |x: f64| (x * 1e9).round() / 1e9;
-            let tr = tr.map(r);
-            copies.push(SceneCopy {
-                copy: pl.copy + 1,
-                rotation_deg: a.to_degrees(),
-                translation: tr,
-                matrix: [[c, -s, 0.0, tr[0]], [s, c, 0.0, tr[1]], [0.0, 0.0, 1.0, tr[2]], [0.0, 0.0, 0.0, 1.0]],
-                min: lo.map(r),
-                max: hi.map(r),
-            });
+            let model = format!("parts/{}-{}-{}.stl", i + 1, slug(p.label()), pl.copy + 1);
+            files.push((model.clone(), stl(&format!("{} #{}", p.label(), pl.copy + 1), &mine)));
+            placed.extend(mine);
+            copies.push(SceneCopy { copy: pl.copy + 1, model, rotation_deg: f64::from(pl.quarter_turns % 4) * 90.0, min: lo.map(r), max: hi.map(r) });
         }
-        files.push((model.clone(), stl(p.label(), &tris)));
-        parts.push(ScenePart { name: p.label().to_string(), design: p.design.clone(), body: p.body.clone(), up: *up, model, copies });
+        parts.push(ScenePart { name: p.label().to_string(), design: p.design.clone(), body: p.body.clone(), up: *up, copies });
     }
     files.push(("placed.stl".to_string(), stl("placed parts", &placed)));
     let doc = SceneDoc {
@@ -191,4 +182,17 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
     };
     let json = serde_json::to_string_pretty(&doc).map_err(|e| CamError::Invalid(format!("scene: {e}")))?;
     Ok(SceneFiles { doc, json, files })
+}
+
+/// The scene packed into one zip archive: `scene.json` and every model, compressed.
+pub fn zip(scene: &SceneFiles) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let fail = |e: String| CamError::Invalid(format!("scene archive: {e}"));
+    let mut w = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = ::zip::write::SimpleFileOptions::default().compression_method(::zip::CompressionMethod::Deflated);
+    for (name, bytes) in std::iter::once(("scene.json", scene.json.as_bytes())).chain(scene.files.iter().map(|(n, b)| (n.as_str(), b.as_slice()))) {
+        w.start_file(name, opts).map_err(|e| fail(e.to_string()))?;
+        w.write_all(bytes).map_err(|e| fail(e.to_string()))?;
+    }
+    Ok(w.finish().map_err(|e| fail(e.to_string()))?.into_inner())
 }
