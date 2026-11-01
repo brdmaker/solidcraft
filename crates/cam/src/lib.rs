@@ -14,6 +14,7 @@ pub mod post;
 pub mod preview;
 pub mod region;
 pub mod scene;
+pub mod sim;
 pub mod toolpath;
 
 /// What went wrong while planning a job.

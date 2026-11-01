@@ -10,7 +10,8 @@ use solidcraft_cam::part::{PartFeatures, oriented};
 use super::CommandSpec;
 use crate::params::bad;
 use crate::schema::cam::{
-    JobExportSceneParams, JobExportSceneResult, JobGcodeParams, JobGcodeResult, JobNestParams, JobNestResult, NestedPart, PartInspectParams,
+    JobExportSceneParams, JobExportSceneResult, JobGcodeParams, JobGcodeResult, JobNestParams, JobNestResult, JobSimulateParams, JobSimulateResult,
+    NestedPart, PartInspectParams,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
@@ -19,6 +20,7 @@ const PART_INSPECT_CONTRACT: TypedContract<PartInspectParams> = TypedContract::n
 const JOB_NEST_CONTRACT: TypedContract<JobNestParams> = TypedContract::new();
 const JOB_EXPORT_SCENE_CONTRACT: TypedContract<JobExportSceneParams> = TypedContract::new();
 const JOB_GCODE_CONTRACT: TypedContract<JobGcodeParams> = TypedContract::new();
+const JOB_SIMULATE_CONTRACT: TypedContract<JobSimulateParams> = TypedContract::new();
 
 /// Largest job file read (bytes).
 const MAX_JOB_BYTES: usize = 4 << 20;
@@ -60,6 +62,20 @@ pub static COMMANDS: &[CommandSpec] = &[
              work zero at stock.origin (top_center by default, Z0 the sheet's top), each tool T<n> M6 with G43 H<n> and S M3, \
              G0/G1/G2/G3 (I J from the arc's start; helices change Z), drilling as G98 G81 or G83 with Q, M30. Returns the path, \
              line count, tools in order, operations in order and the plan's warnings",
+        ),
+    CommandSpec::new("cam.job.simulate", "Simulate Job", crate::checked!("cam.job.simulate", job_simulate))
+        .icon("play")
+        .noundo()
+        .contract(&JOB_SIMULATE_CONTRACT)
+        .output(output_schema_for::<JobSimulateResult>)
+        .params(
+            "job: as for cam.job.nest; cell? (0.25 mm); image? (a .png path) → plans the job and cuts it on a height map of the \
+             sheet with the real tool shapes (flat end mills, drill and chamfer cones), then compares the result with the parts \
+             (finely triangulated): gouges (cut into a part by more than 0.02 mm), material left on the parts (more than 0.05 mm: \
+             corners the tool cannot reach, a countersink's steps), rapids through material, cuts below the spoilboard allowance \
+             (a drill's point allowed), each copy cut free or where it is held, loose slugs in through openings, and the volume \
+             removed; spots are worst first with position, size and area. The image shades the machined sheet and rings the spots \
+             (red gouges, orange material left, magenta held). Read-only but for the image",
         ),
     CommandSpec::new("cam.job.nest", "Nest Job", crate::checked!("cam.job.nest", job_nest))
         .icon("list")
@@ -145,6 +161,25 @@ fn job_gcode(s: &mut Session, p: &Value) -> Result<Value> {
         operations: plan.ops.iter().map(|o| o.name.clone()).collect(),
         warnings: plan.warnings,
     };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+fn job_simulate(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.job.simulate";
+    let cell = p.get("cell").and_then(Value::as_f64).unwrap_or(0.25);
+    if !(cell.is_finite() && (0.01..=5.0).contains(&cell)) {
+        return Err(bad(cmd, format!("cell must be from 0.01 to 5 mm; it is {cell}")));
+    }
+    let image = p.get("image").and_then(Value::as_str).map(str::to_string);
+    let (job, base) = read_job(s, p.get("job").ok_or_else(|| bad(cmd, "job: a job object or the path of a job file"))?)?;
+    let bodies = job.parts.iter().map(|part| part_body(s, base.as_deref(), part)).collect::<Result<Vec<_>>>()?;
+    let plan = solidcraft_cam::plan::plan_job(&job, &bodies).map_err(|e| EngineError::Other(e.to_string()))?;
+    let (report, map) = solidcraft_cam::sim::simulate(&job, &bodies, &plan, cell).map_err(|e| EngineError::Other(e.to_string()))?;
+    if let Some(path) = &image {
+        let png = solidcraft_cam::sim::png(&map, job.stock.thickness, Some(&report), 2000).map_err(|e| EngineError::Other(e.to_string()))?;
+        solidcraft_io::vfs::write(path, &png).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    }
+    let result = JobSimulateResult { report, warnings: plan.warnings, image };
     serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
 }
 

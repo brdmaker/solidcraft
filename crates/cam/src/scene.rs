@@ -122,6 +122,49 @@ fn slug(s: &str) -> String {
     if t.is_empty() { "part".into() } else { t }
 }
 
+/// One placed copy of a part as triangles, in work coordinates.
+pub struct PlacedCopy {
+    /// Index of the part in the job's `parts`.
+    pub part: usize,
+    /// 0-based.
+    pub copy: u32,
+    pub quarter_turns: u8,
+    pub up: Up,
+    pub tris: Vec<[Vec3; 3]>,
+}
+
+/// Every placed copy of a planned job's parts, turned as machined and placed as the toolpaths
+/// are (the part's bottom on the sheet's bottom), drawn with chords within `tol`.
+pub fn placed_copies(job: &Job, bodies: &[Body], plan: &JobPlan, tol: f64) -> Result<Vec<PlacedCopy>> {
+    if bodies.len() != job.parts.len() || plan.ups.len() != job.parts.len() || plan.features.len() != job.parts.len() {
+        return Err(CamError::Invalid("every part's body is needed, as planned".into()));
+    }
+    let t = job.stock.thickness;
+    let mut out = Vec::new();
+    for (i, (body, (up, f))) in bodies.iter().zip(plan.ups.iter().zip(&plan.features)).enumerate() {
+        if !plan.nesting.placements.iter().any(|pl| pl.part == i) {
+            continue;
+        }
+        let turned = crate::part::turned(body, *up)?;
+        let mesh = turned.tessellate(tol)?;
+        let tris: Tris = mesh.triangles.iter().filter_map(|tr| mesh.tri(tr)).collect();
+        for pl in plan.nesting.placements.iter().filter(|pl| pl.part == i) {
+            // exact quarter turns
+            let (s, c) = match pl.quarter_turns % 4 {
+                1 => (1.0, 0.0),
+                2 => (0.0, -1.0),
+                3 => (-1.0, 0.0),
+                _ => (0.0, 1.0),
+            };
+            let tr = [pl.offset[0], pl.offset[1], -(f.bottom_z + t)];
+            let place = |v: Vec3| Vec3::new(c * v.x - s * v.y + tr[0], s * v.x + c * v.y + tr[1], v.z + tr[2]);
+            let mine: Tris = tris.iter().map(|q| [place(q[0]), place(q[1]), place(q[2])]).collect();
+            out.push(PlacedCopy { part: i, copy: pl.copy, quarter_turns: pl.quarter_turns, up: *up, tris: mine });
+        }
+    }
+    Ok(out)
+}
+
 /// The scene of a planned job: `bodies` are the parts' bodies as designed (in `job.parts`
 /// order), `plan` the plan made from them.
 pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> {
@@ -134,44 +177,29 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
     let (smin, smax) = ([-zero[0], -zero[1], -t], [w - zero[0], d - zero[1], 0.0]);
     let mut files = vec![("stock.stl".to_string(), stl("stock", &stock_tris(smin, smax)))];
     let mut placed: Tris = Vec::new();
-    let mut parts = Vec::new();
-    for (i, ((p, body), (up, f))) in job.parts.iter().zip(bodies).zip(plan.ups.iter().zip(&plan.features)).enumerate() {
-        let turned = crate::part::turned(body, *up)?;
-        let mesh = turned.tessellate(MODEL_TOL)?;
-        let tris: Tris = mesh.triangles.iter().filter_map(|tr| mesh.tri(tr)).collect();
-        let mut copies = Vec::new();
-        for pl in plan.nesting.placements.iter().filter(|pl| pl.part == i) {
-            // exact quarter turns
-            let (s, c) = match pl.quarter_turns % 4 {
-                1 => (1.0, 0.0),
-                2 => (0.0, -1.0),
-                3 => (-1.0, 0.0),
-                _ => (0.0, 1.0),
-            };
-            // the part's bottom on the sheet's bottom, as the toolpaths are placed
-            let tr = [pl.offset[0], pl.offset[1], -(f.bottom_z + t)];
-            let place = |v: Vec3| Vec3::new(c * v.x - s * v.y + tr[0], s * v.x + c * v.y + tr[1], v.z + tr[2]);
-            let mut lo = [f64::INFINITY; 3];
-            let mut hi = [f64::NEG_INFINITY; 3];
-            let mut mine: Tris = Vec::with_capacity(tris.len());
-            for tri in &tris {
-                let q = [place(tri[0]), place(tri[1]), place(tri[2])];
-                for v in &q {
-                    for (k, x) in [v.x, v.y, v.z].into_iter().enumerate() {
-                        lo[k] = lo[k].min(x);
-                        hi[k] = hi[k].max(x);
-                    }
-                }
-                mine.push(q);
+    let mut parts: Vec<ScenePart> = Vec::new();
+    for c in placed_copies(job, bodies, plan, MODEL_TOL)? {
+        let Some(p) = job.parts.get(c.part) else { continue };
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for v in c.tris.iter().flatten() {
+            for (k, x) in [v.x, v.y, v.z].into_iter().enumerate() {
+                lo[k] = lo[k].min(x);
+                hi[k] = hi[k].max(x);
             }
-            // to a nanometre: no 2.9999999999999 in the file
-            let r = |x: f64| (x * 1e9).round() / 1e9;
-            let model = format!("parts/{}-{}-{}.stl", i + 1, slug(p.label()), pl.copy + 1);
-            files.push((model.clone(), stl(&format!("{} #{}", p.label(), pl.copy + 1), &mine)));
-            placed.extend(mine);
-            copies.push(SceneCopy { copy: pl.copy + 1, model, rotation_deg: f64::from(pl.quarter_turns % 4) * 90.0, min: lo.map(r), max: hi.map(r) });
         }
-        parts.push(ScenePart { name: p.label().to_string(), design: p.design.clone(), body: p.body.clone(), up: *up, copies });
+        // to a nanometre: no 2.9999999999999 in the file
+        let r = |x: f64| (x * 1e9).round() / 1e9;
+        let model = format!("parts/{}-{}-{}.stl", c.part + 1, slug(p.label()), c.copy + 1);
+        files.push((model.clone(), stl(&format!("{} #{}", p.label(), c.copy + 1), &c.tris)));
+        let copy = SceneCopy { copy: c.copy + 1, model, rotation_deg: f64::from(c.quarter_turns % 4) * 90.0, min: lo.map(r), max: hi.map(r) };
+        placed.extend(c.tris);
+        match parts.iter_mut().find(|sp| sp.name == p.label() && sp.design == p.design && sp.body == p.body) {
+            Some(sp) => sp.copies.push(copy),
+            None => {
+                parts.push(ScenePart { name: p.label().to_string(), design: p.design.clone(), body: p.body.clone(), up: c.up, copies: vec![copy] })
+            }
+        }
     }
     files.push(("placed.stl".to_string(), stl("placed parts", &placed)));
     let title = job.parts.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ");

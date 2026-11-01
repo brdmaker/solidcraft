@@ -2006,3 +2006,139 @@ mod scene_tests {
         assert_eq!(stl_bounds(&read("placed.stl")).0, tris, "every copy");
     }
 }
+
+#[cfg(test)]
+mod sim_tests {
+    use solidcraft_geom::Vec3;
+    use solidcraft_kernel::{BoolOp, boolean, box_solid};
+
+    use crate::sim::{Cutter, HeightMap, simulate, sweep};
+
+    /// A Ø6 flat end mill 1 deep along 20 mm of a 40 × 20 block (0.05 mm cells) takes 20 × 6 +
+    /// π × 3² (the round ends) = 148.27 mm³; every cell is at 0 or −1; a cell 2.9 from the path
+    /// is cut, 3.1 is not.
+    #[test]
+    fn a_flat_cut_removes_its_swept_volume() {
+        let mut m = HeightMap::new([-10.0, -10.0], [30.0, 10.0], 0.0, 0.05).unwrap();
+        let c = Cutter { r: 3.0, cone: 0.0 };
+        sweep(&mut m, c, [0.0, 0.0, -1.0], [20.0, 0.0, -1.0]);
+        let vol: f64 = m.z.iter().map(|z| -f64::from(*z)).sum::<f64>() * 0.05 * 0.05;
+        let want = 20.0 * 6.0 + std::f64::consts::PI * 9.0;
+        assert!((vol - want).abs() < 0.01 * want, "{vol} vs {want}");
+        assert!(m.z.iter().all(|z| *z == 0.0 || *z == -1.0));
+        let cell = |x: f64, y: f64| m.at(((x + 10.0) / 0.05) as usize, ((y + 10.0) / 0.05) as usize);
+        assert_eq!((cell(10.0, 2.9), cell(10.0, 3.1)), (-1.0, 0.0));
+    }
+
+    /// A 118° Ø5 drill plunged to −5 leaves a cone: at d from its axis −5 + d / tan 59°.
+    #[test]
+    fn a_drill_leaves_its_point() {
+        let mut m = HeightMap::new([-5.0, -5.0], [5.0, 5.0], 0.0, 0.02).unwrap();
+        let k = 1.0 / 59f64.to_radians().tan();
+        sweep(&mut m, Cutter { r: 2.5, cone: k }, [0.0, 0.0, 1.0], [0.0, 0.0, -5.0]);
+        for d in [0.0, 0.5, 1.2, 2.0, 2.4] {
+            let i = ((d + 5.0) / 0.02) as usize;
+            let j = (5.0 / 0.02) as usize;
+            let c = m.centre(i, j);
+            let r = c[0].hypot(c[1]);
+            assert!((m.at(i, j) - (-5.0 + r * k)).abs() < 1e-4, "at {r}: {}", m.at(i, j));
+        }
+        assert_eq!(m.at(0, 0), 0.0, "outside the drill");
+    }
+
+    /// The report of a planned job: a 60 × 40 × 10 plate with a 30 × 20 pocket 4 deep with
+    /// sharp corners (finishing T2 Ø3 leaves 1.5 × (√2 − 1) in each), cut out of a 100 × 80
+    /// sheet: no gouges, no rapid through material, material left only in the four corners
+    /// (within a millimetre of them, 4 high: the pocket's depth), the plate cut free.
+    #[test]
+    fn a_simulated_pocket_plate_shows_only_its_sharp_corners() {
+        let plate = box_solid(Vec3::new(-30.0, -20.0, 0.0), Vec3::new(30.0, 20.0, 10.0)).unwrap();
+        let b = boolean(&plate, &box_solid(Vec3::new(-15.0, -10.0, 6.0), Vec3::new(15.0, 10.0, 11.0)).unwrap(), BoolOp::Cut).unwrap().unwrap();
+        let job = crate::job::Job::from_json(
+            r#"{"stock": {"size": [100, 80], "thickness": 10}, "nest": {"margin": 10}, "strategy": {"roughing": {"pattern": "offset"}},
+                "tools": [{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3},
+                          {"number": 2, "kind": "flat", "diameter": 3, "flute_length": 12, "rpm": 22000, "feed": 700, "plunge": 150, "stepdown": 1.5}],
+                "parts": [{"body": "P", "orient": "+z"}]}"#,
+        )
+        .unwrap();
+        let plan = crate::plan::plan_job(&job, std::slice::from_ref(&b)).unwrap();
+        let (r, _) = simulate(&job, &[b], &plan, 0.1).unwrap();
+        assert!(r.gouges.is_empty(), "{:?}", r.gouges);
+        assert!(r.rapid_hits.is_empty(), "{:?}", r.rapid_hits);
+        assert!(r.spoilboard.is_empty());
+        assert!(r.parts.len() == 1 && r.parts[0].free, "{:?}", r.parts);
+        assert_eq!(r.left.len(), 4, "{:?}", r.left);
+        // the pocket's corners where the plate sits: turned by the nesting, its centre at the
+        // placement's offset
+        let pl = &plan.nesting.placements[0];
+        let turn = |p: (f64, f64)| if pl.quarter_turns % 2 == 1 { (-p.1, p.0) } else { p };
+        for s in &r.left {
+            let near = [(-15.0, -10.0), (15.0, -10.0), (-15.0, 10.0), (15.0, 10.0)]
+                .map(turn)
+                .iter()
+                .any(|(x, y)| (s.at[0] - (pl.offset[0] + x)).abs() < 1.0 && (s.at[1] - (pl.offset[1] + y)).abs() < 1.0);
+            assert!(near, "material left at {:?}, not in a corner: {:?}", s.at, r.left);
+            assert!((s.by - 4.0).abs() < 0.05, "{} high", s.by);
+        }
+    }
+
+    /// A 60 × 40 × 6 plate with a 20 × 14 cutout through it, `skin` cut-out with a Ø6: the
+    /// separation runs 3 inside the cutout's walls, so the skin's middle, (20 − 12) × (14 − 12)
+    /// = 16 mm² at 0.5 high, drops out as one loose slug; it is not material left on the plate.
+    /// The cutout's four sharp corners are: the Ø6 cannot reach into them.
+    #[test]
+    fn the_skin_in_a_cutout_drops_out_as_a_slug() {
+        let plate = box_solid(Vec3::new(-30.0, -20.0, 0.0), Vec3::new(30.0, 20.0, 6.0)).unwrap();
+        let b = boolean(&plate, &box_solid(Vec3::new(-10.0, -7.0, -1.0), Vec3::new(10.0, 7.0, 7.0)).unwrap(), BoolOp::Cut).unwrap().unwrap();
+        let job = crate::job::Job::from_json(
+            r#"{"stock": {"size": [100, 80], "thickness": 6}, "nest": {"margin": 10}, "strategy": {"roughing": {"pattern": "offset"}},
+                "tools": [{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3}],
+                "parts": [{"body": "P", "orient": "+z"}]}"#,
+        )
+        .unwrap();
+        let plan = crate::plan::plan_job(&job, std::slice::from_ref(&b)).unwrap();
+        let (r, _) = simulate(&job, &[b], &plan, 0.1).unwrap();
+        assert!(r.gouges.is_empty() && r.rapid_hits.is_empty(), "{:?} {:?}", r.gouges, r.rapid_hits);
+        // the cutout's corners are sharp: the Ø6 leaves them, the full 6 high
+        let pl = &plan.nesting.placements[0];
+        let turn = |p: (f64, f64)| if pl.quarter_turns % 2 == 1 { (-p.1, p.0) } else { p };
+        assert_eq!(r.left.len(), 4, "{:?}", r.left);
+        for s in &r.left {
+            let near = [(-10.0, -7.0), (10.0, -7.0), (-10.0, 7.0), (10.0, 7.0)]
+                .map(turn)
+                .iter()
+                // all of a corner's leftover stands 6 high: the spot may be named by any of its
+                // cells, which reach r(√2 − 1) + r(1 − 1/√2) ≈ 2.1 from the corner
+                .any(|(x, y)| (s.at[0] - (pl.offset[0] + x)).abs() < 2.5 && (s.at[1] - (pl.offset[1] + y)).abs() < 2.5);
+            assert!(near && (s.by - 6.0).abs() < 0.05, "{s:?}");
+        }
+        assert_eq!(r.slugs.len(), 1, "{:?}", r.slugs);
+        assert!((r.slugs[0].area - 16.0).abs() < 2.5 && (r.slugs[0].by - 0.5).abs() < 1e-3, "{:?}", r.slugs[0]);
+        assert!(r.parts[0].free);
+    }
+
+    /// A rapid through material is caught, with how deep it went.
+    #[test]
+    fn a_rapid_through_material_is_caught() {
+        let b = box_solid(Vec3::new(-10.0, -10.0, 0.0), Vec3::new(10.0, 10.0, 10.0)).unwrap();
+        let job = crate::job::Job::from_json(
+            r#"{"stock": {"size": [60, 60], "thickness": 10}, "tools": [{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300}], "parts": [{"body": "P"}]}"#,
+        )
+        .unwrap();
+        let op = crate::toolpath::Operation {
+            kind: crate::toolpath::OpKind::Roughing,
+            name: "bad".into(),
+            tool: 1,
+            rpm: 18000.0,
+            moves: vec![
+                crate::toolpath::Move::Rapid { to: [-20.0, 0.0, 5.0] },
+                crate::toolpath::Move::Rapid { to: [-20.0, 0.0, -2.0] },
+                crate::toolpath::Move::Rapid { to: [20.0, 0.0, -2.0] },
+            ],
+        };
+        let _ = b;
+        let mut m = HeightMap::new([-30.0, -30.0], [30.0, 30.0], 0.0, 0.2).unwrap();
+        let hits = crate::sim::run(&mut m, &job, &[op]).unwrap();
+        assert!(!hits.is_empty() && hits.iter().all(|h| (h.depth - 2.0).abs() < 1e-6), "{hits:?}");
+    }
+}

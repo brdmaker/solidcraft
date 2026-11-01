@@ -220,3 +220,28 @@ fn gcode_writes_the_program() {
     assert!(!r["operations"].as_array().unwrap().is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// cam.job.simulate on a front panel: nothing gouged, no rapid through material, the panel cut
+/// free, material left only in small spots (its display cutout's sharp corners, a countersink's
+/// steps), and the picture written as a PNG.
+#[test]
+fn simulate_reports_and_draws() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-cam-sim-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("sim.png");
+    let job = json!({
+        "stock": {"size": [240, 130], "thickness": 3},
+        "strategy": {"roughing": {"pattern": "offset"}},
+        "parts": [{"design": fixtures().join("front-panel.step").to_string_lossy(), "body": "Panel"}]
+    });
+    let mut s = Session::default();
+    let r = run(&mut s, "cam.job.simulate", json!({"job": job, "cell": 0.25, "image": image.to_string_lossy()}));
+    let rep = &r["report"];
+    assert_eq!(rep["gouges"].as_array().unwrap().len(), 0, "{:#}", rep["gouges"]);
+    assert_eq!(rep["rapid_hits"].as_array().unwrap().len(), 0, "{:#}", rep["rapid_hits"]);
+    assert_eq!(rep["parts"][0]["free"], true);
+    assert!(rep["left"].as_array().unwrap().iter().all(|s| s["area"].as_f64().unwrap() < 5.0), "{:#}", rep["left"]);
+    let png = std::fs::read(&image).unwrap();
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    std::fs::remove_dir_all(&dir).ok();
+}

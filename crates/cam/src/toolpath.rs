@@ -73,8 +73,10 @@ impl OpKind {
             OpKind::Countersink => 1,
             OpKind::Roughing => 2,
             OpKind::HoleMilling => 3,
-            OpKind::FloorFinish => 4,
-            OpKind::WallFinish => 5,
+            // the wall passes first, level by level: they clear what roughing could not reach
+            // (corners tighter than the roughing tool), so the floor pass only skims the floor
+            OpKind::WallFinish => 4,
+            OpKind::FloorFinish => 5,
             OpKind::Chamfer => 6,
             OpKind::Profile => 7,
             OpKind::EdgeChamfer => 8,

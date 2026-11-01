@@ -97,3 +97,27 @@ pub struct JobGcodeResult {
     /// The plan's warnings.
     pub warnings: Vec<String>,
 }
+
+/// A job to plan and simulate.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct JobSimulateParams {
+    /// The job (as for `cam.job.nest`): an object or the path of a job file.
+    pub job: serde_json::Value,
+    /// A cell of the height map, mm (default 0.25).
+    #[serde(default)]
+    pub cell: Option<f64>,
+    /// A PNG to draw the machined sheet in, with the report's spots marked.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// What `cam.job.simulate` returns.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct JobSimulateResult {
+    pub report: solidcraft_cam::sim::SimReport,
+    /// The plan's warnings.
+    pub warnings: Vec<String>,
+    /// The picture written, if one was asked for.
+    pub image: Option<String>,
+}

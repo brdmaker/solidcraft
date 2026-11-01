@@ -967,3 +967,26 @@ fn gcode_comments_are_plain_ascii() {
     assert_eq!(comment("Ø6 90° chamfer mill (T9)"), "(D6 90 deg chamfer mill [T9])");
     assert_eq!(comment("Fräs\nteil"), "(Fr?s teil)");
 }
+
+/// Two NEMA 23 flanges simulated on 0.25 mm cells (drilled holes, bores, end-milled countersinks,
+/// recess and chamfers, contours, separation): nothing cut into them, no rapid through
+/// material, nothing below the spoilboard allowance, both cut free.
+#[test]
+fn simulated_flanges_are_cut_clean_and_free() {
+    let part = &expected()["parts"][0];
+    let read =
+        solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
+            .unwrap();
+    let body = read.bodies[0].body.clone();
+    let job = crate::job::Job::from_json(&format!(
+        r#"{{"stock": {{"size": [220, 120], "thickness": 10}}, "tools": {TOOLS}, "parts": [{{"body": "F", "quantity": 2}}]}}"#
+    ))
+    .unwrap();
+    let plan = crate::plan::plan_job(&job, std::slice::from_ref(&body)).unwrap();
+    let (r, _) = crate::sim::simulate(&job, &[body], &plan, 0.25).unwrap();
+    assert!(r.gouges.is_empty(), "{:?}", r.gouges);
+    assert!(r.rapid_hits.is_empty(), "{:?}", r.rapid_hits);
+    assert!(r.spoilboard.is_empty(), "{:?}", r.spoilboard);
+    assert!(r.parts.len() == 2 && r.parts.iter().all(|p| p.free), "{:?}", r.parts);
+    assert!(r.removed_volume > 0.0);
+}
