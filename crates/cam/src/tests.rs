@@ -2330,3 +2330,122 @@ mod sim_tests {
         assert!(!hits.is_empty() && hits.iter().all(|h| (h.depth - 2.0).abs() < 1e-6), "{hits:?}");
     }
 }
+
+mod remaining_tests {
+    use solidcraft_geom::Vec3;
+    use solidcraft_kernel::{BoolOp, boolean, box_solid};
+
+    use crate::job::Job;
+    use crate::remaining::trim_air;
+    use crate::sim::{HeightMap, cutter, pieces, simulate, sweep};
+    use crate::toolpath::{Move, OpKind, Operation};
+
+    fn job(extra: &str) -> Job {
+        Job::from_json(&format!(
+            r#"{{"stock": {{"size": [100, 80], "thickness": 10}}, "tools": [{{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1000, "plunge": 300, "stepdown": 3}}], "parts": [{{"body": "P"}}] {extra}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn op(moves: Vec<Move>) -> Operation {
+        Operation { kind: OpKind::Roughing, name: "test".into(), tool: 1, rpm: 18000.0, moves }
+    }
+
+    /// A band x 0..20, |y| ≤ 6 cut 2 deep with Ø6 (lines every 2 mm), then a line along y 0
+    /// from x 10 to −20: the cutter and 0.5 round it (3.5) meet nothing standing until its
+    /// centre is within 3.5 of the band's end (x −3, less the model's 0.14 cell pad): the line
+    /// goes at the link feed (3000) to about x 1, then at its own feed. Its plunge at x 10 has
+    /// the band's floor (z −2) under it, so the rapid comes down to −2 + 1 (the retract), and
+    /// the plunge is the last millimetre. The rapids come down 4 (5 to 1) and 6 (5 to −1).
+    #[test]
+    fn moves_through_cleared_ground_go_at_the_link_feed() {
+        let j = job("");
+        let mut cut = vec![Move::Rapid { to: [0.0, -6.0, 5.0] }, Move::Line { to: [0.0, -6.0, -2.0], feed: 300.0 }];
+        for k in 0..7 {
+            let y = -6.0 + 2.0 * k as f64;
+            let (a, b) = if k % 2 == 0 { (0.0, 20.0) } else { (20.0, 0.0) };
+            cut.push(Move::Line { to: [a, y, -2.0], feed: 1000.0 });
+            cut.push(Move::Line { to: [b, y, -2.0], feed: 1000.0 });
+        }
+        cut.push(Move::Rapid { to: [0.0, 6.0, 5.0] });
+        let then = vec![
+            Move::Rapid { to: [10.0, 0.0, 5.0] },
+            Move::Line { to: [10.0, 0.0, -2.0], feed: 300.0 },
+            Move::Line { to: [-20.0, 0.0, -2.0], feed: 1000.0 },
+            Move::Rapid { to: [-20.0, 0.0, 5.0] },
+        ];
+        let mut ops = vec![op(cut.clone()), op(then)];
+        let done = trim_air(&j, &mut ops).unwrap();
+        // the first operation cuts fresh stock all the way, its lines as they were; its rapid comes
+        // down to the retract over the sheet's top (z 0), and its first line, going nowhere, is
+        // left out
+        let first = &ops[0].moves;
+        assert_eq!(first[1], Move::Rapid { to: [0.0, -6.0, 1.0] });
+        assert_eq!(first[2], Move::Line { to: [0.0, -6.0, -2.0], feed: 300.0 });
+        assert_eq!(first[3..], cut[3..], "{first:?}");
+        let m = &ops[1].moves;
+        assert_eq!(m[0], Move::Rapid { to: [10.0, 0.0, 5.0] });
+        assert_eq!(m[1], Move::Rapid { to: [10.0, 0.0, -1.0] }, "down to the retract over the floor");
+        assert_eq!(m[2], Move::Line { to: [10.0, 0.0, -2.0], feed: 300.0 });
+        let Move::Line { to: air_end, feed: 3000.0 } = m[3] else { panic!("{:?}", m[3]) };
+        assert!((0.5..=2.5).contains(&air_end[0]) && air_end[1] == 0.0, "{air_end:?}");
+        assert_eq!(m[4], Move::Line { to: [-20.0, 0.0, -2.0], feed: 1000.0 });
+        assert!((done.rapid_drop - (4.0 + 6.0)).abs() < 1e-9 && done.air_moves == 1, "{done:?}");
+    }
+
+    /// The material removed by `m` from `at` on `map`, mm³ (cells lowered times their area).
+    fn removed(map: &mut HeightMap, c: crate::sim::Cutter, at: [f64; 3], m: &Move) -> f64 {
+        let mut v = 0.0;
+        for (a, b) in pieces(at, m, map.h / 4.0) {
+            let r = c.r + map.h;
+            let (lo, hi) = ([a[0].min(b[0]) - r, a[1].min(b[1]) - r], [a[0].max(b[0]) + r, a[1].max(b[1]) + r]);
+            let ix = |x: f64, o: f64, n: usize| (((x - o) / map.h).floor().max(0.0) as usize).min(n - 1);
+            let (i0, i1, j0, j1) = (ix(lo[0], map.x0, map.nx), ix(hi[0], map.x0, map.nx), ix(lo[1], map.y0, map.ny), ix(hi[1], map.y0, map.ny));
+            let before: Vec<f32> = (j0..=j1).flat_map(|j| (i0..=i1).map(move |i| (i, j))).map(|(i, j)| map.z[j * map.nx + i]).collect();
+            sweep(map, c, a, b);
+            let after = (j0..=j1).flat_map(|j| (i0..=i1).map(move |i| (i, j))).map(|(i, j)| map.z[j * map.nx + i]);
+            v += before.iter().zip(after).map(|(p, q)| f64::from(p - q)).sum::<f64>() * map.h * map.h;
+        }
+        v
+    }
+
+    /// A planned pocket (40 × 24, 6 deep in a 60 × 40 plate) replayed on a 0.05 mm grid: every
+    /// move at the link feed, the stock model's and the adaptive links', removes next to nothing
+    /// (less than a 0.03 mm sliver its depth deep along it); trimming changes no cut (the same
+    /// volume removed as without it) and sends no rapid through material.
+    #[test]
+    fn link_feed_moves_cut_nothing_in_the_simulation() {
+        let b = box_solid(Vec3::new(-30.0, -20.0, 0.0), Vec3::new(30.0, 20.0, 10.0)).unwrap();
+        let b = boolean(&b, &box_solid(Vec3::new(-20.0, -12.0, 4.0), Vec3::new(20.0, 12.0, 11.0)).unwrap(), BoolOp::Cut).unwrap().unwrap();
+        let (on, off) = (job(""), job(r#", "strategy": {"feeds": {"trim_air": false}}"#));
+        let plan = crate::plan::plan_job(&on, std::slice::from_ref(&b)).unwrap();
+        let plain = crate::plan::plan_job(&off, std::slice::from_ref(&b)).unwrap();
+        let mut map = HeightMap::new([-50.0, -40.0], [50.0, 40.0], 0.0, 0.05).unwrap();
+        let mut at = [f64::NAN; 3];
+        let (mut links, mut trimmed) = (0, 0);
+        for o in &plan.ops {
+            let c = cutter(&on, o.tool).unwrap();
+            for m in &o.moves {
+                let from = if at[0].is_nan() { [m.end()[0], m.end()[1], 5.0] } else { at };
+                let v = removed(&mut map, c, from, m);
+                if let Move::Line { feed, .. } | Move::Arc { feed, .. } = m
+                    && (*feed - 3000.0).abs() < 1e-9
+                {
+                    let len = (0..3).map(|k| (m.end()[k] - from[k]).powi(2)).sum::<f64>().sqrt();
+                    let depth = (-from[2].min(m.end()[2])).max(0.0);
+                    assert!(v <= 0.03 * depth * len + 0.05, "{}: {m:?} from {from:?} removes {v:.3} mm³", o.name);
+                    links += 1;
+                    trimmed += usize::from(o.kind != OpKind::Roughing);
+                }
+                at = m.end();
+            }
+        }
+        assert!(links > 20 && trimmed > 0, "{links} moves at the link feed, {trimmed} outside roughing");
+        let (r_on, _) = simulate(&on, std::slice::from_ref(&b), &plan, 0.1).unwrap();
+        let (r_off, _) = simulate(&off, std::slice::from_ref(&b), &plain, 0.1).unwrap();
+        assert!(r_on.rapid_hits.is_empty(), "{:?}", r_on.rapid_hits);
+        assert!((r_on.removed_volume - r_off.removed_volume).abs() < 1e-6 * r_off.removed_volume, "{} {}", r_on.removed_volume, r_off.removed_volume);
+        assert!(r_on.air_minutes < r_off.air_minutes, "air {} min with the model, {} without", r_on.air_minutes, r_off.air_minutes);
+        assert!(r_on.feed_minutes < r_off.feed_minutes);
+    }
+}

@@ -13,6 +13,7 @@ pub mod plan;
 pub mod post;
 pub mod preview;
 pub mod region;
+pub mod remaining;
 pub mod scene;
 pub mod sim;
 pub mod toolpath;

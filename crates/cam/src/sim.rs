@@ -68,7 +68,7 @@ impl HeightMap {
     }
 
     /// The cells whose centres may lie in `lo`..`hi`: first and last across and up.
-    fn span(&self, lo: [f64; 2], hi: [f64; 2]) -> Option<(usize, usize, usize, usize)> {
+    pub(crate) fn span(&self, lo: [f64; 2], hi: [f64; 2]) -> Option<(usize, usize, usize, usize)> {
         let f = |v: f64, o: f64| ((v - o) / self.h - 0.5).floor();
         let c = |v: f64, o: f64| ((v - o) / self.h - 0.5).ceil();
         let (i0, i1) = (f(lo[0], self.x0).max(0.0), c(hi[0], self.x0).min(self.nx as f64 - 1.0));
@@ -92,7 +92,7 @@ pub struct Cutter {
 }
 
 impl Cutter {
-    fn rise(&self, d: f64) -> f64 {
+    pub(crate) fn rise(&self, d: f64) -> f64 {
         d * self.cone
     }
 }
@@ -109,6 +109,17 @@ pub struct Spot {
     /// Area of the spot, mm².
     pub area: f64,
 }
+
+/// An operation's feed time, and the part of it that cut nothing, minutes.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct OpTime {
+    pub operation: String,
+    pub minutes: f64,
+    pub air_minutes: f64,
+}
+
+/// A feed move lowering no cell by this much cuts nothing, mm.
+pub const AIR_TOL: f64 = 0.005;
 
 /// A rapid that went through material.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -137,6 +148,12 @@ pub struct SimReport {
     pub left_area: f64,
     /// Rapids (G0) through material (at most 50).
     pub rapid_hits: Vec<RapidHit>,
+    /// Time of the feed moves (G1, G2, G3) at their programmed feeds, minutes.
+    pub feed_minutes: f64,
+    /// Of that, moves that cut nothing (lowered no cell by 0.005 mm): through air.
+    pub air_minutes: f64,
+    /// The operations with the most time in air, most first (at most 20).
+    pub air_by_operation: Vec<OpTime>,
     /// Cuts deeper into the spoilboard than the job allows (its allowance, or a drill's point
     /// past it), deepest first (at most 50).
     pub spoilboard: Vec<Spot>,
@@ -156,7 +173,7 @@ pub struct PartFree {
 }
 
 /// The cutter of tool `n` in `job`.
-fn cutter(job: &Job, n: u32) -> Result<Cutter> {
+pub(crate) fn cutter(job: &Job, n: u32) -> Result<Cutter> {
     let t = job.tool(n).ok_or_else(|| CamError::Invalid(format!("simulation: no tool T{n}")))?;
     let cone = match t.kind {
         ToolKind::Flat => 0.0,
@@ -168,7 +185,16 @@ fn cutter(job: &Job, n: u32) -> Result<Cutter> {
 /// Cut `map` along the straight move `a`→`b` with `c`; returns how deep the cut went into
 /// material above the cutter (for a rapid's check): the most any cell was lowered.
 pub fn sweep(map: &mut HeightMap, c: Cutter, a: [f64; 3], b: [f64; 3]) -> f64 {
-    let r = c.r;
+    sweep_in(map, c, a, b, 0.0)
+}
+
+/// [`sweep`] cutting less: only cells whose every point the cutter covers, `pad` (half a cell's
+/// diagonal or more) standing for the cell's reach from its centre.
+pub(crate) fn sweep_in(map: &mut HeightMap, c: Cutter, a: [f64; 3], b: [f64; 3], pad: f64) -> f64 {
+    let r = c.r - pad;
+    if r <= 0.0 {
+        return 0.0;
+    }
     let Some((i0, i1, j0, j1)) = map.span([a[0].min(b[0]) - r, a[1].min(b[1]) - r], [a[0].max(b[0]) + r, a[1].max(b[1]) + r]) else {
         return 0.0;
     };
@@ -200,7 +226,7 @@ pub fn sweep(map: &mut HeightMap, c: Cutter, a: [f64; 3], b: [f64; 3]) -> f64 {
             };
             let z_at = |t: f64| {
                 let d = (px - t * ux).hypot(py - t * uy);
-                a[2] + t * uz + c.rise(d)
+                a[2] + t * uz + c.rise(d + pad)
             };
             let low = if c.cone == 0.0 {
                 // flat: the underside's height runs linearly along the move
@@ -231,7 +257,7 @@ pub fn sweep(map: &mut HeightMap, c: Cutter, a: [f64; 3], b: [f64; 3]) -> f64 {
 }
 
 /// The straight pieces of a move from `from`: an arc split so its chords stay within `sag`.
-fn pieces(from: [f64; 3], m: &Move, sag: f64) -> Vec<([f64; 3], [f64; 3])> {
+pub(crate) fn pieces(from: [f64; 3], m: &Move, sag: f64) -> Vec<([f64; 3], [f64; 3])> {
     match m {
         Move::Rapid { to } | Move::Line { to, .. } => vec![(from, *to)],
         Move::Arc { to, center, ccw, .. } => {
@@ -262,17 +288,19 @@ fn pieces(from: [f64; 3], m: &Move, sag: f64) -> Vec<([f64; 3], [f64; 3])> {
 
 /// Run `ops` over `map`; returns the rapids that went through material.
 pub fn run(map: &mut HeightMap, job: &Job, ops: &[Operation]) -> Result<Vec<RapidHit>> {
-    run_with(map, None, job, ops)
+    Ok(run_with(map, None, job, ops)?.0)
 }
 
 /// [`run`], also lowering `allowed` (how deep each cell may be cut) under every drill's point:
 /// a drill goes past the bottom by its tip to cut its full diameter there.
-fn run_with(map: &mut HeightMap, mut allowed: Option<&mut HeightMap>, job: &Job, ops: &[Operation]) -> Result<Vec<RapidHit>> {
+fn run_with(map: &mut HeightMap, mut allowed: Option<&mut HeightMap>, job: &Job, ops: &[Operation]) -> Result<(Vec<RapidHit>, Vec<OpTime>)> {
     let sag = map.h / 4.0;
     let mut hits = Vec::new();
+    let mut times = Vec::new();
     let mut at = [f64::NAN; 3];
     for op in ops {
         let c = cutter(job, op.tool)?;
+        let mut time = OpTime { operation: op.name.clone(), minutes: 0.0, air_minutes: 0.0 };
         for m in &op.moves {
             let start = if at[0].is_nan() {
                 // the first move of a program comes down from above
@@ -284,10 +312,22 @@ fn run_with(map: &mut HeightMap, mut allowed: Option<&mut HeightMap>, job: &Job,
             if let (Move::Drill { at: p, back, bottom, .. }, Some(allow)) = (m, allowed.as_deref_mut()) {
                 sweep(allow, c, [p[0], p[1], *back], [p[0], p[1], *bottom]);
             }
+            let (mut cut, mut length) = (0.0f64, 0.0);
             for (a, b) in pieces(start, m, sag) {
                 let depth = sweep(map, c, a, b);
+                cut = cut.max(depth);
+                length += (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f64>().sqrt();
                 if matches!(m, Move::Rapid { .. }) && depth > 0.01 && hits.len() < 50 {
                     hits.push(RapidHit { operation: op.name.clone(), at: b, depth });
+                }
+            }
+            if let Move::Line { feed, .. } | Move::Arc { feed, .. } = m
+                && *feed > 0.0
+            {
+                let t = length / feed;
+                time.minutes += t;
+                if cut < AIR_TOL {
+                    time.air_minutes += t;
                 }
             }
             at = match m {
@@ -295,8 +335,9 @@ fn run_with(map: &mut HeightMap, mut allowed: Option<&mut HeightMap>, job: &Job,
                 _ => m.end(),
             };
         }
+        times.push(time);
     }
-    Ok(hits)
+    Ok((hits, times))
 }
 
 /// The highest point of `tris` over each cell inside them; NaN elsewhere.
@@ -386,7 +427,12 @@ pub fn simulate(job: &Job, bodies: &[Body], plan: &JobPlan, cell: f64) -> Result
     let mut map = HeightMap::new([-zero[0], -zero[1]], [w - zero[0], d - zero[1]], 0.0, cell)?;
     let floor = -t - job.stock.spoilboard_allowance;
     let mut allowed = HeightMap::new([-zero[0], -zero[1]], [w - zero[0], d - zero[1]], floor, cell)?;
-    let rapid_hits = run_with(&mut map, Some(&mut allowed), job, &plan.ops)?;
+    let (rapid_hits, times) = run_with(&mut map, Some(&mut allowed), job, &plan.ops)?;
+    let feed_minutes = times.iter().map(|t| t.minutes).sum();
+    let air_minutes = times.iter().map(|t| t.air_minutes).sum();
+    let mut air_by_operation = times;
+    air_by_operation.sort_by(|a, b| b.air_minutes.total_cmp(&a.air_minutes));
+    air_by_operation.truncate(20);
     let n = map.nx * map.ny;
     let removed_volume: f64 = map.z.iter().map(|z| (0.0 - f64::from(*z).max(-t)).max(0.0)).sum::<f64>() * cell * cell;
 
@@ -552,6 +598,9 @@ pub fn simulate(job: &Job, bodies: &[Body], plan: &JobPlan, cell: f64) -> Result
         left: left_spots,
         left_area,
         rapid_hits,
+        feed_minutes,
+        air_minutes,
+        air_by_operation,
         spoilboard: spots(&map, &spoil, &spoil_by, 50),
         parts,
         slugs,

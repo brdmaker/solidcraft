@@ -1105,8 +1105,11 @@ pub fn plan_job(job: &Job, bodies: &[solidcraft_kernel::Body]) -> Result<JobPlan
     let nesting = crate::nest::nest(&job.stock, &job.nest, &items);
     warnings.extend(nesting.unplaced.iter().map(|u| format!("{} #{} is not on the sheet: {}", u.label, u.copy + 1, u.reason)));
     let pairs: Vec<(&PartFeatures, &PartPlan)> = features.iter().zip(&plans).collect();
-    let (ops, sheet_warnings) = plan_sheet(job, &pairs, &nesting.placements)?;
+    let (mut ops, sheet_warnings) = plan_sheet(job, &pairs, &nesting.placements)?;
     warnings.extend(sheet_warnings);
+    if job.strategy.feeds.trim_air {
+        crate::remaining::trim_air(job, &mut ops)?;
+    }
     // tools the machine's changer does not hold
     if !job.machine.rack.is_empty() {
         let mut missing: Vec<u32> = Vec::new();

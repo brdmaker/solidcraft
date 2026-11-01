@@ -847,17 +847,17 @@ fn link(b: &mut PathBuilder, maps: &Maps, hub: [f64; 2], to: [f64; 2], z: f64, f
     let (tlo, thi) = bbox(&[to], maps.pad);
     let over = nearest_on(&maps.cen.window(tlo, thi)?, to).unwrap_or(to);
     let lift = from + p.retract;
-    let (feed, plunge, rapid) = (p.link.max(t.feed).max(1e-6), t.plunge.max(1e-6), p.rapid.max(1e-6));
+    let (feed, rapid) = (p.link.max(t.feed).max(1e-6), p.rapid.max(1e-6));
     let up_feed = t.plunge.max(t.feed).max(1e-6);
     let clear = b.h.clearance;
     let above = (from + p.retract).min(clear);
     let up_time = ((clear - b.at[2]).max(0.0) + d(here, over) + (clear - above).max(0.0)) / rapid
-        + (above - z).max(0.0) / plunge
+        + (above - z).max(0.0) / feed
         + d(over, to) / t.feed.max(1e-6);
     let mut ways = [
         (d(here, to) / feed, 0u8),
         ((d(here, hub) + d(hub, to)) / feed, 1),
-        ((lift - z) / up_feed + d(here, over) / feed + d(over, to) / t.feed.max(1e-6) + (lift - z) / plunge, 2),
+        ((lift - z) / up_feed + d(here, over) / feed + d(over, to) / t.feed.max(1e-6) + (lift - z) / feed, 2),
     ];
     ways.sort_by(|a, b| a.0.total_cmp(&b.0));
     let inside = |tiles: &Tiled, a: [f64; 2], q: [f64; 2]| -> Result<bool> {
@@ -902,7 +902,9 @@ fn link(b: &mut PathBuilder, maps: &Maps, hub: [f64; 2], to: [f64; 2], z: f64, f
             b.travel_to(over, from);
         }
     }
-    b.line([over[0], over[1], z], t.plunge);
+    // down onto ground this level has cleared (the cutter's centre has been there), through the
+    // levels above it: in air
+    b.line([over[0], over[1], z], feed);
     b.line([to[0], to[1], z], t.feed);
     Ok(())
 }

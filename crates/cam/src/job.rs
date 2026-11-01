@@ -305,11 +305,15 @@ pub struct Feeds {
     /// Feed of moves through cleared ground between adaptive passes, mm/min (default 3000; at
     /// least the tool's feed, at most the rapid feed).
     pub link: f64,
+    /// Follow the stock left as the operations cut it: feed moves through air run at the link
+    /// feed, and rapids come down to the retract height above the stock still there (default
+    /// true; false: each level's moves as planned from its top).
+    pub trim_air: bool,
 }
 
 impl Default for Feeds {
     fn default() -> Self {
-        Feeds { chip_thinning: true, max_thinning: 2.0, slotting: 0.8, link: 3000.0 }
+        Feeds { chip_thinning: true, max_thinning: 2.0, slotting: 0.8, link: 3000.0, trim_air: true }
     }
 }
 
