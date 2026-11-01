@@ -85,8 +85,15 @@ pub struct Strategy {
     pub profile_tool: Option<u32>,
     /// Tool for countersinks and chamfers (default: the first chamfer cutter).
     pub chamfer_tool: Option<u32>,
-    /// Material roughing leaves on walls and floors for the finishing passes, mm (default 0.2).
+    /// Material roughing leaves on walls (pockets, cutouts and round the parts) for the wall
+    /// passes, mm (default 0.5: roughing may leave a rough edge).
     pub stock_to_leave: f64,
+    /// Material roughing leaves on floors for the floor finishing, mm (default 0.2).
+    pub floor_stock_to_leave: f64,
+    /// Contour passes cleaning each wall after roughing, by the material each leaves, mm, before
+    /// the last pass leaves none (default [0.3, 0.1]; empty: the last pass only). Round the
+    /// parts, the last pass is the separation's.
+    pub wall_passes: Vec<f64>,
     /// Steepest ramp into the material, degrees from horizontal (default 3).
     pub ramp_angle_deg: f64,
     /// Height above the sheet for rapid moves, mm (default 5).
@@ -228,7 +235,9 @@ impl Default for Strategy {
             finish_tool: None,
             profile_tool: None,
             chamfer_tool: None,
-            stock_to_leave: 0.2,
+            stock_to_leave: 0.5,
+            floor_stock_to_leave: 0.2,
+            wall_passes: vec![0.3, 0.1],
             ramp_angle_deg: 3.0,
             clearance: 5.0,
             retract: 1.0,
@@ -500,6 +509,20 @@ impl Job {
         validate_tools(&self.tools, "tools")?;
         let st = &self.strategy;
         length("strategy.stock_to_leave", st.stock_to_leave, 0.0)?;
+        length("strategy.floor_stock_to_leave", st.floor_stock_to_leave, 0.0)?;
+        if st.wall_passes.len() > 20 {
+            return Err(CamError::Invalid("strategy.wall_passes: at most 20 passes".into()));
+        }
+        let mut before = st.stock_to_leave;
+        for (i, w) in st.wall_passes.iter().enumerate() {
+            if !(w.is_finite() && *w > 0.0 && *w < before) {
+                return Err(CamError::Invalid(format!(
+                    "strategy.wall_passes[{i}] is {w}: each pass leaves less than the one before (roughing leaves {}) and more than 0, which the last pass leaves",
+                    st.stock_to_leave
+                )));
+            }
+            before = *w;
+        }
         length("strategy.clearance", st.clearance, 0.5)?;
         length("strategy.retract", st.retract, 0.1)?;
         length("strategy.chamfer_tip_below", st.chamfer_tip_below, 0.0)?;

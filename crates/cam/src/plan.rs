@@ -349,14 +349,31 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
     {
         let rt = t.diameter / 2.0;
         let leave = st.stock_to_leave;
-        // floors get the stock to leave; a cut through (to the skin or below the sheet) none
-        let rough_targets: Vec<f64> = targets.iter().map(|z| if *z > cx.cut_to + Z_EPS { z + leave } else { *z }).collect();
+        // floors get their stock to leave; a cut through (to the skin or below the sheet) none
+        let rough_targets: Vec<f64> = targets.iter().map(|z| if *z > cx.cut_to + Z_EPS { z + st.floor_stock_to_leave } else { *z }).collect();
         let mut tasks: Vec<RoughTask> = Vec::new();
         let mut roots: Vec<Area> = Vec::new();
         let mut from = f.top_z;
         for z in levels(f.top_z, &rough_targets, t.stepdown()) {
             let pocket = cx.pocket(z)?;
-            let allowed = pocket.offset(-(rt + leave), PATH_TOL)?;
+            let mut allowed = pocket.offset(-(rt + leave), PATH_TOL)?;
+            // a region too narrow to leave the stock on its walls (a slot not much wider than
+            // the cutter) is roughed leaving none, rather than left for the wall passes
+            for sh in pocket.offset(-(rt + 0.02), PATH_TOL)?.shapes {
+                let tight = Area { shapes: vec![sh] };
+                if tight.intersection(&allowed)?.is_empty() {
+                    if let Some((lo, hi)) = tight.bounds() {
+                        cx.warn(format!(
+                            "{label}: adaptive: the pocket at ({:.1}, {:.1}) on z {z:.3} is too narrow for T{} (Ø{}) to leave {leave} mm on its walls: it is roughed leaving none, close to slotting",
+                            (lo[0] + hi[0]) / 2.0,
+                            (lo[1] + hi[1]) / 2.0,
+                            t.number,
+                            t.diameter
+                        ));
+                    }
+                    allowed = allowed.union(&tight)?;
+                }
+            }
             if allowed.is_empty() && !pocket.is_empty() {
                 cx.warn(format!("{label}: a pocket at z {z:.3} is narrower than T{} (Ø{}) can rough", t.number, t.diameter));
             }
@@ -397,7 +414,7 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         && !targets.is_empty()
     {
         let rt = t.diameter / 2.0;
-        let leave = st.stock_to_leave;
+        let leave = st.floor_stock_to_leave;
         for (z, region) in &pocket_floors {
             let mut fb = PathBuilder::new(cx.h, [0.0, 0.0]);
             let pocket = cx.pocket(*z)?;
@@ -418,16 +435,19 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
                 cx.warn(format!("{label}: a pocket at z {z:.3} is narrower than T{} (Ø{}) can finish", t.number, t.diameter));
             }
             unreached_corners(&pocket, &allowed, rt, z, &mut corners)?;
+            // the wall passes, each leaving less, the last none
             let mut wb = PathBuilder::new(cx.h, [0.0, 0.0]);
-            let walls: Vec<Ring> = allowed.rings().cloned().collect();
-            for r in &walls {
-                let r = climb_inside(r);
-                let start = nearest_vertex(&r, [wb.at[0], wb.at[1]]);
-                let Some(&p) = r.get(start) else { continue };
-                wb.travel_to(p, from);
-                wb.line([p[0], p[1], z], t.plunge);
-                wb.ring(&r, start, z, t.feed);
-                wb.up();
+            for left in st.wall_passes.iter().copied().chain([0.0]) {
+                let path = if left > 0.0 { pocket.offset(-(rt + left), PATH_TOL)? } else { allowed.clone() };
+                for r in path.rings() {
+                    let r = climb_inside(r);
+                    let start = nearest_vertex(&r, [wb.at[0], wb.at[1]]);
+                    let Some(&p) = r.get(start) else { continue };
+                    wb.travel_to(p, from);
+                    wb.line([p[0], p[1], z], t.plunge);
+                    wb.ring(&r, start, z, t.feed);
+                    wb.up();
+                }
             }
             if !wb.moves.is_empty() {
                 ops.push(cx.op(OpKind::WallFinish, "walls", t, wb.moves));
@@ -815,12 +835,13 @@ fn profile(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Result<()> {
     Ok(())
 }
 
-/// The `skin` cut-out of one part with the profile tool: a contour round the outline finishing
-/// it level by level down to the skin's top (roughing cleared round it, leaving the stock to
-/// leave), then the skin cut through `skin_stepdown` at a time, round the outline and inside
-/// each through cutout, down past the sheet's bottom: each level an operation of its own, so
-/// the whole sheet is cut through level by level. Climbing: anticlockwise round the outside,
-/// clockwise inside a cutout.
+/// The `skin` cut-out of one part with the profile tool. Roughing cleared round it leaving the
+/// stock to leave; the wall passes (each leaving less: 0.3, then 0.1 by default) run round the
+/// outline level by level down to the skin's top. The separation, last of all, runs the final
+/// pass (leaving nothing) the same way, then cuts the skin through `skin_stepdown` at a time,
+/// round the outline and inside each through cutout, down past the sheet's bottom: each level
+/// an operation of its own, so the whole sheet is cut level by level. Climbing: anticlockwise
+/// round the outside, clockwise inside a cutout.
 fn contour_and_separate(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Result<()> {
     let Some(t) = cx.job.profile_tool() else { return Ok(()) };
     let rt = t.diameter / 2.0;
@@ -846,6 +867,27 @@ fn contour_and_separate(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Re
         inside.extend(path.shapes.iter().filter_map(|sh| sh.first().map(climb_inside)));
     }
     let skin_top = cx.cut_to;
+    // the wall passes round the outline, level by level down to the skin, each leaving less
+    let mut from = cx.sheet_top;
+    for z in levels(cx.sheet_top, &[skin_top], t.stepdown()) {
+        let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+        for left in &cx.job.strategy.wall_passes {
+            for r in cx.f.outline.offset(rt + left, PATH_TOL)?.shapes.iter().filter_map(|sh| sh.first()) {
+                let start = nearest_vertex(r, [b.at[0], b.at[1]]);
+                let Some(&p) = r.get(start) else { continue };
+                b.travel_to(p, from);
+                b.line([p[0], p[1], from], t.plunge);
+                b.ramp_ring(r, start, z, ramp, t.feed, t.plunge);
+                b.up();
+            }
+        }
+        if !b.moves.is_empty() {
+            ops.push(cx.op(OpKind::Profile, "contour", t, b.moves));
+        }
+        from = z;
+    }
+    // the separation: the last pass, leaving nothing, round the outline down to the skin level
+    // by level, then through the skin round it and inside each cutout
     let mut from = cx.sheet_top;
     for z in levels(cx.sheet_top, &[skin_top], t.stepdown()) {
         let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
@@ -858,7 +900,7 @@ fn contour_and_separate(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Re
             b.up();
         }
         if !b.moves.is_empty() {
-            ops.push(cx.op(OpKind::Profile, "contour", t, b.moves));
+            ops.push(cx.op(OpKind::Separation, "separation", t, b.moves));
         }
         from = z;
     }

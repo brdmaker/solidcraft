@@ -14,8 +14,9 @@ description: "Use when working on CAM in SolidCraft: crates/cam (machining featu
 Toolpaths come from exact faces (`face_surface`, `planar_edges`). The mesh only gives topology, face extents and sides, and the triangulated copy for the check simulation. Holes keep their exact diameters. Areas are drawn with `AREA_TOL` chords, and tests bound that error (2/3 · tol · curved length) instead of loosening tolerances.
 
 ## The shop it serves
-- A job listing no tools uses `crates/cam/library/router-aluminium.json` (single-flute Ø1, 2, 3, 6 as T1, T2, T3, T6; 90° chamfer mills T9, T10). A job's `library` and `tools` override it.
-- Vacuum hold: the default `skin` cut-out roughs a band round the parts to 0.5 above the bottom; contours, then 0.1 passes through the skin last. A sheet runs kind by kind (end-milled countersinks first, through holes then the skin last), each level by level over every part.
+- A job listing no tools uses `crates/cam/library/router-aluminium.json`; its `library` and `tools` override it.
+- Roughing leaves 0.5 on walls, 0.2 on floors; wall passes leave 0.3, 0.1, then none.
+- Vacuum hold (`skin` cut-out): a band round the parts is roughed to 0.5 above the bottom; the last wall pass and 0.1 skin passes run last. A sheet runs kind by kind (end-milled countersinks first, through holes then the skin last), each level by level over every part.
 
 ## Tests: every feature has them
 - Unit tests go in `crates/cam/src/tests.rs`, on solids built with the kernel (`box_solid`, `cylinder`, `boolean`), with expected values worked out by hand.

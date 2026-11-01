@@ -630,7 +630,7 @@ fn placed_paths_are_turned_moved_and_lowered() {
 }
 
 /// The panel's label recess (70 × 14, floor at 2.2) is roughed at 2.4 before its floor is
-/// finished: roughing passes at 2.4 inside it, 3.2 or more from its walls.
+/// finished: roughing passes at 2.4 inside it, 3.5 or more from its walls.
 #[test]
 fn the_label_recess_is_roughed_before_its_floor() {
     use crate::toolpath::{Move, OpKind};
@@ -645,7 +645,7 @@ fn the_label_recess_is_roughed_before_its_floor() {
     assert!(!in_recess.is_empty(), "no roughing in the label recess");
     for p in &in_recess {
         let d = rounded_rect_dist([p[0] + 40.0, p[1] + 30.0], 35.0, 7.0, 3.0);
-        assert!(d <= -(3.2 - crate::plan::PATH_TOL - 1e-6), "roughing at {p:?} is {} from the recess wall", -d);
+        assert!(d <= -(3.5 - crate::plan::PATH_TOL - 1e-6), "roughing at {p:?} is {} from the recess wall", -d);
     }
 }
 

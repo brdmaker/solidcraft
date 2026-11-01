@@ -7,7 +7,10 @@
 //! is cut, the cutter's engagement (the arc of its edge in uncut material) is measured at every
 //! point of it on a grid of what is already cleared; where it would pass the limit, as where the
 //! front wraps into a corner or round an island, the pass is planned again at half the step, down
-//! to a sixteenth. Moves between stretches stay at depth through cleared area, else lift just above
+//! to a sixteenth. Within a step of the region's edge, where a front meets a wall and the material
+//! beside the last pass lies on a quarter of the cutter whatever the step, the limit is that
+//! quarter and a straight cut's engagement: roughing leaves the walls rough for the wall passes
+//! rather than crawl along them. Moves between stretches stay at depth through cleared area, else lift just above
 //! the level and re-enter over cleared ground.
 
 use crate::job::Tool;
@@ -178,9 +181,10 @@ impl Cleared {
     }
 }
 
-/// The points of `segs` where cutting them would engage more than `limit` (radians), thinned
-/// to one every half millimetre or so.
-fn hot_points(segs: &[Vec<[f64; 2]>], cleared: &Cleared, rt: f64, limit: f64) -> Vec<[f64; 2]> {
+/// The points of `segs` where cutting them would engage more than `limit` (radians), or more
+/// than `wall_limit` within the tolerance of `walls` (the region's edge), thinned to one every
+/// half millimetre or so.
+fn hot_points(segs: &[Vec<[f64; 2]>], cleared: &Cleared, rt: f64, limit: f64, walls: &EdgeGrid, wall_limit: f64) -> Vec<[f64; 2]> {
     let mut hot: Vec<[f64; 2]> = Vec::new();
     for w in segs.iter().flat_map(|sg| sg.windows(2)) {
         let (Some(a), Some(b)) = (w.first(), w.get(1)) else { continue };
@@ -195,7 +199,12 @@ fn hot_points(segs: &[Vec<[f64; 2]>], cleared: &Cleared, rt: f64, limit: f64) ->
         for k in 1..=n {
             let t = k as f64 / n as f64;
             let q = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-            if cleared.engagement(q, dir, rt) > limit && hot.last().is_none_or(|h| (h[0] - q[0]).hypot(h[1] - q[1]) > 0.5) && hot.len() < 5_000 {
+            let e = cleared.engagement(q, dir, rt);
+            if e > limit
+                && (e > wall_limit || !walls.near(q))
+                && hot.last().is_none_or(|h| (h[0] - q[0]).hypot(h[1] - q[1]) > 0.5)
+                && hot.len() < 5_000
+            {
                 hot.push(q);
             }
         }
@@ -598,13 +607,10 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
             2.0 * (room.max(0.0) + shrink)
         )]);
     }
-    // In a channel giving the centre less room across than the cutter's radius (as between
-    // two parts nested close), moving on along either side of the cleared strip, the material
-    // beside it, which the cutter's edge only just reached before, lies on a quarter of the
-    // edge however small the step. A pass there may take that quarter and a straight cut's
-    // engagement at the step, and the note says so.
-    let channel_limit = p.max_engagement.max(std::f64::consts::FRAC_PI_2 + AdaptiveParams::straight_engagement(step, rt));
-    let mut in_channel = false;
+    // Where a front meets the region's edge (a wall, either side of a channel), the material
+    // beside the last pass lies on a quarter of the cutter's edge whatever the step: within a
+    // step of the edge a pass may take that quarter and a straight cut's engagement.
+    let wall_limit = p.max_engagement.max(std::f64::consts::FRAC_PI_2 + AdaptiveParams::straight_engagement(step, rt));
     b.travel_to([c[0] + rh, c[1]], from);
     b.line([c[0] + rh, c[1], from], t.plunge);
     let pitch = (std::f64::consts::TAU * rh * p.ramp.tan()).max(0.01);
@@ -644,8 +650,6 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
         let here = [b.at[0], b.at[1]];
         let s0 = if last * 2.0 >= step - 1e-12 { step } else { last * 2.0 };
         let mut half = tile;
-        // whether this pass runs in a channel: looked at once, the first time it is too hot
-        let mut channel: Option<bool> = None;
         let picked = 'window: loop {
             let (wlo, whi) = ([here[0] - half, here[1] - half], [here[0] + half, here[1] + half]);
             let whole = wlo[0] <= blo[0] && wlo[1] <= blo[1] && whi[0] >= bhi[0] && whi[1] >= bhi[1];
@@ -654,6 +658,8 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
             let pad = step + 1.0;
             let visited = cen.window_closed([wlo[0] - pad, wlo[1] - pad], [whi[0] + pad, whi[1] + pad])?;
             let inside = region.window(wlo, whi)?;
+            // the region's edge, read wider than the window so its cut has no edge of its own
+            let walls = EdgeGrid::new(&region.window([wlo[0] - pad, wlo[1] - pad], [whi[0] + pad, whi[1] + pad])?, step + 0.05);
             let mut s = s0;
             loop {
                 let next = if s == step { grown.window(wlo, whi)? } else { visited.offset(s, 0.01)? };
@@ -666,11 +672,7 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
                         continue 'window;
                     }
                     Pick::Piece(piece, segs) => {
-                        let mut hot = hot_points(&segs, &cleared, rt, p.max_engagement);
-                        if !hot.is_empty() && *channel.get_or_insert(narrow_at(&region, &piece, rt)?) {
-                            in_channel = true;
-                            hot = hot_points(&segs, &cleared, rt, channel_limit);
-                        }
+                        let hot = hot_points(&segs, &cleared, rt, p.max_engagement, &walls, wall_limit);
                         if hot.is_empty() {
                             break 'window Some((piece, segs, s));
                         }
@@ -769,29 +771,10 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
             q[0],
             q[1],
             t.number,
-            if in_channel { channel_limit } else { p.max_engagement }.to_degrees()
-        ));
-    }
-    if in_channel {
-        notes.push(format!(
-            "adaptive: the region at {} on z {z:.3} has channels giving T{}'s centre less than {:.2} mm of room: passes along their sides engage up to {:.0}° (a smaller cutter or a wider gap keeps it down)",
-            at(shape),
-            t.number,
-            rt,
-            channel_limit.to_degrees()
+            p.max_engagement.to_degrees()
         ));
     }
     Ok(notes)
-}
-
-/// Is the region the centre may go, round `piece`, a channel narrower than `rt` across: no
-/// point of it within `2 rt` of the piece more than `rt / 2` from its edge? (The tip of a wedge
-/// is narrow too, but wide ground lies close by: it is not a channel.)
-fn narrow_at(region: &Tiled, piece: &Area, rt: f64) -> Result<bool> {
-    let Some((lo, hi)) = piece.bounds() else { return Ok(false) };
-    let local = region.window([lo[0] - 3.0 * rt, lo[1] - 3.0 * rt], [hi[0] + 3.0 * rt, hi[1] + 3.0 * rt])?;
-    let core = local.offset(-rt / 2.0, 0.01)?.intersection(&Area::rect(lo[0] - 2.0 * rt, lo[1] - 2.0 * rt, hi[0] + 2.0 * rt, hi[1] + 2.0 * rt)?)?;
-    Ok(core.is_empty())
 }
 
 /// Windows of the centres' region (cleared ground) and of the region the centre may go, for

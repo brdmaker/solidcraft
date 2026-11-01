@@ -257,6 +257,8 @@ mod job_tests {
         assert_eq!((j.nest.margin, j.nest.spacing, j.nest.rotate), (10.0, 8.0, true));
         assert_eq!(j.parts[0].quantity, 1);
         assert_eq!(j.parts[0].label(), "Flange");
+        let st = &j.strategy;
+        assert_eq!((st.stock_to_leave, st.floor_stock_to_leave, st.wall_passes.clone()), (0.5, 0.2, vec![0.3, 0.1]));
         let c = &j.strategy.cut_out;
         assert_eq!((c.method, c.skin, c.skin_stepdown), (CutOutMethod::Skin, 0.5, 0.1));
         // no tools listed and no library named: the built-in library's
@@ -325,6 +327,25 @@ mod job_tests {
                 .into())
         });
         assert!(bad.unwrap_err().to_string().contains("library.tools[0].number"));
+    }
+
+    /// Wall passes each leave less than the one before, starting below the roughing's stock to
+    /// leave, and more than nothing (the last pass leaves that).
+    #[test]
+    fn wall_passes_are_checked() {
+        let with = |extra: &str| {
+            Job::from_json(&format!(r#"{{"stock": {{"size": [600, 400], "thickness": 3}}, "strategy": {{{extra}}}, "parts": [{{"body": "B"}}]}}"#))
+        };
+        assert!(with(r#""wall_passes": [0.4, 0.2, 0.05]"#).is_ok());
+        assert!(with(r#""wall_passes": []"#).is_ok());
+        for bad in [
+            r#""wall_passes": [0.5]"#,
+            r#""wall_passes": [0.1, 0.3]"#,
+            r#""wall_passes": [0.3, 0]"#,
+            r#""stock_to_leave": 0.2, "wall_passes": [0.3]"#,
+        ] {
+            assert!(with(bad).unwrap_err().to_string().contains("wall_passes"), "{bad}");
+        }
     }
 
     /// The skin must be thinner than the sheet; its passes at least 0.01 mm.
@@ -616,7 +637,7 @@ mod plan_tests {
         cut(b, box_solid(v(-15.0, -10.0, 6.0), v(15.0, 10.0, 11.0)).unwrap())
     }
 
-    /// Roughing stays 3 + 0.2 mm off the pocket's walls and 0.2 mm above its floor; feeds below
+    /// Roughing stays 3 + 0.5 mm off the pocket's walls and 0.2 mm above its floor; feeds below
     /// the top only inside the pocket; rapids that move sideways only at the clearance height.
     /// The only warnings are the pocket's four sharp corners, where the Ø6 tool (also the
     /// finishing tool) leaves 3(√2 − 1) = 1.24 mm.
@@ -636,7 +657,7 @@ mod plan_tests {
         assert!(!cutting.is_empty());
         for a in &cutting {
             let d = rect_dist(a.p, -15.0, -10.0, 15.0, 10.0);
-            assert!(d <= -(3.2 - PATH_TOL - 1e-6), "roughing at {:?} is {} from the pocket wall", a.p, -d);
+            assert!(d <= -(3.5 - PATH_TOL - 1e-6), "roughing at {:?} is {} from the pocket wall", a.p, -d);
         }
         let low = cutting.iter().map(|a| a.p[2]).fold(f64::INFINITY, f64::min);
         assert!((low - 6.2).abs() < 1e-9, "roughing reaches {low}");
@@ -690,8 +711,9 @@ mod plan_tests {
         }
     }
 
-    /// The wall pass runs exactly 3 mm (the tool's radius) inside each wall, clockwise round the
-    /// pocket (wall on the left: climb milling), and down to the floor.
+    /// The wall passes run 3.3, 3.1 and 3 mm inside each wall (the tool's radius and the 0.3,
+    /// 0.1 and nothing each leaves), in that order at each level, clockwise round the pocket
+    /// (wall on the left: climb milling), down to the floor.
     #[test]
     fn walls_are_finished_climbing_at_the_tool_radius() {
         let f = read_part(&pocket_plate()).unwrap();
@@ -700,14 +722,22 @@ mod plan_tests {
         let pts = sample(walls, [0.0, 0.0, 15.0]);
         let at6: Vec<[f64; 2]> = pts.iter().filter(|a| !a.rapid && (a.p[2] - 6.0).abs() < 1e-9).map(|a| [a.p[0], a.p[1]]).collect();
         assert!(!at6.is_empty(), "the walls are finished down to the floor");
+        let mut order: Vec<usize> = Vec::new();
         for p in &at6 {
-            let d = rect_dist([p[0], p[1], 0.0], -15.0, -10.0, 15.0, 10.0);
-            assert!((d + 3.0).abs() <= PATH_TOL + 1e-6, "wall pass at {p:?} is {} from the wall", -d);
+            let d = -rect_dist([p[0], p[1], 0.0], -15.0, -10.0, 15.0, 10.0);
+            let k = [3.3, 3.1, 3.0].iter().position(|w| (d - w).abs() <= PATH_TOL + 1e-6);
+            let k = k.unwrap_or_else(|| panic!("wall pass at {p:?} is {d} from the wall"));
+            if order.last() != Some(&k) {
+                order.push(k);
+            }
         }
-        assert!(signed_area(&at6) < 0.0, "clockwise round the pocket");
+        assert_eq!(order, vec![0, 1, 2], "0.3 left, then 0.1, then none");
+        let last: Vec<[f64; 2]> =
+            at6.iter().copied().filter(|p| (-rect_dist([p[0], p[1], 0.0], -15.0, -10.0, 15.0, 10.0) - 3.0).abs() <= PATH_TOL + 1e-6).collect();
+        assert!(signed_area(&last) < 0.0, "clockwise round the pocket");
         for side in [[-12.0, 0.0], [12.0, 0.0], [0.0, -7.0], [0.0, 7.0]] {
             assert!(
-                at6.iter().any(|p| (p[0] - side[0]).abs() < 0.3 && (p[1] - side[1]).abs() < 0.3
+                last.iter().any(|p| (p[0] - side[0]).abs() < 0.3 && (p[1] - side[1]).abs() < 0.3
                     || (side[0] == 0.0 && (p[1] - side[1]).abs() < 1e-6)
                     || (side[1] == 0.0 && (p[0] - side[0]).abs() < 1e-6)),
                 "no pass along the wall at {side:?}"
@@ -726,14 +756,12 @@ mod plan_tests {
     /// Two 40 × 30 plates 6 thick on a 110 × 50 sheet 6 thick, 8 apart (x 10…50 and 58…98, y
     /// 10…40), with the `skin` cut-out (Ø6 roughing and contour, Ø3 finishing):
     /// - roughing clears a band round them down to the skin's top, −6 + 0.5 = −5.5, in levels of
-    ///   at most 3 (−2.75, −5.5), its centre never nearer the plates than 3 + 0.2, and through
-    ///   the gap between them (centres between x 53.2 and 54.8) at −5.5; the band is narrower
-    ///   than the cutter's radius leaves room for, so a note says passes along its sides engage
-    ///   up to 90° + acos(1 − 0.9/3) = 136°;
-    /// - the contour runs 3 outside each plate at −2.75 and −5.5;
-    /// - last of all, the skin is cut through 3 outside each plate at −5.6, −5.7 … −6.2 (to the
-    ///   spoilboard allowance), both plates at each level before the next, the tool only ever
-    ///   going down while it cuts (no tabs);
+    ///   at most 3 (−2.75, −5.5), its centre never nearer the plates than 3 + 0.5, through the
+    ///   gap between them (centres between x 53.5 and 54.5) and all the way round at −5.5;
+    /// - the contour's wall passes run 3.3 and 3.1 outside each plate at −2.75 and −5.5;
+    /// - last of all the separation: its pass 3 outside each plate at −2.75 and −5.5, then
+    ///   through the skin at −5.6, −5.7 … −6.2 (to the spoilboard allowance), both plates at each
+    ///   level before the next, the tool only ever going down while it cuts (no tabs);
     /// - each kind of work goes level by level over the sheet, the deepest last.
     ///
     /// With the `profile` cut-out, none of that: a slot round each part instead.
@@ -753,9 +781,7 @@ mod plan_tests {
         let j = sheet("");
         let plan = plan_part(&f, &j, "P").unwrap();
         let (ops, warnings) = plan_sheet(&j, &[(&f, &plan)], &[pls(0, 30.0), pls(1, 78.0)]).unwrap();
-        let limit = format!("{:.0}°", 90.0 + (1.0f64 - 0.9 / 3.0).acos().to_degrees());
-        assert!(!warnings.is_empty() && warnings.iter().all(|w| w.starts_with("round the parts: adaptive:") && w.contains(&limit)), "{warnings:#?}");
-        assert!(!warnings.iter().any(|w| w.contains("stopped after")), "{warnings:#?}");
+        assert!(warnings.is_empty(), "{warnings:#?}");
 
         let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // the band's roughing
@@ -766,19 +792,19 @@ mod plan_tests {
         for o in &band {
             for a in sample(o, [0.0, 0.0, 5.0]).iter().filter(|a| !a.rapid && a.p[2] < 0.0) {
                 assert!(a.p[2] >= -5.5 - 1e-9, "below the skin at {:?}", a.p);
-                assert!(to_plates(a.p) >= 3.2 - 0.006, "{:?} is {:.4} from a plate", a.p, to_plates(a.p));
-                if near(a.p[2], -5.5) && a.p[0] > 53.2 - 0.01 && a.p[0] < 54.8 + 0.01 && a.p[1] > 15.0 && a.p[1] < 35.0 {
+                assert!(to_plates(a.p) >= 3.5 - 0.006, "{:?} is {:.4} from a plate", a.p, to_plates(a.p));
+                if near(a.p[2], -5.5) && a.p[0] > 53.5 - 0.01 && a.p[0] < 54.5 + 0.01 && a.p[1] > 15.0 && a.p[1] < 35.0 {
                     in_gap += 1;
                 }
             }
         }
         assert!(in_gap > 50, "the gap is cut at the skin's top ({in_gap} samples)");
-        // and all the way round: beside the middle of every side of both plates, 3.2 to 4.8 out
+        // and all the way round: beside the middle of every side of both plates, 3.5 to 5 out
         let low: Vec<[f64; 3]> =
             band.iter().flat_map(|o| sample(o, [0.0, 0.0, 5.0])).filter(|a| !a.rapid && near(a.p[2], -5.5)).map(|a| a.p).collect();
         for (x0, x1) in [(10.0, 50.0), (58.0, 98.0)] {
             let xm = (x0 + x1) / 2.0;
-            for (side, q) in [("front", [xm, 10.0 - 4.0]), ("back", [xm, 40.0 + 4.0]), ("left", [x0 - 4.0, 25.0]), ("right", [x1 + 4.0, 25.0])] {
+            for (side, q) in [("front", [xm, 10.0 - 4.25]), ("back", [xm, 40.0 + 4.25]), ("left", [x0 - 4.25, 25.0]), ("right", [x1 + 4.25, 25.0])] {
                 assert!(
                     low.iter().any(|p| (p[0] - q[0]).hypot(p[1] - q[1]) < 1.0),
                     "nothing cut at −5.5 beside the {side} of the plate at x {x0}…{x1}"
@@ -786,19 +812,23 @@ mod plan_tests {
             }
         }
 
-        // the contour, 3 outside each plate down to the skin's top
+        // the contour: the wall passes leaving 0.3 and 0.1, 3.3 and 3.1 outside each plate,
+        // level by level down to the skin's top
         let contour: Vec<&Operation> = ops.iter().filter(|o| o.kind == OpKind::Profile).collect();
         let levels: Vec<f64> = contour.iter().map(|o| o.deepest()).collect();
         assert_eq!(levels.len(), 4, "{levels:?}");
         assert!(near(levels[0], -2.75) && near(levels[1], -2.75) && near(levels[2], -5.5) && near(levels[3], -5.5), "{levels:?}");
-        // the separation: 3 outside each plate, level by level, both plates at each
+        // the separation: the last pass, 3 outside each plate, at −2.75 and −5.5, then through the
+        // skin; level by level, both plates at each
         let sep: Vec<&Operation> = ops.iter().filter(|o| o.kind == OpKind::Separation).collect();
-        let want: Vec<f64> = (1..=7).flat_map(|k| [-5.5 - 0.1 * k as f64; 2]).collect();
+        let want: Vec<f64> = [-2.75, -5.5].into_iter().chain((1..=7).map(|k| -5.5 - 0.1 * k as f64)).flat_map(|z| [z; 2]).collect();
         let got: Vec<f64> = sep.iter().map(|o| o.deepest()).collect();
         assert!(got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-9), "{got:?}");
         for o in contour.iter().chain(&sep) {
             assert_eq!(o.tool, 1, "the Ø6");
             let level = o.deepest();
+            let offsets: &[f64] = if o.kind == OpKind::Profile { &[3.3, 3.1] } else { &[3.0] };
+            let mut seen = vec![false; offsets.len()];
             // between rapids the tool only ever goes down (no tabs to climb over)
             let mut prev = f64::INFINITY;
             for a in sample(o, [0.0, 0.0, 5.0]) {
@@ -809,10 +839,13 @@ mod plan_tests {
                 assert!(a.p[2] <= prev + 1e-9, "{:?} rises", a.p);
                 prev = a.p[2];
                 if a.p[2] < 0.0 {
-                    assert!((to_plates(a.p) - 3.0).abs() <= 0.006, "{:?} is {:.4} from a plate", a.p, to_plates(a.p));
+                    let k = offsets.iter().position(|w| (to_plates(a.p) - w).abs() <= 0.006);
+                    let k = k.unwrap_or_else(|| panic!("{:?} is {:.4} from a plate", a.p, to_plates(a.p)));
+                    seen[k] = true;
                     assert!(a.p[2] >= level - 1e-9);
                 }
             }
+            assert!(seen.iter().all(|s| *s), "{:?} at {level}: every pass", o.kind);
         }
         // kind by kind, each level by level over the sheet; the separation last
         let first_sep = ops.iter().position(|o| o.kind == OpKind::Separation).unwrap();
@@ -832,8 +865,9 @@ mod plan_tests {
 
     /// A 60 × 40 plate 6 thick with a 20 × 14 cutout through its middle, `skin` cut-out: the
     /// cutout is roughed and its walls finished down to the skin's top (z 0.5), no deeper; the
-    /// skin is cut through inside it climbing (clockwise) on the 14 × 8 rectangle 3 in from its
-    /// walls, as well as 3 round the outside, down to −0.2.
+    /// separation's last pass runs 3 round the outside down to the skin, then the skin is cut
+    /// through inside the cutout climbing (clockwise) on the 14 × 8 rectangle 3 in from its
+    /// walls, as well as round the outside, down to −0.2.
     #[test]
     fn the_skin_is_cut_through_inside_a_cutout_too() {
         let plate = box_solid(v(-30.0, -20.0, 0.0), v(30.0, 20.0, 6.0)).unwrap();
@@ -848,7 +882,12 @@ mod plan_tests {
             let d = plan.ops.iter().filter(|o| o.kind == kind).map(|o| o.deepest()).fold(f64::INFINITY, f64::min);
             assert!((d - 0.5).abs() < 1e-9, "{kind:?} down to {d}");
         }
-        let sep: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Separation).collect();
+        // the separation's last pass round the outline at 3.25 and 0.5 (6 down to the skin in
+        // levels of at most 3), then the skin, 0.5 to −0.2 in 0.1 steps, inside the cutout too
+        let all: Vec<f64> = plan.ops.iter().filter(|o| o.kind == OpKind::Separation).map(|o| o.deepest()).collect();
+        assert_eq!(all.len(), 9, "{all:?}");
+        assert!((all[0] - 3.25).abs() < 1e-9 && (all[1] - 0.5).abs() < 1e-9, "{all:?}");
+        let sep: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Separation && o.deepest() < 0.5 - 1e-9).collect();
         assert_eq!(sep.len(), 7, "0.5 to −0.2 in 0.1 steps");
         for o in &sep {
             let inside: Vec<[f64; 3]> =
@@ -1245,15 +1284,44 @@ mod adaptive_tests {
     }
 
     /// The pocket's region the cutter's centre may reach at a level: the 40 × 24 pocket shrunk
-    /// by the radius (3) and the stock to leave (0.2): |x| ≤ 16.8, |y| ≤ 8.8.
+    /// by the radius (3) and the stock to leave on walls (0.5): |x| ≤ 16.5, |y| ≤ 8.5.
     fn in_reach(p: [f64; 3]) -> bool {
-        p[0].abs() <= 16.8 + 0.01 && p[1].abs() <= 8.8 + 0.01
+        p[0].abs() <= 16.5 + 0.01 && p[1].abs() <= 8.5 + 0.01
     }
 
-    /// Engagement stays within the limit (default here 90°: 1.3 × the straight cut's 45.6° is
-    /// less) at both levels, to within the replay's resolution (rays every 1.9°, a 0.04 mm grid);
-    /// no move takes the centre outside its region; and the last level is cut everywhere the
-    /// cutter can reach.
+    /// The most a pass may engage within a step (0.9) of the region's edge, where a front meets a
+    /// wall: a quarter of the cutter and a straight cut's engagement at the step, 90° +
+    /// acos(1 − 0.9/3) = 135.6°.
+    fn wall_limit() -> f64 {
+        90.0 + (1.0f64 - 0.9 / 3.0).acos().to_degrees()
+    }
+
+    /// Engagement at the samples (each with its distance from the centres' region's edge): within
+    /// the limit (default here 90°: 1.3 × the straight cut's 45.6° is less) farther than a step
+    /// (and 0.1 of slack) from the edge, within `wall_limit` nearer, to within the replay's
+    /// resolution (rays every 1.9°, a 0.04 mm grid): p99 and max of each.
+    fn engagement_ok(what: &str, engaged: &[(f64, f64)]) {
+        let split = |wall: bool| {
+            let mut e: Vec<f64> = engaged.iter().filter(|(_, d)| (*d <= 0.9 + 0.1) == wall).map(|(e, _)| *e).collect();
+            e.sort_by(f64::total_cmp);
+            e
+        };
+        for (wall, limit) in [(false, 90.0), (true, wall_limit())] {
+            let e = split(wall);
+            if e.is_empty() {
+                continue;
+            }
+            let (p99, max) = (e[(e.len() - 1) * 99 / 100], *e.last().unwrap());
+            assert!(
+                p99 <= limit && max <= limit + 6.0,
+                "{what}, {}: p99 {p99:.1}°, max {max:.1}° (limit {limit:.1}°)",
+                if wall { "by the walls" } else { "inside" }
+            );
+        }
+    }
+
+    /// Engagement stays within the limits (`engagement_ok`) at both levels; no move takes the
+    /// centre outside its region; and the last level is cut everywhere the cutter can reach.
     #[test]
     fn adaptive_keeps_engagement_and_clears_the_pocket() {
         let op = roughing(&plate(&[[-20.0, -12.0, 20.0, 12.0]]), &job(""));
@@ -1261,18 +1329,18 @@ mod adaptive_tests {
             let seen = replay_level(&op, z, above);
             let mut e: Vec<f64> = seen.engaged.iter().map(|e| e.0).collect();
             assert!(e.len() > 1000, "level {z} has {} samples", e.len());
+            let edge = |p: [f64; 3]| (16.5 - p[0].abs()).min(8.5 - p[1].abs());
+            let with: Vec<(f64, f64)> = seen.engaged.iter().zip(&seen.at).map(|(e, p)| (e.0, edge(*p))).collect();
+            engagement_ok(&format!("level {z}"), &with);
             e.sort_by(f64::total_cmp);
-            let p99 = e[(e.len() - 1) * 99 / 100];
-            let max = *e.last().unwrap();
-            assert!(p99 <= 90.0 && max <= 90.0 + 6.0, "level {z}: p99 {p99:.1}°, max {max:.1}°");
             let median = e[e.len() / 2];
             assert!(median > 20.0, "level {z}: the cutter mostly works ({median:.1}° median)");
             if z == 4.2 {
-                let mut x: f64 = -19.75;
-                while x < 19.75 {
-                    let mut y: f64 = -11.75;
-                    while y < 11.75 {
-                        let corner = x.abs() > 16.8 && y.abs() > 8.8;
+                let mut x: f64 = -19.25;
+                while x < 19.25 {
+                    let mut y: f64 = -11.25;
+                    while y < 11.25 {
+                        let corner = x.abs() > 16.5 && y.abs() > 8.5;
                         assert!(corner || seen.replay.is_cut(x, y), "({x:.2}, {y:.2}) left uncut");
                         y += 0.25;
                     }
@@ -1583,8 +1651,10 @@ mod adaptive_tests {
     /// Adaptive on the slot test parts (tests/cam: slot-plate, stepped-slot, cross-slot,
     /// odd-slots) with a Ø6 cutter, 0.9 mm stepover, 3 mm stepdown: for each slot, replayed on a
     /// 0.05 mm grid round it at its last roughing level (0.2 above its floor; 0.5 through, the skin's top),
-    /// engagement stays within the 90° default, every point the cutter can reach (within 3 of a
-    /// point 3.2 inside the wall) is cut, and the centre stays 3.2 from the wall. A cross's reach
+    /// engagement stays within the limits (`engagement_ok`), every point the cutter can reach
+    /// (within 3 of a point 3.5 inside the wall: the radius and the 0.5 roughing leaves on walls)
+    /// is cut, and the centre stays 3.5 from the wall; in a slot too narrow for that (marked
+    /// `slotting`, and announced) 3.02. A cross's reach
     /// is its two arms'; a sharp corner's tip is out of reach.
     #[test]
     fn adaptive_clears_the_slot_test_parts() {
@@ -1640,10 +1710,10 @@ mod adaptive_tests {
                 let (lo, hi) = slot.bounds();
                 let grid = Replay::over([lo[0] - 4.0, lo[1] - 4.0], [hi[0] + 4.0, hi[1] + 4.0], 0.05);
                 let seen = replay_level_on(&sampled, z, above, grid);
-                let mut e: Vec<f64> = seen.engaged.iter().map(|e| e.0).collect();
-                assert!(!e.is_empty(), "{name}: nothing cut at {z} in the slot at {c:?}");
-                e.sort_by(f64::total_cmp);
-                let (p99, max) = (e[(e.len() - 1) * 99 / 100], *e.last().unwrap());
+                assert!(!seen.engaged.is_empty(), "{name}: nothing cut at {z} in the slot at {c:?}");
+                // how far inside the wall the centre stays: the radius and the 0.5 left on walls,
+                // or, in a slot too narrow for that, the radius and 0.02
+                let keep = if feat["adaptive"] == "slotting" { 3.02 } else { 3.5 };
                 if feat["adaptive"] == "slotting" {
                     let at = format!("({:.1}, {:.1})", c[0], c[1]);
                     assert!(
@@ -1652,7 +1722,9 @@ mod adaptive_tests {
                         plan.warnings
                     );
                 } else {
-                    assert!(p99 <= 90.0 && max <= 96.0, "{name}, slot at {c:?}, level {z}: p99 {p99:.1}°, max {max:.1}°");
+                    // each sample's distance from the centres' region's edge, 3.5 inside the wall
+                    let with: Vec<(f64, f64)> = seen.engaged.iter().zip(&seen.at).map(|(e, p)| (e.0, -slot.sdf([p[0], p[1]]) - keep)).collect();
+                    engagement_ok(&format!("{name}, slot at {c:?}, level {z}"), &with);
                 }
                 // the gouge check uses the slot's true outline, sampled every 0.02 mm
                 let outline = slot.outline(0.02);
@@ -1676,12 +1748,12 @@ mod adaptive_tests {
                 for st in &sampled {
                     for s in st.iter().filter(|s| (s.p[2] - z).abs() < 1e-9 && seen.replay.inside(s.p)).step_by(4) {
                         let d = depth([s.p[0], s.p[1]]);
-                        assert!(d >= 3.2 - 0.02, "{name}: the centre at {:?} is {d:.3} from the slot's wall", s.p);
+                        assert!(d >= keep - 0.02, "{name}: the centre at {:?} is {d:.3} from the slot's wall", s.p);
                     }
                 }
-                // Where the cutter can reach: within 3 of a centre 3.2 inside the wall. A point that
+                // Where the cutter can reach: within 3 of a centre 3.5 inside the wall. A point that
                 // deep is itself reached; any other is near the edge of the centres' region, so
-                // only centres on that edge (3.2 to 3.3 deep, every 0.1) are stamped, each with
+                // only centres on that edge (3.5 to 3.6 deep, every 0.1) are stamped, each with
                 // the points within 2.95 of it (0.05 of slack: the planner's region is built from
                 // offsets drawn as chords within 0.01 and paths within 0.005, so its rounded
                 // corners sit a little inside).
@@ -1693,7 +1765,7 @@ mod adaptive_tests {
                     for j in 0..gy {
                         let p = [lo[0] + i as f64 * h, lo[1] + j as f64 * h];
                         let d = slot.sdf(p);
-                        if !(-3.3..=-3.2).contains(&d) {
+                        if !(-keep - 0.1..=-keep).contains(&d) {
                             continue;
                         }
                         for di in -k..=k {
@@ -1715,7 +1787,7 @@ mod adaptive_tests {
                 for i in 0..gx {
                     for j in 0..gy {
                         let (x, y) = (lo[0] + i as f64 * h, lo[1] + j as f64 * h);
-                        if (i % 4 != 0 || j % 4 != 0) || !(slot.sdf([x, y]) <= -3.2 || reach[i * gy + j]) {
+                        if (i % 4 != 0 || j % 4 != 0) || !(slot.sdf([x, y]) <= -keep || reach[i * gy + j]) {
                             continue;
                         }
                         checked += 1;
