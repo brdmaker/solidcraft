@@ -14,9 +14,12 @@ use crate::{CamError, Result};
 /// The most pixels a preview may have on its longer side.
 pub const MAX_PIXELS: u32 = 8192;
 
-/// What to draw, in sheet coordinates (mm, X right, Y back, Z0 the sheet's top).
+/// What to draw: the sheet from its front-left corner, the outlines and paths in work
+/// coordinates (mm, X right, Y back, Z0 the sheet's top), work zero at `origin` on the sheet.
 pub struct Scene<'a> {
     pub sheet: [f64; 2],
+    /// Where work zero is on the sheet, from its front-left corner.
+    pub origin: [f64; 2],
     pub margin: f64,
     /// Each placed part's outline (turned and moved onto the sheet).
     pub outlines: &'a [Area],
@@ -112,6 +115,18 @@ pub fn png(scene: &Scene, width: u32) -> Result<Vec<u8>> {
         dashed.dash = StrokeDash::new(vec![6.0 / scale as f32, 4.0 / scale as f32], 0.0);
         pm.stroke_path(&PathBuilder::from_rect(rect), &paint("#a7b0b9", 1.0), &dashed, tf, None);
     }
+    // work zero: a small cross; everything after is in work coordinates
+    let [ox, oy] = scene.origin;
+    let mut cross = PathBuilder::new();
+    let arm = 0.02 * w.max(h);
+    cross.move_to((ox - arm) as f32, oy as f32);
+    cross.line_to((ox + arm) as f32, oy as f32);
+    cross.move_to(ox as f32, (oy - arm) as f32);
+    cross.line_to(ox as f32, (oy + arm) as f32);
+    if let Some(path) = cross.finish() {
+        pm.stroke_path(&path, &paint("#c62828", 1.0), &line(1.5), tf, None);
+    }
+    let tf = tf.pre_translate(ox as f32, oy as f32);
     // the parts
     for a in scene.outlines {
         let mut pb = PathBuilder::new();
@@ -243,6 +258,18 @@ pub fn svg(scene: &Scene) -> String {
             h - 2.0 * m
         );
     }
+    // work zero, then everything in work coordinates
+    let [ox, oy] = scene.origin;
+    let arm = 0.02 * w.max(h);
+    let _ = write!(
+        s,
+        r##"<path d="M{:.3} {oy:.3}H{:.3}M{ox:.3} {:.3}V{:.3}" stroke="#c62828" stroke-width="0.5"><title>work zero</title></path>"##,
+        ox - arm,
+        ox + arm,
+        oy - arm,
+        oy + arm
+    );
+    let _ = write!(s, r#"<g transform="translate({ox:.3} {oy:.3})">"#);
     for a in scene.outlines {
         let mut d = String::new();
         for ring in a.rings() {
@@ -294,7 +321,7 @@ pub fn svg(scene: &Scene) -> String {
     }
     let _ = write!(s, r##"<path d="{rapids}" stroke="#9aa3ad" stroke-width="0.2" stroke-opacity="0.6"/>"##);
     s.push_str(&cuts);
-    s.push_str("</g>");
+    s.push_str("</g></g>");
     // legend, under the sheet
     let size = legend_h * 0.35;
     let mut x = 0.0;

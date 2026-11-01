@@ -477,7 +477,7 @@ mod nest_tests {
     use crate::region::Area;
 
     fn stock(w: f64, h: f64, t: f64) -> Stock {
-        Stock { size: [w, h], thickness: t, material: String::new(), spoilboard_allowance: 0.2 }
+        Stock { size: [w, h], thickness: t, material: String::new(), spoilboard_allowance: 0.2, origin: crate::job::Origin::TopFrontLeft }
     }
 
     fn opts(margin: f64, spacing: f64, rotate: bool) -> NestOptions {
@@ -808,6 +808,44 @@ mod plan_tests {
         rect_dist(p, 10.0, 10.0, 50.0, 40.0).min(rect_dist(p, 58.0, 10.0, 98.0, 40.0))
     }
 
+    /// Work zero in the sheet's top centre (the default) moves every path by half the sheet:
+    /// the same two plates planned with the corner as work zero, less (55, 25), move by move.
+    #[test]
+    fn work_zero_defaults_to_the_top_centre() {
+        use crate::nest::Placement;
+        use crate::plan::plan_sheet;
+        let plate = box_solid(v(-20.0, -15.0, 0.0), v(20.0, 15.0, 6.0)).unwrap();
+        let f = read_part(&plate).unwrap();
+        let sheet = |origin: &str| {
+            Job::from_json(&format!(
+                r#"{{"stock": {{"size": [110, 50], "thickness": 6 {origin}}}, "tools": [{FLAT6}, {FLAT3}], "parts": [{{"body": "P"}}]}}"#
+            ))
+            .unwrap()
+        };
+        let pls = |copy: u32, x: f64| Placement { part: 0, label: "P".into(), copy, quarter_turns: 0, offset: [x, 25.0], bounds: [[0.0; 2]; 2] };
+        let centre = sheet("");
+        assert_eq!(centre.stock.work_zero(), [55.0, 25.0]);
+        let corner = sheet(r#", "origin": "top_front_left""#);
+        assert_eq!(corner.stock.work_zero(), [0.0, 0.0]);
+        let plan = plan_part(&f, &centre, "P").unwrap();
+        let (a, _) = plan_sheet(&centre, &[(&f, &plan)], &[pls(0, 30.0), pls(1, 78.0)]).unwrap();
+        let (b, _) = plan_sheet(&corner, &[(&f, &plan)], &[pls(0, 30.0), pls(1, 78.0)]).unwrap();
+        assert_eq!(a.len(), b.len());
+        let mut n = 0;
+        for (oa, ob) in a.iter().zip(&b) {
+            assert_eq!(oa.moves.len(), ob.moves.len());
+            for (ma, mb) in oa.moves.iter().zip(&ob.moves) {
+                let (pa, pb) = (ma.end(), mb.end());
+                assert!(
+                    (pa[0] - (pb[0] - 55.0)).abs() < 1e-9 && (pa[1] - (pb[1] - 25.0)).abs() < 1e-9 && (pa[2] - pb[2]).abs() < 1e-12,
+                    "{pa:?} vs {pb:?}"
+                );
+                n += 1;
+            }
+        }
+        assert!(n > 1000);
+    }
+
     /// Two 40 × 30 plates 6 thick on a 110 × 50 sheet 6 thick, 8 apart (x 10…50 and 58…98, y
     /// 10…40), with the `skin` cut-out (Ø6 roughing and contour, Ø3 finishing):
     /// - roughing clears a band round them down to the skin's top, −6 + 0.5 = −5.5, in levels of
@@ -828,7 +866,7 @@ mod plan_tests {
         let f = read_part(&plate).unwrap();
         let sheet = |extra: &str| {
             Job::from_json(&format!(
-                r#"{{"stock": {{"size": [110, 50], "thickness": 6}}, "tools": [{FLAT6}, {FLAT3}], "parts": [{{"body": "P"}}] {extra}}}"#
+                r#"{{"stock": {{"size": [110, 50], "thickness": 6, "origin": "top_front_left"}}, "tools": [{FLAT6}, {FLAT3}], "parts": [{{"body": "P"}}] {extra}}}"#
             ))
             .unwrap()
         };
@@ -1882,5 +1920,27 @@ mod adaptive_tests {
             assert!(area[0].0 == area[1].0 && area[2].0 == area[3].0 && area[0].0 != area[2].0, "{pattern} by area: {area:?}");
             assert!(area[0].1 > area[1].1 && area[2].1 > area[3].1, "{pattern} by area, top level first: {area:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod scene_tests {
+    use solidcraft_geom::Vec3;
+
+    /// A binary STL: 80-byte header, the count, 50 bytes a triangle; a 1 × 2 × 3 box as written
+    /// for the stock: 12 triangles facing out (their signed volumes add up to +6).
+    #[test]
+    fn stl_files_are_binary_and_boxes_face_out() {
+        let tris: Vec<[Vec3; 3]> = vec![[Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)]];
+        let b = crate::scene::stl("t", &tris);
+        assert_eq!(b.len(), 84 + 50);
+        assert_eq!(u32::from_le_bytes([b[80], b[81], b[82], b[83]]), 1);
+        let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        assert_eq!((f(84), f(88), f(92)), (0.0, 0.0, 1.0), "the normal");
+        assert_eq!((f(108), f(112), f(116)), (1.0, 0.0, 0.0), "the second corner");
+        let stock = crate::scene::stock_tris([0.0, 0.0, -3.0], [1.0, 2.0, 0.0]);
+        assert_eq!(stock.len(), 12);
+        let vol: f64 = stock.iter().map(|t| t[0].dot(t[1].cross(t[2])) / 6.0).sum();
+        assert!((vol - 6.0).abs() < 1e-12, "{vol}");
     }
 }

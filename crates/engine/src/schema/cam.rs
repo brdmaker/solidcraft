@@ -49,3 +49,26 @@ pub struct JobNestResult {
     pub parts: Vec<NestedPart>,
     pub nesting: solidcraft_cam::nest::Nesting,
 }
+
+/// A job to plan and export as models for a machine's own viewer.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct JobExportSceneParams {
+    /// The job (as for `cam.job.nest`): an object or the path of a job file.
+    pub job: serde_json::Value,
+    /// The folder to write into: `scene.json`, `stock.stl`, `placed.stl` and `parts/*.stl`.
+    pub path: String,
+}
+
+/// What `cam.job.export_scene` returns.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct JobExportSceneResult {
+    /// The folder written into.
+    pub path: String,
+    /// The files written, relative to it.
+    pub files: Vec<String>,
+    /// What `scene.json` says.
+    pub scene: solidcraft_cam::scene::SceneDoc,
+    /// The plan's warnings (faces not machined, copies not placed...).
+    pub warnings: Vec<String>,
+}

@@ -611,9 +611,10 @@ fn placed_paths_are_turned_moved_and_lowered() {
     use crate::plan::plan_sheet;
     use crate::toolpath::Move;
     let (f, plan) = plan_fixture(0, 10.0);
-    let job =
-        crate::job::Job::from_json(&format!(r#"{{"stock": {{"size": [600, 400], "thickness": 10}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}]}}"#))
-            .unwrap();
+    let job = crate::job::Job::from_json(&format!(
+        r#"{{"stock": {{"size": [600, 400], "thickness": 10, "origin": "top_front_left"}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}]}}"#
+    ))
+    .unwrap();
     let pl = Placement { part: 0, label: "P".into(), copy: 1, quarter_turns: 1, offset: [100.0, 50.0], bounds: [[0.0; 2]; 2] };
     let (all, _) = plan_sheet(&job, &[(&f, &plan)], &[pl]).unwrap();
     assert!(all.windows(2).all(|w| w[0].kind.rank() <= w[1].kind.rank()), "in machining order");
@@ -661,7 +662,7 @@ fn the_preview_draws_the_toolpaths_where_they_are() {
         solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
             .unwrap();
     let job = crate::job::Job::from_json(&format!(
-        r#"{{"stock": {{"size": [220, 220], "thickness": 10}}, "nest": {{"margin": 10, "spacing": 10}}, "tools": {TOOLS},
+        r#"{{"stock": {{"size": [220, 220], "thickness": 10, "origin": "top_front_left"}}, "nest": {{"margin": 10, "spacing": 10}}, "tools": {TOOLS},
             "strategy": {{"countersinks": "chamfer_mill", "cut_out": {{"method": "profile"}}}}, "parts": [{{"body": "F", "quantity": 4}}]}}"#
     ))
     .unwrap();
@@ -669,7 +670,7 @@ fn the_preview_draws_the_toolpaths_where_they_are() {
     assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     assert_eq!(plan.nesting.placements.len(), 4);
     let outlines = plan.placed_outlines();
-    let scene = Scene { sheet: [220.0, 220.0], margin: 10.0, outlines: &outlines, ops: &plan.ops, clearance: 5.0 };
+    let scene = Scene { sheet: [220.0, 220.0], origin: [0.0, 0.0], margin: 10.0, outlines: &outlines, ops: &plan.ops, clearance: 5.0 };
 
     // 1100 px wide: the sheet plus 4 % of 220 each side (8.8 mm), 4.545... px per mm
     let bytes = png(&scene, 1100).unwrap();

@@ -948,7 +948,8 @@ fn place_move(m: &Move, q: u8, d: [f64; 2], dz: f64) -> Move {
     }
 }
 
-/// The whole sheet's operations, in sheet coordinates, and what could not be done.
+/// The whole sheet's operations, in work coordinates (`placements` are from the sheet's
+/// front-left corner), and what could not be done.
 ///
 /// Every placed copy's operations, and with the `skin` cut-out the roughing of a band round
 /// the parts (the nest's spacing wide, so the gaps between parts are cleared whole) down to the
@@ -1027,7 +1028,17 @@ pub fn plan_sheet(job: &Job, parts: &[(&PartFeatures, &PartPlan)], placements: &
     all.sort_by(|a, b| {
         a.1.kind.rank().cmp(&b.1.kind.rank()).then(a.1.tool.cmp(&b.1.tool)).then(by_depth(&a.1).total_cmp(&by_depth(&b.1))).then(a.0.cmp(&b.0))
     });
-    Ok((all.into_iter().map(|(_, op)| op).collect(), warnings))
+    // from the sheet's corner to work zero
+    let zero = job.stock.work_zero();
+    Ok((
+        all.into_iter()
+            .map(|(_, mut op)| {
+                op.moves = op.moves.iter().map(|m| place_move(m, 0, [-zero[0], -zero[1]], 0.0)).collect();
+                op
+            })
+            .collect(),
+        warnings,
+    ))
 }
 
 /// A whole job planned: each part's features and toolpaths, the nesting, and the sheet's
@@ -1037,6 +1048,7 @@ pub struct JobPlan {
     /// Which of each part's axes is up on the machine (its `orient`, or the one `auto` chose).
     pub ups: Vec<crate::job::Up>,
     pub plans: Vec<PartPlan>,
+    /// The nesting in work coordinates.
     pub nesting: crate::nest::Nesting,
     pub ops: Vec<Operation>,
     /// Every part's warnings, and every copy that did not go on the sheet.
@@ -1071,11 +1083,12 @@ pub fn plan_job(job: &Job, bodies: &[solidcraft_kernel::Body]) -> Result<JobPlan
     let pairs: Vec<(&PartFeatures, &PartPlan)> = features.iter().zip(&plans).collect();
     let (ops, sheet_warnings) = plan_sheet(job, &pairs, &nesting.placements)?;
     warnings.extend(sheet_warnings);
+    let nesting = nesting.in_work(job.stock.work_zero());
     Ok(JobPlan { features, ups, plans, nesting, ops, warnings })
 }
 
 impl JobPlan {
-    /// Every placed copy's outline on the sheet.
+    /// Every placed copy's outline, in work coordinates.
     pub fn placed_outlines(&self) -> Vec<Area> {
         self.nesting
             .placements

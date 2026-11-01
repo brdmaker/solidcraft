@@ -9,12 +9,13 @@ use solidcraft_cam::part::{PartFeatures, oriented};
 
 use super::CommandSpec;
 use crate::params::bad;
-use crate::schema::cam::{JobNestParams, JobNestResult, NestedPart, PartInspectParams};
+use crate::schema::cam::{JobExportSceneParams, JobExportSceneResult, JobNestParams, JobNestResult, NestedPart, PartInspectParams};
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
 
 const PART_INSPECT_CONTRACT: TypedContract<PartInspectParams> = TypedContract::new();
 const JOB_NEST_CONTRACT: TypedContract<JobNestParams> = TypedContract::new();
+const JOB_EXPORT_SCENE_CONTRACT: TypedContract<JobExportSceneParams> = TypedContract::new();
 
 /// Largest job file read (bytes).
 const MAX_JOB_BYTES: usize = 4 << 20;
@@ -32,19 +33,34 @@ pub static COMMANDS: &[CommandSpec] = &[
          kind cylinder|cone, z and radius at top and bottom); chamfers (sloped bands: z range, width, angle, on outline|opening); cutouts \
          (through openings that aren't round); unsupported (faces it cannot machine, each with its reason). Read-only",
         ),
+    CommandSpec::new("cam.job.export_scene", "Export Job Scene", crate::checked!("cam.job.export_scene", job_export_scene))
+        .icon("export")
+        .noundo()
+        .contract(&JOB_EXPORT_SCENE_CONTRACT)
+        .output(output_schema_for::<JobExportSceneResult>)
+        .params(
+            "job: as for cam.job.nest; path: a folder → plans the job and writes, for a machine's own viewer (a LinuxCNC screen), \
+             scene.json (version, units mm, work_zero, stock {size [w, d, t], min, max, material, model}, parts [{name, design, body, \
+             up, model, copies [{copy, rotation_deg, translation, matrix (row-major 4x4: work point = matrix x model point), min, max}]}], \
+             placed_model, unplaced), stock.stl, parts/<n>-<name>.stl (each part as machined, its own coordinates) and placed.stl \
+             (every copy placed). Work coordinates: Z0 the sheet's top, X right, Y back, work zero at stock.origin (top_center by \
+             default). Returns the files written, the scene and the plan's warnings",
+        ),
     CommandSpec::new("cam.job.nest", "Nest Job", crate::checked!("cam.job.nest", job_nest))
         .icon("list")
         .noundo()
         .contract(&JOB_NEST_CONTRACT)
         .output(output_schema_for::<JobNestResult>)
         .params(
-            "job: a job object or the path of a job file: {stock: {size: [width, depth], thickness, material?, spoilboard_allowance? (0.2)}, \
+            "job: a job object or the path of a job file: {stock: {size: [width, depth], thickness, material?, spoilboard_allowance? (0.2), \
+             origin? (top_center | top_front_left)}, \
              nest?: {margin? (10), spacing? (8), rotate? (true)}, tools?: [{number, kind: flat|drill|chamfer, diameter, flute_length, \
              rpm, feed, plunge, flutes?, tip_angle_deg?, stepdown?, stepover? (fraction), peck?}], parts: [{body, design? (.sc or STEP, \
              relative to the job file; empty: the open design), quantity? (1), name?, orient? (auto | +z | -z | +x | -x | +y | -y: which \
              of the part's axes is up; auto picks one that fits the sheet, then with the fewest faces unreachable from the top, then \
              the largest flat bottom)}]} → each part's axis up, height, box and outline area, \
-             and the layout on the sheet (work zero at the sheet's top front-left corner, X right, Y back): placements {part, copy, \
+             and the layout on the sheet in work coordinates (work zero at stock.origin: top_center (default) or top_front_left; X \
+             right, Y back): placements {part, copy, \
              quarter_turns, offset, bounds}, unplaced copies with the reason, utilisation. Bounding-box nesting with 90° turns. Read-only",
         ),
 ];
@@ -87,8 +103,30 @@ fn job_nest(s: &mut Session, p: &Value) -> Result<Value> {
         .zip(&features)
         .map(|(p, f)| NestItem { label: p.label(), quantity: p.quantity, outline: &f.outline, height: f.top_z - f.bottom_z })
         .collect();
-    let nesting = nest(&job.stock, &job.nest, &items);
+    let nesting = nest(&job.stock, &job.nest, &items).in_work(job.stock.work_zero());
     let result = JobNestResult { sheet: job.stock.size, thickness: job.stock.thickness, parts, nesting };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+fn job_export_scene(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.job.export_scene";
+    let dir = p.get("path").and_then(Value::as_str).ok_or_else(|| bad(cmd, "path: the folder to write the scene into"))?.to_string();
+    let (job, base) = read_job(s, p.get("job").ok_or_else(|| bad(cmd, "job: a job object or the path of a job file"))?)?;
+    let bodies = job.parts.iter().map(|part| part_body(s, base.as_deref(), part)).collect::<Result<Vec<_>>>()?;
+    let plan = solidcraft_cam::plan::plan_job(&job, &bodies).map_err(|e| EngineError::Other(e.to_string()))?;
+    let out = solidcraft_cam::scene::export(&job, &bodies, &plan).map_err(|e| EngineError::Other(e.to_string()))?;
+    let folder = Path::new(&dir);
+    let fail = |f: &Path, e: String| EngineError::Other(format!("{}: {e}", f.display()));
+    solidcraft_io::vfs::create_dir_all(&folder.join("parts").to_string_lossy()).map_err(|e| fail(folder, e.to_string()))?;
+    let mut files = vec!["scene.json".to_string()];
+    let json_path = folder.join("scene.json");
+    solidcraft_io::vfs::write(&json_path.to_string_lossy(), out.json.as_bytes()).map_err(|e| fail(&json_path, e.to_string()))?;
+    for (name, bytes) in &out.files {
+        let f = folder.join(name);
+        solidcraft_io::vfs::write(&f.to_string_lossy(), bytes).map_err(|e| fail(&f, e.to_string()))?;
+        files.push(name.clone());
+    }
+    let result = JobExportSceneResult { path: dir, files, scene: out.doc, warnings: plan.warnings };
     serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
 }
 

@@ -43,7 +43,14 @@ fn run() -> Result<(), String> {
         println!("{}: {} up", p.label(), serde_json::to_string(up).unwrap_or_default().trim_matches('"'));
     }
     let outlines = plan.placed_outlines();
-    let scene = Scene { sheet: job.stock.size, margin: job.nest.margin, outlines: &outlines, ops: &plan.ops, clearance: job.strategy.clearance };
+    let scene = Scene {
+        sheet: job.stock.size,
+        origin: job.stock.work_zero(),
+        margin: job.nest.margin,
+        outlines: &outlines,
+        ops: &plan.ops,
+        clearance: job.strategy.clearance,
+    };
     if out.ends_with(".svg") {
         std::fs::write(out, svg(&scene)).map_err(|e| format!("{out}: {e}"))?;
     } else {

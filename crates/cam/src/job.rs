@@ -1,8 +1,10 @@
 //! A CAM job: one sheet of stock, the tools in the machine, and the parts to cut from it.
 //!
 //! The job is a small JSON document of its own (parts come from several designs). Work zero is
-//! the top face of the sheet at its front-left corner: X to the right, Y to the back, Z up, so
-//! the sheet spans X 0…width, Y 0…depth, Z −thickness…0.
+//! on the sheet's top face, by default in its middle (`stock.origin`): X to the right, Y to the
+//! back, Z up, the sheet's top at Z0 and its bottom at −thickness. Nesting works from the
+//! sheet's front-left corner (X 0…width, Y 0…depth); a planned job's paths, placements and
+//! outlines are in work coordinates.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -270,6 +272,31 @@ pub struct Stock {
     /// How far through-cuts go below the sheet into the spoilboard, mm (default 0.2).
     #[serde(default = "spoil")]
     pub spoilboard_allowance: f64,
+    /// Where work zero (X0 Y0 Z0) is on the sheet's top: `top_center` (default) or
+    /// `top_front_left`.
+    #[serde(default)]
+    pub origin: Origin,
+}
+
+/// Where work zero is: always on the sheet's top face (Z0), X right, Y back.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// The middle of the sheet's top: X −width/2…width/2, Y −depth/2…depth/2.
+    #[default]
+    TopCenter,
+    /// The sheet's front-left top corner: X 0…width, Y 0…depth.
+    TopFrontLeft,
+}
+
+impl Stock {
+    /// Where work zero lies on the sheet, measured from its front-left corner (X, Y).
+    pub fn work_zero(&self) -> [f64; 2] {
+        match self.origin {
+            Origin::TopCenter => [self.size[0] / 2.0, self.size[1] / 2.0],
+            Origin::TopFrontLeft => [0.0, 0.0],
+        }
+    }
 }
 
 fn spoil() -> f64 {

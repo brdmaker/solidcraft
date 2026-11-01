@@ -115,3 +115,59 @@ fn nest_refuses_bad_jobs() {
     );
     assert!(err(&mut s, json!("/no/such/job.json")).contains("/no/such/job.json"));
 }
+
+/// The scene of two front panels (200 × 100 × 3) on a 300 × 250 × 3 sheet, work zero in its
+/// top centre: the stock spans −150…150, −125…125, −3…0; the files are written; each copy's
+/// matrix, applied to its part's model as written, gives the copy's box; the copies lie on the
+/// sheet, from its bottom (−3) to its top (0).
+#[test]
+fn export_scene_writes_models_and_where_they_go() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-cam-scene-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let job = json!({
+        "stock": {"size": [300, 250], "thickness": 3},
+        "strategy": {"roughing": {"pattern": "offset"}},
+        "parts": [{"design": fixtures().join("front-panel.step").to_string_lossy(), "body": "Panel", "quantity": 2}]
+    });
+    let mut s = Session::default();
+    let r = run(&mut s, "cam.job.export_scene", json!({"job": job, "path": dir.to_string_lossy()}));
+    let sc = &r["scene"];
+    let v3 = |v: &Value| [v[0].as_f64().unwrap(), v[1].as_f64().unwrap(), v[2].as_f64().unwrap()];
+    assert_eq!(sc["work_zero"], "top_center");
+    assert_eq!((v3(&sc["stock"]["min"]), v3(&sc["stock"]["max"])), ([-150.0, -125.0, -3.0], [150.0, 125.0, 0.0]));
+    for f in ["scene.json", "stock.stl", "placed.stl"] {
+        assert!(dir.join(f).is_file(), "{f}");
+    }
+    let model = dir.join(sc["parts"][0]["model"].as_str().unwrap());
+    let bytes = std::fs::read(&model).unwrap();
+    let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+    assert_eq!(bytes.len(), 84 + 50 * n);
+    let fl = |o: usize| f64::from(f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]));
+    let copies = sc["parts"][0]["copies"].as_array().unwrap();
+    assert_eq!(copies.len(), 2);
+    for c in copies {
+        let m: Vec<Vec<f64>> =
+            c["matrix"].as_array().unwrap().iter().map(|row| row.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect()).collect();
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for t in 0..n {
+            for k in 0..3 {
+                let o = 84 + 50 * t + 12 + 12 * k;
+                let p = [fl(o), fl(o + 4), fl(o + 8), 1.0];
+                for (i, row) in m.iter().take(3).enumerate() {
+                    let x: f64 = row.iter().zip(&p).map(|(a, b)| a * b).sum();
+                    lo[i] = lo[i].min(x);
+                    hi[i] = hi[i].max(x);
+                }
+            }
+        }
+        let (cmin, cmax) = (v3(&c["min"]), v3(&c["max"]));
+        for i in 0..3 {
+            assert!((lo[i] - cmin[i]).abs() < 1e-3 && (hi[i] - cmax[i]).abs() < 1e-3, "{lo:?} {hi:?} vs {cmin:?} {cmax:?}");
+        }
+        assert!((cmin[2] + 3.0).abs() < 1e-3 && cmax[2].abs() < 1e-3, "on the sheet: {cmin:?} {cmax:?}");
+        assert!(cmin[0] >= -150.0 && cmax[0] <= 150.0 && cmin[1] >= -125.0 && cmax[1] <= 125.0);
+    }
+    let placed = std::fs::read(dir.join("placed.stl")).unwrap();
+    assert_eq!(u32::from_le_bytes([placed[80], placed[81], placed[82], placed[83]]) as usize, 2 * n, "both copies");
+    std::fs::remove_dir_all(&dir).ok();
+}

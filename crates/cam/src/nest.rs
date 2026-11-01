@@ -44,6 +44,19 @@ pub struct Unplaced {
     pub reason: String,
 }
 
+impl Nesting {
+    /// The same nesting with every placement moved by `(-d[0], -d[1])`: from the sheet's
+    /// front-left corner to work coordinates, when work zero lies at `d` on the sheet.
+    pub fn in_work(&self, d: [f64; 2]) -> Nesting {
+        let mut n = self.clone();
+        for p in &mut n.placements {
+            p.offset = [p.offset[0] - d[0], p.offset[1] - d[1]];
+            p.bounds = [[p.bounds[0][0] - d[0], p.bounds[0][1] - d[1]], [p.bounds[1][0] - d[0], p.bounds[1][1] - d[1]]];
+        }
+        n
+    }
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Nesting {
     pub placements: Vec<Placement>,
