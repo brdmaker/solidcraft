@@ -36,7 +36,7 @@ fn run() -> Result<(), String> {
     }
     let plan = plan_job(&job, &bodies).map_err(|e| e.to_string())?;
     let title = job.parts.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ");
-    let program = solidcraft_cam::post::linuxcnc(&job, &plan.ops, &title).map_err(|e| e.to_string())?;
+    let program = solidcraft_cam::post::linuxcnc(&job, &plan.ops, &title, &plan.warnings).map_err(|e| e.to_string())?;
     std::fs::write(out, &program).map_err(|e| format!("{out}: {e}"))?;
     println!("{} lines in {out}", program.lines().count());
     for w in &plan.warnings {

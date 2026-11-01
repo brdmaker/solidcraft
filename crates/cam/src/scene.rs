@@ -203,7 +203,7 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
     }
     files.push(("placed.stl".to_string(), stl("placed parts", &placed)));
     let title = job.parts.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ");
-    files.push(("job.ngc".to_string(), crate::post::linuxcnc(job, &plan.ops, &title)?.into_bytes()));
+    files.push(("job.ngc".to_string(), crate::post::linuxcnc(job, &plan.ops, &title, &plan.warnings)?.into_bytes()));
     let doc = SceneDoc {
         version: 1,
         units: "mm".into(),

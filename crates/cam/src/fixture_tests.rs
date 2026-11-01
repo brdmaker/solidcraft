@@ -321,9 +321,9 @@ fn plan_fixture(i: usize, thickness: f64) -> (crate::part::PartFeatures, crate::
 
 /// The front panel's four M3 countersinks (Ø3.4 holes, Ø6.6 at 90°: the cone from r 3.3 at the
 /// top, z 3, to r 1.7 at z 1.4), end-milled by default with the end mill that fits the Ø3.4 hole,
-/// T2 Ø3 (3 × 1.05 ≤ 3.4), in 16 steps of 0.1: at each step z one ring of radius
-/// 1.7 + (z − 1.4) − 1.5, the tool's edge on the cone, and nowhere past the cone; first of all
-/// on the sheet. The holes under them are bored from the panel's top (the countersinks leave
+/// T2 Ø3 (3 × 1.05 ≤ 3.4): roughed in its 1.5 stepdown (at 2.2 and 1.4), then finished in
+/// 16 steps of 0.1 from the top: at each step z one ring of radius 1.7 + (z − 1.4) − 1.5, the
+/// tool's edge on the cone; nowhere past the cone; first of all on the sheet. The holes under them are bored from the panel's top (the countersinks leave
 /// their middles), with the other through holes near the end, just before the separation.
 #[test]
 fn countersinks_are_end_milled_first_and_holes_bored_last() {
@@ -366,12 +366,16 @@ fn countersinks_are_end_milled_first_and_holes_bored_last() {
         at = to;
     }
     for c in &sinks {
-        let mut levels: Vec<(f64, f64)> =
+        let mine: Vec<(f64, f64)> =
             flat.iter().filter(|(cc, ..)| (cc[0] - c[0]).hypot(cc[1] - c[1]) < 1e-6).map(|(_, z, r)| ((z * 1e6).round() / 1e6, *r)).collect();
+        // roughed in the tool's 1.5 stepdown (1.6 deep: two steps, at 2.2 and 1.4), then finished
+        // every 0.1 from the top: the finishing rings, the last 16 levels, in order, each with
+        // the edge on the cone
+        let mut levels = mine.clone();
         levels.dedup_by(|a, b| a.0 == b.0);
-        let want: Vec<f64> = (1..=16).map(|k| ((3.0 - 0.1 * k as f64) * 1e6).round() / 1e6).collect();
+        let want: Vec<f64> = [2.2, 1.4].into_iter().chain((1..=16).map(|k| ((3.0 - 0.1 * k as f64) * 1e6).round() / 1e6)).collect();
         assert_eq!(levels.iter().map(|l| l.0).collect::<Vec<_>>(), want, "the steps at {c:?}");
-        for (z, r) in &levels {
+        for (z, r) in levels.iter().skip(2) {
             assert!((r - (cone(*z) - 1.5)).abs() < 1e-6, "at {c:?} z {z} the ring is r {r}");
         }
     }
@@ -882,8 +886,13 @@ fn the_linuxcnc_program_reads_back_as_planned() {
     .unwrap();
     let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();
     assert_eq!(plan.nesting.placements.len(), 2);
-    let program = crate::post::linuxcnc(&job, &plan.ops, "flanges").unwrap();
+    let program = crate::post::linuxcnc(&job, &plan.ops, "flanges", &plan.warnings).unwrap();
     assert!(program.starts_with("%\n") && program.trim_end().ends_with("%"));
+    // the plan's warnings in the header, a long one over several comment lines
+    let warned = crate::post::linuxcnc(&job, &plan.ops, "flanges", &["a long warning ".repeat(30), "short".into()]).unwrap();
+    let head: Vec<&str> = warned.lines().take_while(|l| !l.starts_with('G')).filter(|l| l.starts_with("(WARNING")).collect();
+    assert!(head.len() >= 4 && head.iter().all(|l| l.len() <= 256), "{head:?}");
+    assert!(head.last().unwrap().contains("short"));
     assert!(program.contains("M7"), "mist with each tool");
     let (got, facts) = read_program(&program);
     for f in ["G21", "G90", "G17", "G94", "G54", "G98", "M30"] {
@@ -1006,7 +1015,7 @@ fn the_program_opens_with_a_tool_table() {
         crate::job::Job::from_json(&format!(r#"{{"stock": {{"size": [120, 120], "thickness": 10}}, "tools": {TOOLS}, "parts": [{{"body": "F"}}]}}"#))
             .unwrap();
     let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();
-    let program = crate::post::linuxcnc(&job, &plan.ops, "flange").unwrap();
+    let program = crate::post::linuxcnc(&job, &plan.ops, "flange", &plan.warnings).unwrap();
     let first_g = program.lines().position(|l| l.starts_with('G')).unwrap();
     let table: Vec<&str> = program.lines().take(first_g).filter(|l| l.starts_with("(TOOL ")).collect();
     let mut order: Vec<u32> = Vec::new();

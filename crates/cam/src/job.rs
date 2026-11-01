@@ -39,7 +39,25 @@ pub struct Job {
     /// How the G-code is written.
     #[serde(default)]
     pub post: Post,
+    /// The machine the job runs on.
+    #[serde(default)]
+    pub machine: Machine,
     pub parts: Vec<PartRef>,
+}
+
+/// The machine's tool changer.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Machine {
+    /// Tool numbers the changer holds (default 1 to 6: the six-fork rack); a plan using any
+    /// other says so. Empty: no check.
+    pub rack: Vec<u32>,
+}
+
+impl Default for Machine {
+    fn default() -> Self {
+        Machine { rack: (1..=6).collect() }
+    }
 }
 
 /// Coolant the program turns on with each tool.
@@ -194,11 +212,14 @@ pub struct CutOut {
     pub skin: f64,
     /// Skin: depth of each pass cutting through it, mm (default 0.1).
     pub skin_stepdown: f64,
+    /// Skin: how much of it the separation leaves, mm (default 0: the parts are cut free); a
+    /// thin skin holds them on the vacuum table, to break them out by hand.
+    pub final_skin: f64,
 }
 
 impl Default for CutOut {
     fn default() -> Self {
-        CutOut { method: CutOutMethod::Skin, skin: 0.5, skin_stepdown: 0.1 }
+        CutOut { method: CutOutMethod::Skin, skin: 0.5, skin_stepdown: 0.1, final_skin: 0.0 }
     }
 }
 
@@ -662,6 +683,16 @@ impl Job {
         length("strategy.countersink_stepdown", st.countersink_stepdown, 0.01)?;
         length("strategy.cut_out.skin", st.cut_out.skin, 0.0)?;
         length("strategy.cut_out.skin_stepdown", st.cut_out.skin_stepdown, 0.01)?;
+        length("strategy.cut_out.final_skin", st.cut_out.final_skin, 0.0)?;
+        if st.cut_out.final_skin > 0.0 && st.cut_out.final_skin >= st.cut_out.skin {
+            return Err(CamError::Invalid(format!(
+                "strategy.cut_out.final_skin {} mm must be thinner than the skin, {} mm",
+                st.cut_out.final_skin, st.cut_out.skin
+            )));
+        }
+        if self.machine.rack.len() > 1000 || self.machine.rack.iter().any(|n| *n == 0 || *n > 99_999) {
+            return Err(CamError::Invalid("machine.rack: tool numbers 1 to 99999, at most 1000 of them".into()));
+        }
         if st.cut_out.skin >= s.thickness {
             return Err(CamError::Invalid(format!(
                 "strategy.cut_out.skin {} mm is not less than the sheet's thickness {} mm",

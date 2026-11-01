@@ -634,11 +634,12 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
     Ok(())
 }
 
-/// Bore the cone `s` of the hole stack `h` with the end mill that fits the hole under it, in
-/// steps of `countersink_stepdown`: at each, rings from the cone inwards a stepover apart
-/// until one lies within the hole (what is left inside, the hole's bore takes from the top
-/// down later), the tool's edge on the cone at the step's height, never past it. The cone
-/// widens upwards, so each step leaves a stair as high as the step. On the part's top face the
+/// Bore the cone `s` of the hole stack `h` with the end mill that fits the hole under it: rough
+/// it in the tool's stepdown, each step rings from the cone inwards a stepover apart until one
+/// lies within the hole (what is left inside, the hole's bore takes from the top down later);
+/// then finish it in steps of `countersink_stepdown`, one ring each with the tool's edge on the
+/// cone at the step's height, never past it. The cone widens upwards, so each step leaves a
+/// stair as high as the step. On the part's top face the
 /// countersink is cut first of all; on a floor below, after the walls.
 fn end_mill_cone(cx: &mut Ctx, h: &HoleStack, s: &crate::part::HoleStep, sinks: &mut Vec<(u32, bool, PathBuilder)>) {
     let c = h.center;
@@ -688,20 +689,38 @@ fn end_mill_cone(cx: &mut Ctx, h: &HoleStack, s: &crate::part::HoleStep, sinks: 
     };
     let Some((_, _, b)) = sinks.get_mut(k) else { return };
     let step = cx.job.strategy.countersink_stepdown;
+    // rough: steps the tool's stepdown deep, each cleared from the middle out to the cone at its
+    // depth (the cone widens upwards: nothing above is touched)
+    let mut from = s.z_top;
     let mut first = true;
-    for z in levels(s.z_top, &[s.z_bottom], step) {
+    for z in levels(s.z_top, &[s.z_bottom], t.stepdown()) {
         let radii = rings(z);
         let Some(&inner) = radii.first() else { continue };
         if first {
             b.travel_to([c[0] + inner, c[1]], s.z_top);
             b.line([c[0] + inner, c[1], s.z_top], t.plunge);
             first = false;
+        } else {
+            b.line([c[0] + inner, c[1], from], t.feed);
         }
-        // down one step on the innermost ring (cleared above), then the rings outwards
-        b.helix(c, inner, z, step, t.plunge.max(t.feed * 0.5));
+        b.helix(c, inner, z, (t.stepdown() / 2.0).min(t.diameter * 0.25), t.plunge.max(t.feed * 0.5));
         for r in radii.iter().skip(1) {
             b.circle(c, *r, z, t.feed);
         }
+        from = z;
+    }
+    // finish from the top down, `countersink_stepdown` at a time: one ring each, the tool's edge
+    // on the cone. The stair a rough step leaves is at most a stepdown across the slope, inside
+    // the cutter's width, so the ring takes all of it
+    let cone = |z: f64| s.r_bottom + (z - s.z_bottom) * slope - rt;
+    let mut finishing = levels(s.z_top, &[s.z_bottom], step).into_iter().peekable();
+    if let Some(&z1) = finishing.peek() {
+        // up through the cleared middle, across to the first ring above the material
+        b.line([b.at[0], b.at[1], s.z_top], t.feed);
+        b.line([c[0] + cone(z1), c[1], s.z_top], t.feed);
+    }
+    for z in finishing {
+        b.helix(c, cone(z), z, step, t.feed);
     }
     b.up();
 }
@@ -905,7 +924,9 @@ fn contour_and_separate(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Re
         from = z;
     }
     let step = cx.job.strategy.cut_out.skin_stepdown;
-    for z in levels(skin_top, &[cx.through], step) {
+    // through to the spoilboard allowance, or down to a thin skin left to hold the parts
+    let last = if cx.job.strategy.cut_out.final_skin > 0.0 { cx.f.bottom_z + cx.job.strategy.cut_out.final_skin } else { cx.through };
+    for z in levels(skin_top, &[last], step) {
         let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
         for r in outside.iter().chain(&inside) {
             let start = nearest_vertex(r, [b.at[0], b.at[1]]);
@@ -1083,6 +1104,21 @@ pub fn plan_job(job: &Job, bodies: &[solidcraft_kernel::Body]) -> Result<JobPlan
     let pairs: Vec<(&PartFeatures, &PartPlan)> = features.iter().zip(&plans).collect();
     let (ops, sheet_warnings) = plan_sheet(job, &pairs, &nesting.placements)?;
     warnings.extend(sheet_warnings);
+    // tools the machine's changer does not hold
+    if !job.machine.rack.is_empty() {
+        let mut missing: Vec<u32> = Vec::new();
+        for op in &ops {
+            if !job.machine.rack.contains(&op.tool) && !missing.contains(&op.tool) {
+                missing.push(op.tool);
+            }
+        }
+        for n in missing {
+            warnings.push(format!(
+                "T{n} is not in the machine's rack (T{}): put it in the rack, renumber it in the tool library, or change it by hand",
+                job.machine.rack.iter().map(u32::to_string).collect::<Vec<_>>().join(", T")
+            ));
+        }
+    }
     let nesting = nesting.in_work(job.stock.work_zero());
     Ok(JobPlan { features, ups, plans, nesting, ops, warnings })
 }

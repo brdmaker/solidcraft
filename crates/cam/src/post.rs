@@ -82,8 +82,9 @@ pub fn tool_line(job: &Job, ops: &[Operation], n: u32, decimals: u32) -> String 
     line
 }
 
-/// The program for `ops` (a planned job's operations, in work coordinates).
-pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str) -> Result<String> {
+/// The program for `ops` (a planned job's operations, in work coordinates); `warnings` (the
+/// plan's) go into its header as comments, so whoever runs it sees them.
+pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) -> Result<String> {
     let post = &job.post;
     let dec = post.decimals;
     let n = |x: f64| num(x, dec);
@@ -125,6 +126,21 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str) -> Result<String> {
     }
     for t in &used {
         out(&mut g, comment(&tool_line(job, ops, *t, dec)))?;
+    }
+    for w in warnings {
+        // LinuxCNC reads at most 256 characters a line
+        let text = comment(w);
+        let words: Vec<&str> = text.trim_start_matches('(').trim_end_matches(')').split(' ').collect();
+        let mut line = String::from("WARNING:");
+        for word in words {
+            if line.len() + word.len() + 1 > 200 {
+                out(&mut g, format!("({line})"))?;
+                line = String::from("WARNING ...");
+            }
+            line.push(' ');
+            line.push_str(word);
+        }
+        out(&mut g, format!("({line})"))?;
     }
     out(&mut g, "G21 G90 G17 G40 G49 G80 G94".into())?;
     out(&mut g, "G54".into())?;

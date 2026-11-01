@@ -317,13 +317,15 @@ mod job_tests {
         let c = &j.strategy.cut_out;
         assert_eq!((c.method, c.skin, c.skin_stepdown), (CutOutMethod::Skin, 0.5, 0.1));
         // no tools listed and no library named: the built-in library's
-        assert_eq!(j.tools.iter().map(|t| t.number).collect::<Vec<_>>(), vec![1, 2, 3, 6, 9, 10]);
+        assert_eq!(j.tools.iter().map(|t| t.number).collect::<Vec<_>>(), vec![1, 2, 3, 5, 6]);
+        assert_eq!(j.machine.rack, vec![1, 2, 3, 4, 5, 6], "the six-fork rack");
+        assert_eq!(j.strategy.cut_out.final_skin, 0.0, "cut free");
     }
 
     /// The built-in library: single-flute end mills Ø1, Ø2, Ø3 and Ø6 as T1, T2, T3 and T6, and
-    /// 90° chamfer mills Ø6 and Ø12 as T9 and T10. With it, roughing takes the Ø6, finishing
-    /// the Ø3 (the largest smaller than the roughing tool), cutting out the Ø6 (its 22 mm flutes
-    /// reach through 10 mm and the 0.2 below), chamfers the first chamfer mill.
+    /// a 90° chamfer mill Ø6 as T5: all in the six-fork rack (T1 to T6). With it, roughing takes
+    /// the Ø6, finishing the Ø3 (the largest smaller than the roughing tool), cutting out the Ø6
+    /// (its 22 mm flutes reach through 10 mm and the 0.2 below), chamfers the chamfer mill.
     #[test]
     fn the_builtin_library_holds_the_usual_tools() {
         let lib = ToolLibrary::builtin().unwrap();
@@ -334,15 +336,14 @@ mod job_tests {
                 (1, ToolKind::Flat, 1.0, 1),
                 (2, ToolKind::Flat, 2.0, 1),
                 (3, ToolKind::Flat, 3.0, 1),
-                (6, ToolKind::Flat, 6.0, 1),
-                (9, ToolKind::Chamfer, 6.0, 1),
-                (10, ToolKind::Chamfer, 12.0, 1)
+                (5, ToolKind::Chamfer, 6.0, 1),
+                (6, ToolKind::Flat, 6.0, 1)
             ]
         );
         assert!(lib.tools.iter().filter(|t| t.kind == ToolKind::Chamfer).all(|t| t.tip_angle() == 90.0));
         let j = Job::from_json(MINIMAL).unwrap();
         let n = |t: Option<&crate::job::Tool>| t.map(|t| t.number);
-        assert_eq!((n(j.rough_tool()), n(j.finish_tool()), n(j.profile_tool()), n(j.chamfer_tool())), (Some(6), Some(3), Some(6), Some(9)));
+        assert_eq!((n(j.rough_tool()), n(j.finish_tool()), n(j.profile_tool()), n(j.chamfer_tool())), (Some(6), Some(3), Some(6), Some(5)));
     }
 
     /// Holes no drill fits are milled with the finishing tool when the hole's radius is at least
@@ -403,6 +404,26 @@ mod job_tests {
         }
     }
 
+    /// A plan using a tool the rack does not hold says so; with the tool in the rack, or no rack
+    /// given (`[]`), it does not.
+    #[test]
+    fn tools_outside_the_rack_are_warned_about() {
+        let b = solidcraft_kernel::box_solid(solidcraft_geom::Vec3::new(0.0, 0.0, 0.0), solidcraft_geom::Vec3::new(40.0, 30.0, 6.0)).unwrap();
+        let plan = |rack: &str| {
+            let j = Job::from_json(&format!(
+                r#"{{"stock": {{"size": [120, 80], "thickness": 6}}, {rack} "strategy": {{"roughing": {{"pattern": "offset"}}}},
+                    "tools": [{{"number": 7, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1000, "plunge": 250}}],
+                    "parts": [{{"body": "P"}}]}}"#
+            ))
+            .unwrap();
+            crate::plan::plan_job(&j, std::slice::from_ref(&b)).unwrap().warnings
+        };
+        let w = plan("");
+        assert!(w.iter().any(|w| w.starts_with("T7 is not in the machine's rack (T1, T2, T3, T4, T5, T6)")), "{w:?}");
+        assert!(!plan(r#""machine": {"rack": [1, 7]},"#).iter().any(|w| w.contains("rack")));
+        assert!(!plan(r#""machine": {"rack": []},"#).iter().any(|w| w.contains("rack")));
+    }
+
     /// The skin must be thinner than the sheet; its passes at least 0.01 mm.
     #[test]
     fn the_skin_is_checked() {
@@ -415,6 +436,8 @@ mod job_tests {
         assert!(with(r#""skin": 3"#).unwrap_err().to_string().contains("skin"));
         assert!(with(r#""skin_stepdown": 0"#).unwrap_err().to_string().contains("skin_stepdown"));
         assert_eq!(with(r#""method": "profile""#).unwrap().strategy.cut_out.method, CutOutMethod::Profile);
+        assert!(with(r#""final_skin": 0.05"#).is_ok());
+        assert!(with(r#""final_skin": 0.5"#).unwrap_err().to_string().contains("final_skin"), "thinner than the skin");
     }
 
     #[test]
@@ -2115,6 +2138,25 @@ mod sim_tests {
         assert_eq!(r.slugs.len(), 1, "{:?}", r.slugs);
         assert!((r.slugs[0].area - 16.0).abs() < 2.5 && (r.slugs[0].by - 0.5).abs() < 1e-3, "{:?}", r.slugs[0]);
         assert!(r.parts[0].free);
+    }
+
+    /// With a thin skin left (0.05 of the 0.5), the separation stops at −6 + 0.05 and the plate
+    /// is held all round by it; the simulation says it is not free.
+    #[test]
+    fn a_thin_final_skin_holds_the_part() {
+        let b = box_solid(Vec3::new(-20.0, -15.0, 0.0), Vec3::new(20.0, 15.0, 6.0)).unwrap();
+        let job = crate::job::Job::from_json(
+            r#"{"stock": {"size": [80, 60], "thickness": 6}, "strategy": {"roughing": {"pattern": "offset"}, "cut_out": {"final_skin": 0.05}},
+                "tools": [{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3}],
+                "parts": [{"body": "P"}]}"#,
+        )
+        .unwrap();
+        let plan = crate::plan::plan_job(&job, std::slice::from_ref(&b)).unwrap();
+        let deepest = plan.ops.iter().filter(|o| o.kind == crate::toolpath::OpKind::Separation).map(|o| o.deepest()).fold(f64::INFINITY, f64::min);
+        assert!((deepest - (-6.0 + 0.05)).abs() < 1e-9, "{deepest}");
+        let (r, _) = simulate(&job, &[b], &plan, 0.2).unwrap();
+        assert!(!r.parts[0].free && !r.parts[0].held_at.is_empty(), "{:?}", r.parts);
+        assert!(r.parts[0].held_at.iter().all(|s| (s.by - 0.05).abs() < 1e-3), "held by the 0.05 skin: {:?}", r.parts[0].held_at);
     }
 
     /// A rapid through material is caught, with how deep it went.

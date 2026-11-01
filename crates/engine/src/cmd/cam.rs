@@ -146,7 +146,7 @@ fn job_gcode(s: &mut Session, p: &Value) -> Result<Value> {
     let bodies = job.parts.iter().map(|part| part_body(s, base.as_deref(), part)).collect::<Result<Vec<_>>>()?;
     let plan = solidcraft_cam::plan::plan_job(&job, &bodies).map_err(|e| EngineError::Other(e.to_string()))?;
     let title = job.parts.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ");
-    let program = solidcraft_cam::post::linuxcnc(&job, &plan.ops, &title).map_err(|e| EngineError::Other(e.to_string()))?;
+    let program = solidcraft_cam::post::linuxcnc(&job, &plan.ops, &title, &plan.warnings).map_err(|e| EngineError::Other(e.to_string()))?;
     solidcraft_io::vfs::write(&path, program.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let mut tools: Vec<u32> = Vec::new();
     for op in &plan.ops {
