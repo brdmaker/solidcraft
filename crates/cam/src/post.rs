@@ -189,7 +189,14 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) 
             rpm = Some(op.rpm);
         }
         out(&mut g, comment(&op.name))?;
-        for m in &op.moves {
+        let fitted;
+        let moves: &[Move] = if post.fit_arcs {
+            fitted = fit(&op.moves, post.fit_tolerance);
+            &fitted
+        } else {
+            &op.moves
+        };
+        for m in moves {
             if !matches!(m, Move::Drill { .. }) && in_cycle {
                 out(&mut g, "G80".into())?;
                 in_cycle = false;
@@ -258,4 +265,149 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) 
     out(&mut g, "M30".into())?;
     out(&mut g, "%".into())?;
     Ok(g)
+}
+
+/// Most points one fitted move may replace.
+const MAX_FIT: usize = 400;
+
+/// `moves` with every run of straight feed moves at one height and feed (after the move that
+/// brings the tool to its start) replaced by as few arcs and lines as stay within `tol` of all
+/// its points and of the middle of every piece between them. Arcs end on planned points.
+pub fn fit(moves: &[Move], tol: f64) -> Vec<Move> {
+    let mut out: Vec<Move> = Vec::with_capacity(moves.len());
+    let mut i = 0;
+    let mut at: Option<[f64; 3]> = None;
+    while let Some(m) = moves.get(i) {
+        let (Move::Line { to, feed }, Some(start)) = (m, at) else {
+            out.push(m.clone());
+            at = Some(m.end());
+            if let Move::Drill { at: c, back, .. } = m {
+                at = Some([c[0], c[1], *back]);
+            }
+            i += 1;
+            continue;
+        };
+        // the run: lines at the start's height and this feed
+        let z = start[2];
+        let mut pts = vec![[start[0], start[1]]];
+        let mut k = i;
+        while let Some(Move::Line { to: p, feed: f }) = moves.get(k) {
+            if (p[2] - z).abs() > 1e-9 || (f - feed).abs() > 1e-9 {
+                break;
+            }
+            pts.push([p[0], p[1]]);
+            k += 1;
+        }
+        if pts.len() < 3 {
+            // a lone move, or one that changes height: as planned
+            out.push(m.clone());
+            at = Some(*to);
+            i += 1;
+            continue;
+        }
+        let mut a = 0;
+        while a + 1 < pts.len() {
+            let line = longest_line(&pts, a, tol);
+            let arc = longest_arc(&pts, a, tol);
+            match arc {
+                Some((b, centre, ccw)) if b > line => {
+                    let e = pts.get(b).copied().unwrap_or([0.0, 0.0]);
+                    out.push(Move::Arc { to: [e[0], e[1], z], center: centre, ccw, feed: *feed });
+                    a = b;
+                }
+                _ => {
+                    let e = pts.get(line).copied().unwrap_or([0.0, 0.0]);
+                    out.push(Move::Line { to: [e[0], e[1], z], feed: *feed });
+                    a = line;
+                }
+            }
+        }
+        at = pts.last().map(|p| [p[0], p[1], z]);
+        i = k;
+    }
+    out
+}
+
+fn dist_to_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    (a[0] + t * dx - p[0]).hypot(a[1] + t * dy - p[1])
+}
+
+/// The furthest point `b` > `a` that a straight line from `a` reaches with every point between,
+/// and the middle of every piece, within `tol`.
+fn longest_line(pts: &[[f64; 2]], a: usize, tol: f64) -> usize {
+    let Some(&pa) = pts.get(a) else { return a + 1 };
+    let mut best = a + 1;
+    for b in a + 2..pts.len().min(a + MAX_FIT) {
+        let Some(&pb) = pts.get(b) else { break };
+        let ok = (a + 1..b).all(|k| {
+            let (Some(&p), Some(&q)) = (pts.get(k), pts.get(k - 1)) else { return false };
+            dist_to_segment(p, pa, pb) <= tol && dist_to_segment([(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0], pa, pb) <= tol
+        }) && pts.get(b - 1).is_some_and(|q| dist_to_segment([(q[0] + pb[0]) / 2.0, (q[1] + pb[1]) / 2.0], pa, pb) <= tol);
+        if !ok {
+            break;
+        }
+        best = b;
+    }
+    best
+}
+
+/// The circle through three points: its centre, or `None` when they lie in a line.
+fn circle(p: [f64; 2], q: [f64; 2], r: [f64; 2]) -> Option<[f64; 2]> {
+    let d = 2.0 * (p[0] * (q[1] - r[1]) + q[0] * (r[1] - p[1]) + r[0] * (p[1] - q[1]));
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let (p2, q2, r2) = (p[0] * p[0] + p[1] * p[1], q[0] * q[0] + q[1] * q[1], r[0] * r[0] + r[1] * r[1]);
+    Some([(p2 * (q[1] - r[1]) + q2 * (r[1] - p[1]) + r2 * (p[1] - q[1])) / d, (p2 * (r[0] - q[0]) + q2 * (p[0] - r[0]) + r2 * (q[0] - p[0])) / d])
+}
+
+/// The furthest point `b` (at least `a` + 3) an arc from `a` reaches, through the point halfway
+/// between, with every point between and the middle of every piece within `tol` of it, all on
+/// one turn the same way round, its radius from 0.05 to 5000 mm: `b`, the centre and whether
+/// it turns anticlockwise.
+fn longest_arc(pts: &[[f64; 2]], a: usize, tol: f64) -> Option<(usize, [f64; 2], bool)> {
+    let pa = *pts.get(a)?;
+    let mut best = None;
+    for b in a + 3..pts.len().min(a + MAX_FIT) {
+        let pb = *pts.get(b)?;
+        let pm = *pts.get((a + b) / 2)?;
+        // an arc ending back at its start is a full turn to the control
+        if (pb[0] - pa[0]).hypot(pb[1] - pa[1]) < 0.01 {
+            break;
+        }
+        let Some(c) = circle(pa, pm, pb) else { break };
+        let r = (pa[0] - c[0]).hypot(pa[1] - c[1]);
+        if !(0.05..=5000.0).contains(&r) {
+            break;
+        }
+        let ccw = (pm[0] - pa[0]) * (pb[1] - pm[1]) - (pm[1] - pa[1]) * (pb[0] - pm[0]) > 0.0;
+        let ang = |p: [f64; 2]| (p[1] - c[1]).atan2(p[0] - c[0]);
+        let a0 = ang(pa);
+        let along = |p: [f64; 2]| {
+            let d = ang(p) - a0;
+            if ccw { d.rem_euclid(std::f64::consts::TAU) } else { (-d).rem_euclid(std::f64::consts::TAU) }
+        };
+        let mut last = 0.0;
+        let mut ok = true;
+        for k in a + 1..=b {
+            let (Some(&p), Some(&q)) = (pts.get(k), pts.get(k - 1)) else { return best };
+            // furthest from the circle along the piece: at an end, or where it comes closest to the centre
+            let off = ((p[0] - c[0]).hypot(p[1] - c[1]) - r).abs().max(r - dist_to_segment(c, q, p));
+            let t = if k == b { along(p).max(last) } else { along(p) };
+            if off > tol || t + 1e-9 < last {
+                ok = false;
+                break;
+            }
+            last = t;
+        }
+        // less than a full turn
+        if !ok || last >= std::f64::consts::TAU - 1e-6 {
+            break;
+        }
+        best = Some((b, c, ccw));
+    }
+    best
 }

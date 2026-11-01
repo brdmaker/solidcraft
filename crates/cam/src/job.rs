@@ -85,11 +85,15 @@ pub struct Post {
     pub decimals: u32,
     /// Path blending tolerance (`G64 P`), mm, default 0.01; 0 for exact stop (`G61`).
     pub blend_tolerance: f64,
+    /// Fit arcs (`G2`/`G3`) and longer lines to runs of short straight moves (default true).
+    pub fit_arcs: bool,
+    /// How far a fitted move may stray from the planned points, mm (default 0.005).
+    pub fit_tolerance: f64,
 }
 
 impl Default for Post {
     fn default() -> Self {
-        Post { coolant: Coolant::Off, spindle_wait: 2.0, decimals: 4, blend_tolerance: 0.01 }
+        Post { coolant: Coolant::Off, spindle_wait: 2.0, decimals: 4, blend_tolerance: 0.01, fit_arcs: true, fit_tolerance: 0.005 }
     }
 }
 
@@ -656,6 +660,9 @@ impl Job {
         }
         if !(3..=6).contains(&post.decimals) {
             return Err(CamError::Invalid(format!("post.decimals must be from 3 to 6; it is {}", post.decimals)));
+        }
+        if !(post.fit_tolerance.is_finite() && (0.0005..=0.1).contains(&post.fit_tolerance)) {
+            return Err(CamError::Invalid(format!("post.fit_tolerance must be from 0.0005 to 0.1 mm; it is {}", post.fit_tolerance)));
         }
         if !(post.blend_tolerance.is_finite() && (0.0..=1.0).contains(&post.blend_tolerance)) {
             return Err(CamError::Invalid(format!("post.blend_tolerance must be from 0 to 1 mm; it is {}", post.blend_tolerance)));

@@ -881,7 +881,7 @@ fn the_linuxcnc_program_reads_back_as_planned() {
         solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
             .unwrap();
     let job = crate::job::Job::from_json(&format!(
-        r#"{{"stock": {{"size": [220, 120], "thickness": 10}}, "tools": {TOOLS}, "post": {{"coolant": "mist"}}, "parts": [{{"body": "F", "quantity": 2}}]}}"#
+        r#"{{"stock": {{"size": [220, 120], "thickness": 10}}, "tools": {TOOLS}, "post": {{"coolant": "mist", "fit_arcs": false}}, "parts": [{{"body": "F", "quantity": 2}}]}}"#
     ))
     .unwrap();
     let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();
@@ -1065,4 +1065,129 @@ fn the_program_opens_with_a_tool_table() {
         assert!((num("z_min") - low).abs() < 1e-4, "T{n}: z_min {} vs {low}", kv["z_min"]);
         assert!(!name.is_empty());
     }
+}
+
+/// Points along `moves` from `start`, arcs and helices in pieces of at most half a degree and
+/// within 1e-5 mm of the curve.
+fn path_points(start: [f64; 3], moves: &[crate::toolpath::Move]) -> Vec<[f64; 3]> {
+    use crate::toolpath::Move;
+    let mut out = vec![start];
+    let mut at = start;
+    for m in moves {
+        if let Move::Arc { to, center: c, ccw, .. } = m {
+            let a0 = (at[1] - c[1]).atan2(at[0] - c[0]);
+            let r = (at[0] - c[0]).hypot(at[1] - c[1]);
+            let mut sweep = (to[1] - c[1]).atan2(to[0] - c[0]) - a0;
+            if *ccw {
+                sweep = sweep.rem_euclid(std::f64::consts::TAU);
+            } else {
+                sweep = -(-sweep).rem_euclid(std::f64::consts::TAU);
+            }
+            if sweep.abs() < 1e-12 {
+                sweep = if *ccw { std::f64::consts::TAU } else { -std::f64::consts::TAU };
+            }
+            // pieces short enough to stay within 1e-5 of the arc
+            let step = 0.5f64.to_radians().min(2.0 * (1.0 - 1e-5 / r.max(1e-3)).clamp(-1.0, 1.0).acos());
+            let n = (sweep.abs() / step).ceil().clamp(1.0, 1e6) as usize;
+            for k in 1..=n {
+                let t = k as f64 / n as f64;
+                let a = a0 + sweep * t;
+                out.push([c[0] + r * a.cos(), c[1] + r * a.sin(), at[2] + (to[2] - at[2]) * t]);
+            }
+        } else if let Move::Drill { at: c, bottom, .. } = m {
+            out.push([c[0], c[1], *bottom]);
+        }
+        at = m.end();
+        out.push(at);
+    }
+    out
+}
+
+/// The largest distance from a point of `a` to the path through `b`.
+fn furthest(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
+    let seg = |p: &[f64; 3], s: &[f64; 3], e: &[f64; 3]| {
+        let d: Vec<f64> = (0..3).map(|k| e[k] - s[k]).collect();
+        let l2: f64 = d.iter().map(|x| x * x).sum();
+        let t = if l2 > 0.0 { ((0..3).map(|k| (p[k] - s[k]) * d[k]).sum::<f64>() / l2).clamp(0.0, 1.0) } else { 0.0 };
+        (0..3).map(|k| (s[k] + t * d[k] - p[k]).powi(2)).sum::<f64>().sqrt()
+    };
+    // pieces of `b` by 1 mm cell of their box
+    let mut cells: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
+    for i in 1..b.len() {
+        let (s, e) = (b[i - 1], b[i]);
+        for x in (s[0].min(e[0]) - 0.1).floor() as i64..=(s[0].max(e[0]) + 0.1).floor() as i64 {
+            for y in (s[1].min(e[1]) - 0.1).floor() as i64..=(s[1].max(e[1]) + 0.1).floor() as i64 {
+                cells.entry((x, y)).or_default().push(i);
+            }
+        }
+    }
+    a.iter()
+        .map(|p| {
+            cells
+                .get(&(p[0].floor() as i64, p[1].floor() as i64))
+                .map(|ix| ix.iter().map(|&i| seg(p, &b[i - 1], &b[i])).fold(f64::INFINITY, f64::min))
+                .unwrap_or(f64::INFINITY)
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn fitted_arcs_stay_on_the_planned_path_with_far_fewer_moves() {
+    use crate::toolpath::Move;
+    let part = &expected()["parts"][0];
+    let read =
+        solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
+            .unwrap();
+    let job = crate::job::Job::from_json(&format!(
+        r#"{{"stock": {{"size": [220, 120], "thickness": 10}}, "tools": {TOOLS}, "post": {{"fit_tolerance": 0.005}}, "parts": [{{"body": "F", "quantity": 2}}]}}"#
+    ))
+    .unwrap();
+    assert!(job.post.fit_arcs, "on by default");
+    let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();
+    let tol = job.post.fit_tolerance;
+    let (mut planned, mut fitted, mut short_planned, mut short_fitted, mut arcs) = (0, 0, 0, 0, 0);
+    let short = |s: [f64; 3], ms: &[Move]| {
+        let mut at = s;
+        let mut n = 0;
+        for m in ms {
+            let e = m.end();
+            if !matches!(m, Move::Drill { .. }) && (0..3).map(|k| (e[k] - at[k]).powi(2)).sum::<f64>().sqrt() < 0.05 {
+                n += 1;
+            }
+            at = e;
+        }
+        n
+    };
+    let mut start = [0.0, 0.0, job.strategy.clearance];
+    for op in &plan.ops {
+        let fit = crate::post::fit(&op.moves, tol);
+        // the same ends: the operation starts and stops where planned
+        assert_eq!(fit.last().map(|m| m.end()), op.moves.last().map(|m| m.end()), "{}", op.name);
+        let (p, q) = (path_points(start, &op.moves), path_points(start, &fit));
+        let (there, back) = (furthest(&q, &p), furthest(&p, &q));
+        assert!(there <= tol + 1e-4 && back <= tol + 1e-4, "{}: {there} {back} from the planned path", op.name);
+        planned += op.moves.len();
+        fitted += fit.len();
+        short_planned += short(start, &op.moves);
+        short_fitted += short(start, &fit);
+        arcs += fit.iter().filter(|m| matches!(m, Move::Arc { .. })).count() - op.moves.iter().filter(|m| matches!(m, Move::Arc { .. })).count();
+        start = op.moves.last().map(|m| m.end()).unwrap_or(start);
+    }
+    assert!(arcs > 50, "{arcs} arcs fitted");
+    assert!(fitted * 2 < planned, "{fitted} of {planned} moves");
+    assert!(short_fitted * 4 < short_planned.max(1), "{short_fitted} of {short_planned} short moves");
+    // and the program carries them: as many feed and arc moves as the fitted operations
+    let program = crate::post::linuxcnc(&job, &plan.ops, "flanges", &plan.warnings).unwrap();
+    let (got, _) = read_program(&program);
+    assert!(got.len() <= fitted + 4 * plan.ops.len() + 100, "{} read back, {fitted} fitted", got.len());
+    let (unfitted, _) = read_program(
+        &crate::post::linuxcnc(
+            &crate::job::Job { post: crate::job::Post { fit_arcs: false, ..job.post.clone() }, ..job.clone() },
+            &plan.ops,
+            "flanges",
+            &plan.warnings,
+        )
+        .unwrap(),
+    );
+    assert!(got.len() * 2 < unfitted.len());
 }
