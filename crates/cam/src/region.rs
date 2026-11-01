@@ -146,6 +146,18 @@ impl Area {
         Ok(Area { shapes })
     }
 
+    /// The area with gaps and slits narrower than `2 d` filled: grown by `d` and shrunk back,
+    /// corners kept sharp (mitred), so nothing else moves and no vertices are added.
+    pub fn closed(&self, d: f64) -> Result<Area> {
+        if self.is_empty() || !(d.is_finite() && (GRID..=1.0).contains(&d)) {
+            return Ok(self.clone());
+        }
+        let style = |d: f64| OutlineStyle::new(d).line_join(LineJoin::Miter(0.0314));
+        let grown = self.shapes.outline_fixed_scale_as::<i64>(&style(d), 1.0 / GRID).map_err(|e| CamError::Geometry(format!("close {d}: {e:?}")))?;
+        let shapes = grown.outline_fixed_scale_as::<i64>(&style(-d), 1.0 / GRID).map_err(|e| CamError::Geometry(format!("close {d}: {e:?}")))?;
+        Ok(Area { shapes })
+    }
+
     /// The area with each ring thinned to the points that matter (Douglas–Peucker within `tol`).
     pub fn simplified(&self, tol: f64) -> Result<Area> {
         let rings: Vec<Ring> = self.rings().map(|r| simplify_ring(r, tol)).filter(|r| r.len() >= 3).collect();

@@ -40,16 +40,26 @@ impl Move {
 #[serde(rename_all = "snake_case")]
 pub enum OpKind {
     Facing,
+    /// Countersinks on the part's top face bored with an end mill, first of all while the sheet
+    /// is whole.
+    Countersink,
     Roughing,
+    /// Through holes drilled: near the end, just before the separation (a hole through the
+    /// sheet lets the vacuum leak).
     Drilling,
+    /// Blind round steps (counterbores, recesses) milled.
     HoleMilling,
     FloorFinish,
     WallFinish,
+    /// Countersinks and chamfers in hole stacks cut after the walls: with the chamfer mill, or
+    /// bored with an end mill on a floor below the top face.
     Chamfer,
     Profile,
     /// A chamfer round the part's outline, cut after the profile so the cutter's tip runs in
     /// the profile's slot.
     EdgeChamfer,
+    /// Through holes milled: near the end, with the drilled ones, just before the separation.
+    ThroughHole,
     /// Cutting through the skin left under and round the parts (the `skin` cut-out), level by
     /// level over the whole sheet: last of all, while the vacuum still holds every part.
     Separation,
@@ -60,15 +70,17 @@ impl OpKind {
     pub fn rank(self) -> u8 {
         match self {
             OpKind::Facing => 0,
-            OpKind::Roughing => 1,
-            OpKind::Drilling => 2,
+            OpKind::Countersink => 1,
+            OpKind::Roughing => 2,
             OpKind::HoleMilling => 3,
             OpKind::FloorFinish => 4,
             OpKind::WallFinish => 5,
             OpKind::Chamfer => 6,
             OpKind::Profile => 7,
             OpKind::EdgeChamfer => 8,
-            OpKind::Separation => 9,
+            OpKind::Drilling => 9,
+            OpKind::ThroughHole => 10,
+            OpKind::Separation => 11,
         }
     }
 }

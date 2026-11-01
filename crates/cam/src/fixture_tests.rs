@@ -312,11 +312,88 @@ fn plan_fixture(i: usize, thickness: f64) -> (crate::part::PartFeatures, crate::
     let f = crate::part::read_part(&read.bodies[0].body).unwrap();
     let job = crate::job::Job::from_json(&format!(
         r#"{{"stock": {{"size": [600, 400], "thickness": {thickness}}}, "tools": {TOOLS},
-            "strategy": {{"cut_out": {{"method": "profile"}}}}, "parts": [{{"body": "P"}}]}}"#
+            "strategy": {{"countersinks": "chamfer_mill", "cut_out": {{"method": "profile"}}}}, "parts": [{{"body": "P"}}]}}"#
     ))
     .unwrap();
     let plan = crate::plan::plan_part(&f, &job, "P").unwrap();
     (f, plan)
+}
+
+/// The front panel's four M3 countersinks (Ø3.4 holes, Ø6.6 at 90°: the cone from r 3.3 at the
+/// top, z 3, to r 1.7 at z 1.4), end-milled by default with the end mill that fits the Ø3.4 hole,
+/// T2 Ø3 (3 × 1.05 ≤ 3.4), in 16 steps of 0.1: at each step z one ring of radius
+/// 1.7 + (z − 1.4) − 1.5, the tool's edge on the cone, and nowhere past the cone; first of all
+/// on the sheet. The holes under them are bored from the panel's top (the countersinks leave
+/// their middles), with the other through holes near the end, just before the separation.
+#[test]
+fn countersinks_are_end_milled_first_and_holes_bored_last() {
+    use crate::toolpath::{Move, OpKind};
+    let part = &expected()["parts"][1];
+    let read =
+        solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join(part["design"].as_str().unwrap().replace(".sc", ".step"))).unwrap())
+            .unwrap();
+    let f = crate::part::read_part(&read.bodies[0].body).unwrap();
+    let job =
+        crate::job::Job::from_json(&format!(r#"{{"stock": {{"size": [600, 400], "thickness": 3}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}]}}"#))
+            .unwrap();
+    let plan = crate::plan::plan_part(&f, &job, "P").unwrap();
+    let sinks: Vec<[f64; 2]> = part["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|ft| ft["kind"] == "countersink")
+        .map(|ft| [ft["center"][0].as_f64().unwrap(), ft["center"][1].as_f64().unwrap()])
+        .collect();
+    assert_eq!(sinks.len(), 4);
+    let ops = ops_of(&plan, OpKind::Countersink);
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].tool, 2);
+    let cone = |z: f64| 1.7 + (z - 1.4);
+    let mut at = [f64::NAN; 3];
+    let mut flat: Vec<([f64; 2], f64, f64)> = Vec::new();
+    for m in &ops[0].moves {
+        let to = m.end();
+        if let Move::Arc { center, .. } = m {
+            let r = (to[0] - center[0]).hypot(to[1] - center[1]);
+            assert!(sinks.iter().any(|c| (c[0] - center[0]).hypot(c[1] - center[1]) < 1e-6), "an arc about {center:?}");
+            // never past the cone: at the arc's lower end, the tool's edge within the cone there
+            let low = to[2].min(at[2]);
+            assert!(r + 1.5 <= cone(low) + 1e-6, "at z {low} the edge is {} out, the cone {}", r + 1.5, cone(low));
+            if (to[2] - at[2]).abs() < 1e-12 {
+                flat.push((*center, to[2], r));
+            }
+        }
+        at = to;
+    }
+    for c in &sinks {
+        let mut levels: Vec<(f64, f64)> =
+            flat.iter().filter(|(cc, ..)| (cc[0] - c[0]).hypot(cc[1] - c[1]) < 1e-6).map(|(_, z, r)| ((z * 1e6).round() / 1e6, *r)).collect();
+        levels.dedup_by(|a, b| a.0 == b.0);
+        let want: Vec<f64> = (1..=16).map(|k| ((3.0 - 0.1 * k as f64) * 1e6).round() / 1e6).collect();
+        assert_eq!(levels.iter().map(|l| l.0).collect::<Vec<_>>(), want, "the steps at {c:?}");
+        for (z, r) in &levels {
+            assert!((r - (cone(*z) - 1.5)).abs() < 1e-6, "at {c:?} z {z} the ring is r {r}");
+        }
+    }
+    // the bores under them start at the panel's top
+    let bores = ops_of(&plan, OpKind::ThroughHole);
+    for c in &sinks {
+        let starts = bores.iter().flat_map(|o| &o.moves).any(|m| match m {
+            Move::Line { to, .. } => (to[0] - c[0]).hypot(to[1] - c[1]) < 0.21 && (to[2] - 3.0).abs() < 1e-9,
+            _ => false,
+        });
+        assert!(starts, "the bore at {c:?} starts at z 3");
+    }
+
+    // on a sheet: countersinks first, through holes just before the separation
+    let pl = crate::nest::Placement { part: 0, label: "P".into(), copy: 0, quarter_turns: 0, offset: [120.0, 70.0], bounds: [[0.0; 2]; 2] };
+    let (all, _) = crate::plan::plan_sheet(&job, &[(&f, &plan)], &[pl]).unwrap();
+    let kinds: Vec<OpKind> = all.iter().map(|o| o.kind).collect();
+    let first = |k: OpKind| kinds.iter().position(|x| *x == k).unwrap();
+    let last = |k: OpKind| kinds.iter().rposition(|x| *x == k).unwrap();
+    assert!(last(OpKind::Countersink) < first(OpKind::Roughing), "{kinds:?}");
+    assert!(last(OpKind::EdgeChamfer) < first(OpKind::ThroughHole) && last(OpKind::Profile) < first(OpKind::ThroughHole), "{kinds:?}");
+    assert_eq!(last(OpKind::ThroughHole) + 1, first(OpKind::Separation), "{kinds:?}");
 }
 
 /// Pocket corners sharper than the finishing tool (T2, Ø3) are warned about, each once, down to
@@ -585,7 +662,7 @@ fn the_preview_draws_the_toolpaths_where_they_are() {
             .unwrap();
     let job = crate::job::Job::from_json(&format!(
         r#"{{"stock": {{"size": [220, 220], "thickness": 10}}, "nest": {{"margin": 10, "spacing": 10}}, "tools": {TOOLS},
-            "strategy": {{"cut_out": {{"method": "profile"}}}}, "parts": [{{"body": "F", "quantity": 4}}]}}"#
+            "strategy": {{"countersinks": "chamfer_mill", "cut_out": {{"method": "profile"}}}}, "parts": [{{"body": "F", "quantity": 4}}]}}"#
     ))
     .unwrap();
     let plan = crate::plan::plan_job(&job, &[read.bodies[0].body.clone()]).unwrap();

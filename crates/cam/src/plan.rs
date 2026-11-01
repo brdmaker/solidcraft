@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::adaptive::AdaptiveParams;
-use crate::job::{CutOutMethod, Job, LevelOrder, Pattern, Strategy, Tool};
+use crate::job::{CountersinkMethod, CutOutMethod, Job, LevelOrder, Pattern, Strategy, Tool};
 use crate::nest::Placement;
 use crate::part::{HoleStack, PartFeatures};
 use crate::region::{Area, Ring, signed_area};
@@ -456,8 +456,11 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
     let job = cx.job;
     let label = cx.label;
     let mut drills: Vec<(u32, Vec<Move>)> = Vec::new();
-    let mut milled: Vec<(u32, PathBuilder)> = Vec::new();
+    // milled steps by tool, blind or through (a through hole runs near the end: it leaks)
+    let mut milled: Vec<(u32, bool, PathBuilder)> = Vec::new();
     let mut cones: Option<PathBuilder> = None;
+    // end-milled countersinks by tool, on the part's top face or on a floor below it
+    let mut sinks: Vec<(u32, bool, PathBuilder)> = Vec::new();
     let holes = cx.f.holes.clone();
     for h in &holes {
         let c = h.center;
@@ -522,14 +525,15 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
                 radii.push(next);
             }
             radii.reverse();
-            let k = match milled.iter().position(|(n, _)| *n == t.number) {
+            let through = i == last && h.through;
+            let k = match milled.iter().position(|(n, th, _)| *n == t.number && *th == through) {
                 Some(k) => k,
                 None => {
-                    milled.push((t.number, PathBuilder::new(cx.h, c)));
+                    milled.push((t.number, through, PathBuilder::new(cx.h, c)));
                     milled.len() - 1
                 }
             };
-            let Some((_, b)) = milled.get_mut(k) else { continue };
+            let Some((_, _, b)) = milled.get_mut(k) else { continue };
             let first = radii.first().copied().unwrap_or(outer);
             b.travel_to([c[0] + first, c[1]], top);
             let mut from = top;
@@ -547,6 +551,10 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
         }
         // Countersinks and the chamfer round a round recess: cones of the stack.
         for s in h.steps.iter().filter(|s| s.kind == "cone") {
+            if job.strategy.countersinks == CountersinkMethod::EndMill {
+                end_mill_cone(cx, h, s, &mut sinks);
+                continue;
+            }
             let Some(t) = job.chamfer_tool() else {
                 cx.warn(format!("{label}: countersink Ø{:.3} at ({:.3}, {:.3}): no chamfer cutter in the job", 2.0 * s.r_top, c[0], c[1]));
                 continue;
@@ -589,15 +597,93 @@ fn holes(cx: &mut Ctx, ops: &mut Vec<Operation>) -> Result<()> {
             ops.push(cx.op(OpKind::Drilling, "drilling", t, moves));
         }
     }
-    for (n, b) in milled {
+    for (n, through, b) in milled {
         if let Some(t) = job.tool(n) {
-            ops.push(cx.op(OpKind::HoleMilling, "holes", t, b.moves));
+            let (kind, what) = if through { (OpKind::ThroughHole, "through holes") } else { (OpKind::HoleMilling, "holes") };
+            ops.push(cx.op(kind, what, t, b.moves));
+        }
+    }
+    for (n, top, b) in sinks {
+        if let Some(t) = job.tool(n) {
+            ops.push(cx.op(if top { OpKind::Countersink } else { OpKind::Chamfer }, "countersinks", t, b.moves));
         }
     }
     if let (Some(b), Some(t)) = (cones, job.chamfer_tool()) {
         ops.push(cx.op(OpKind::Chamfer, "countersinks", t, b.moves));
     }
     Ok(())
+}
+
+/// Bore the cone `s` of the hole stack `h` with the end mill that fits the hole under it, in
+/// steps of `countersink_stepdown`: at each, rings from the cone inwards a stepover apart
+/// until one lies within the hole (what is left inside, the hole's bore takes from the top
+/// down later), the tool's edge on the cone at the step's height, never past it. The cone
+/// widens upwards, so each step leaves a stair as high as the step. On the part's top face the
+/// countersink is cut first of all; on a floor below, after the walls.
+fn end_mill_cone(cx: &mut Ctx, h: &HoleStack, s: &crate::part::HoleStep, sinks: &mut Vec<(u32, bool, PathBuilder)>) {
+    let c = h.center;
+    // the hole under it: the widest cylinder starting at or below the cone's foot
+    let r_hole = h
+        .steps
+        .iter()
+        .filter(|q| q.kind == "cylinder" && q.z_top <= s.z_bottom + Z_EPS)
+        .max_by(|a, b| a.z_top.total_cmp(&b.z_top))
+        .map_or(s.r_bottom, |q| q.r_top);
+    let Some(t) = cx.job.hole_tool(2.0 * r_hole) else {
+        cx.warn(format!(
+            "{}: countersink Ø{:.3} at ({:.3}, {:.3}): no end mill fits the Ø{:.3} hole under it",
+            cx.label,
+            2.0 * s.r_top,
+            c[0],
+            c[1],
+            2.0 * r_hole
+        ));
+        return;
+    };
+    let rt = t.diameter / 2.0;
+    let height = s.z_top - s.z_bottom;
+    if height <= Z_EPS {
+        return;
+    }
+    let slope = (s.r_top - s.r_bottom) / height;
+    let rings = |z: f64| -> Vec<f64> {
+        // the tool's edge on the cone at z, then inwards until a ring lies within the hole
+        let mut out = vec![s.r_bottom + (z - s.z_bottom) * slope - rt];
+        while let Some(&r) = out.last() {
+            if r <= r_hole + 1e-9 || r - t.stepover() <= 0.05 * rt || out.len() > 10_000 {
+                break;
+            }
+            out.push(r - t.stepover());
+        }
+        out.reverse();
+        out
+    };
+    let top = s.z_top >= cx.f.top_z - Z_EPS;
+    let k = match sinks.iter().position(|(n, tp, _)| *n == t.number && *tp == top) {
+        Some(k) => k,
+        None => {
+            sinks.push((t.number, top, PathBuilder::new(cx.h, c)));
+            sinks.len() - 1
+        }
+    };
+    let Some((_, _, b)) = sinks.get_mut(k) else { return };
+    let step = cx.job.strategy.countersink_stepdown;
+    let mut first = true;
+    for z in levels(s.z_top, &[s.z_bottom], step) {
+        let radii = rings(z);
+        let Some(&inner) = radii.first() else { continue };
+        if first {
+            b.travel_to([c[0] + inner, c[1]], s.z_top);
+            b.line([c[0] + inner, c[1], s.z_top], t.plunge);
+            first = false;
+        }
+        // down one step on the innermost ring (cleared above), then the rings outwards
+        b.helix(c, inner, z, step, t.plunge.max(t.feed * 0.5));
+        for r in radii.iter().skip(1) {
+            b.circle(c, *r, z, t.feed);
+        }
+    }
+    b.up();
 }
 
 /// Chamfer bands along openings (before the profile) and round the outline (after it, over

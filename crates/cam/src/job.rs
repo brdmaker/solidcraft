@@ -96,6 +96,11 @@ pub struct Strategy {
     /// The machine's rapid traverse speed, mm/min (default 5000): used to choose the quicker
     /// way between passes (up to clearance and across, or along cleared ground at depth).
     pub rapid_feed: f64,
+    /// How countersinks (and the chamfer round a round recess) are cut: `end_mill` (default)
+    /// or `chamfer_mill`.
+    pub countersinks: CountersinkMethod,
+    /// End-milled countersinks: the depth of each step, mm (default 0.1).
+    pub countersink_stepdown: f64,
     /// How parts are cut out of the sheet.
     pub cut_out: CutOut,
     /// Tabs holding each part to the sheet as its outline is cut through (`profile` cut-out).
@@ -105,6 +110,19 @@ pub struct Strategy {
     /// How far below a chamfer's foot the chamfer cutter's tip goes, mm (default 0.3): the cut
     /// uses the flank, not the fragile tip.
     pub chamfer_tip_below: f64,
+}
+
+/// How the cones of hole stacks (countersinks, a round recess's chamfer) are cut.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CountersinkMethod {
+    /// Bored with the end mill that fits the hole under it, `countersink_stepdown` at a time,
+    /// each step cleared out to the cone (leaving steps that high); first of all on the part's
+    /// top face, while the sheet is whole.
+    #[default]
+    EndMill,
+    /// Cut with the chamfer mill, its flank on the cone, after the walls are finished.
+    ChamferMill,
 }
 
 /// How parts come out of the sheet.
@@ -215,6 +233,8 @@ impl Default for Strategy {
             clearance: 5.0,
             retract: 1.0,
             rapid_feed: 5000.0,
+            countersinks: CountersinkMethod::EndMill,
+            countersink_stepdown: 0.1,
             cut_out: CutOut::default(),
             tabs: Tabs::default(),
             chamfer_tip_below: 0.3,
@@ -484,6 +504,7 @@ impl Job {
         length("strategy.retract", st.retract, 0.1)?;
         length("strategy.chamfer_tip_below", st.chamfer_tip_below, 0.0)?;
         length("strategy.tabs.width", st.tabs.width, 0.0)?;
+        length("strategy.countersink_stepdown", st.countersink_stepdown, 0.01)?;
         length("strategy.cut_out.skin", st.cut_out.skin, 0.0)?;
         length("strategy.cut_out.skin_stepdown", st.cut_out.skin_stepdown, 0.01)?;
         if st.cut_out.skin >= s.thickness {

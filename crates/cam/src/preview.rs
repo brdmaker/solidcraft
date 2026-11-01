@@ -29,6 +29,7 @@ pub struct Scene<'a> {
 pub fn colour(kind: OpKind) -> &'static str {
     match kind {
         OpKind::Facing => "#8fb8de",
+        OpKind::Countersink => "#00897b",
         OpKind::Roughing => "#1f6fd1",
         OpKind::Drilling => "#d62728",
         OpKind::HoleMilling => "#ef8a17",
@@ -37,6 +38,7 @@ pub fn colour(kind: OpKind) -> &'static str {
         OpKind::Chamfer => "#9b59b6",
         OpKind::Profile => "#222222",
         OpKind::EdgeChamfer => "#c2185b",
+        OpKind::ThroughHole => "#bf360c",
         OpKind::Separation => "#6d4c41",
     }
 }
@@ -45,14 +47,16 @@ pub fn colour(kind: OpKind) -> &'static str {
 pub fn legend() -> Vec<(OpKind, &'static str, &'static str)> {
     [
         (OpKind::Facing, "facing"),
+        (OpKind::Countersink, "countersinks (end mill)"),
         (OpKind::Roughing, "roughing"),
-        (OpKind::Drilling, "drilling"),
-        (OpKind::HoleMilling, "hole milling"),
+        (OpKind::HoleMilling, "counterbores, recesses"),
         (OpKind::FloorFinish, "floors"),
         (OpKind::WallFinish, "walls"),
         (OpKind::Chamfer, "countersinks, chamfers"),
         (OpKind::Profile, "profile"),
         (OpKind::EdgeChamfer, "edge chamfer"),
+        (OpKind::Drilling, "drilling"),
+        (OpKind::ThroughHole, "through holes"),
         (OpKind::Separation, "separation"),
     ]
     .into_iter()

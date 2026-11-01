@@ -22,7 +22,7 @@ const RAYS: usize = 192;
 const MAX_CELLS: usize = 400_000_000;
 
 /// The most passes one pocket level may take.
-const MAX_PASSES: usize = 5_000;
+const MAX_PASSES: usize = 50_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveParams {
@@ -423,6 +423,32 @@ impl Tiled {
         Ok(())
     }
 
+    /// Add `a`, then close each tile it touched (fill gaps narrower than 6 µm, corners kept
+    /// sharp) and thin it out (within 2 µm): the hairline gaps between neighbouring pieces go,
+    /// and the chords of many pieces along a curved wall become one outline. Read back with
+    /// [`Tiled::window_closed`], which closes the seams thinning leaves between tiles.
+    fn add_closed(&mut self, a: &Area) -> Result<()> {
+        self.add(a)?;
+        let Some((lo, hi)) = a.bounds() else { return Ok(()) };
+        let (i0, i1, j0, j1) = self.span(lo, hi);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let rect = self.rect(i, j)?;
+                if let Some(t) = self.tiles.get_mut(j * self.nx + i)
+                    && !t.is_empty()
+                {
+                    *t = t.closed(0.003)?.simplified(0.002)?.intersection(&rect)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The area within `lo`..`hi`, closed as in [`Tiled::add_closed`].
+    fn window_closed(&self, lo: [f64; 2], hi: [f64; 2]) -> Result<Area> {
+        self.window(lo, hi)?.closed(0.003)
+    }
+
     /// The area within `lo`..`hi`.
     fn window(&self, lo: [f64; 2], hi: [f64; 2]) -> Result<Area> {
         let (i0, i1, j0, j1) = self.span(lo, hi);
@@ -531,9 +557,7 @@ pub fn clear_level(b: &mut PathBuilder, allowed: &Area, z: f64, from: f64, tool:
     let mut notes = Vec::new();
     for shape in &allowed.shapes {
         let s = Area { shapes: vec![shape.clone()] };
-        if let Some(n) = clear_shape(b, &s, z, from, tool, p)? {
-            notes.push(n);
-        }
+        notes.extend(clear_shape(b, &s, z, from, tool, p)?);
     }
     Ok(notes)
 }
@@ -542,10 +566,10 @@ fn at(shape: &Area) -> String {
     shape.bounds().map(|(lo, hi)| format!("({:.1}, {:.1})", (lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0)).unwrap_or_default()
 }
 
-fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p: &AdaptiveParams) -> Result<Option<String>> {
+fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p: &AdaptiveParams) -> Result<Vec<String>> {
     let rt = t.diameter / 2.0;
     let step = p.step.clamp(rt * 0.02, rt * 0.9);
-    let (Some((lo, hi)), true) = (shape.bounds(), z < from) else { return Ok(None) };
+    let (Some((lo, hi)), true) = (shape.bounds(), z < from) else { return Ok(Vec::new()) };
     let mut cleared = Cleared::new([lo[0] - rt, lo[1] - rt], [hi[0] + rt, hi[1] + rt], (rt / 40.0).max(0.01))?;
     let spacing = (step / 2.0).clamp(0.05, 1.0);
 
@@ -566,22 +590,21 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
             cleared.sweep(&densify(&r, spacing), rt);
             b.up();
         }
-        return Ok(Some(format!(
+        return Ok(vec![format!(
             "adaptive: the region at {} on z {z:.3} leaves T{}'s centre less than {:.2} mm of room: it is cut by slotting (up to 180° engaged); a smaller cutter keeps the engagement down",
             at(shape),
             t.number,
             // the room is found by shrinking in steps of `shrink`: it is less than one more step
             2.0 * (room.max(0.0) + shrink)
-        )));
+        )]);
     }
-    // A channel giving the centre less room across than the cutter's radius (as between two
-    // parts nested close): moving on along either side of the cleared strip, the material
+    // In a channel giving the centre less room across than the cutter's radius (as between
+    // two parts nested close), moving on along either side of the cleared strip, the material
     // beside it, which the cutter's edge only just reached before, lies on a quarter of the
-    // edge however small the step. There the limit is that quarter and a straight cut's
+    // edge however small the step. A pass there may take that quarter and a straight cut's
     // engagement at the step, and the note says so.
-    let narrow = 2.0 * room < rt;
-    let limit =
-        if narrow { p.max_engagement.max(std::f64::consts::FRAC_PI_2 + AdaptiveParams::straight_engagement(step, rt)) } else { p.max_engagement };
+    let channel_limit = p.max_engagement.max(std::f64::consts::FRAC_PI_2 + AdaptiveParams::straight_engagement(step, rt));
+    let mut in_channel = false;
     b.travel_to([c[0] + rh, c[1]], from);
     b.line([c[0] + rh, c[1], from], t.plunge);
     let pitch = (std::f64::consts::TAU * rh * p.ramp.tan()).max(0.01);
@@ -607,7 +630,9 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
     // at the full step every time, where a front runs along a wall pass after pass
     let mut last = step;
 
+    let mut passes = 0usize;
     for _ in 0..MAX_PASSES {
+        passes += 1;
         // The next pass at the full step, one piece of it at a time: where the region branches
         // (the arms of an L or a cross, the two ends of a long slot) the growth falls apart in
         // pieces, and the tool finishes the piece nearest it, pass after pass, before moving
@@ -619,13 +644,15 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
         let here = [b.at[0], b.at[1]];
         let s0 = if last * 2.0 >= step - 1e-12 { step } else { last * 2.0 };
         let mut half = tile;
+        // whether this pass runs in a channel: looked at once, the first time it is too hot
+        let mut channel: Option<bool> = None;
         let picked = 'window: loop {
             let (wlo, whi) = ([here[0] - half, here[1] - half], [here[0] + half, here[1] + half]);
             let whole = wlo[0] <= blo[0] && wlo[1] <= blo[1] && whi[0] >= bhi[0] && whi[1] >= bhi[1];
             let (wlo, whi) = if whole { (blo, bhi) } else { (wlo, whi) };
             // read a step and a millimetre wider: the growth inside the window is exact
             let pad = step + 1.0;
-            let visited = cen.window([wlo[0] - pad, wlo[1] - pad], [whi[0] + pad, whi[1] + pad])?;
+            let visited = cen.window_closed([wlo[0] - pad, wlo[1] - pad], [whi[0] + pad, whi[1] + pad])?;
             let inside = region.window(wlo, whi)?;
             let mut s = s0;
             loop {
@@ -639,7 +666,11 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
                         continue 'window;
                     }
                     Pick::Piece(piece, segs) => {
-                        let hot = hot_points(&segs, &cleared, rt, limit);
+                        let mut hot = hot_points(&segs, &cleared, rt, p.max_engagement);
+                        if !hot.is_empty() && *channel.get_or_insert(narrow_at(&region, &piece, rt)?) {
+                            in_channel = true;
+                            hot = hot_points(&segs, &cleared, rt, channel_limit);
+                        }
                         if hot.is_empty() {
                             break 'window Some((piece, segs, s));
                         }
@@ -725,27 +756,42 @@ fn clear_shape(b: &mut PathBuilder, shape: &Area, z: f64, from: f64, t: &Tool, p
         }
         // offsets add a vertex at every round corner: thin each piece out before it is kept
         let piece = piece.simplified(0.002)?;
-        cen.add(&piece)?;
-        grown.add(&piece.offset(step, 0.01)?.simplified(0.002)?)?;
+        cen.add_closed(&piece)?;
+        piece.offset(step, 0.01).and_then(|g| g.simplified(0.002)).and_then(|g| grown.add(&g))?;
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if passes >= MAX_PASSES {
+        notes.push(format!("adaptive: the region at {} on z {z:.3} stopped after {MAX_PASSES} passes: part of it is left uncut", at(shape)));
     }
     if let Some(q) = over {
-        return Ok(Some(format!(
+        notes.push(format!(
             "adaptive: near ({:.2}, {:.2}) on z {z:.3} T{} engages more than {:.0}° even at a sixteenth of the stepover",
             q[0],
             q[1],
             t.number,
-            limit.to_degrees()
-        )));
+            if in_channel { channel_limit } else { p.max_engagement }.to_degrees()
+        ));
     }
-    Ok(narrow.then(|| {
-        format!(
-            "adaptive: the region at {} on z {z:.3} leaves T{}'s centre {:.2} mm of room or less: passes along its sides engage up to {:.0}° (a smaller cutter or a wider gap keeps it down)",
+    if in_channel {
+        notes.push(format!(
+            "adaptive: the region at {} on z {z:.3} has channels giving T{}'s centre less than {:.2} mm of room: passes along their sides engage up to {:.0}° (a smaller cutter or a wider gap keeps it down)",
             at(shape),
             t.number,
-            2.0 * (room + shrink),
-            limit.to_degrees()
-        )
-    }))
+            rt,
+            channel_limit.to_degrees()
+        ));
+    }
+    Ok(notes)
+}
+
+/// Is the region the centre may go, round `piece`, a channel narrower than `rt` across: no
+/// point of it within `2 rt` of the piece more than `rt / 2` from its edge? (The tip of a wedge
+/// is narrow too, but wide ground lies close by: it is not a channel.)
+fn narrow_at(region: &Tiled, piece: &Area, rt: f64) -> Result<bool> {
+    let Some((lo, hi)) = piece.bounds() else { return Ok(false) };
+    let local = region.window([lo[0] - 3.0 * rt, lo[1] - 3.0 * rt], [hi[0] + 3.0 * rt, hi[1] + 3.0 * rt])?;
+    let core = local.offset(-rt / 2.0, 0.01)?.intersection(&Area::rect(lo[0] - 2.0 * rt, lo[1] - 2.0 * rt, hi[0] + 2.0 * rt, hi[1] + 2.0 * rt)?)?;
+    Ok(core.is_empty())
 }
 
 /// Windows of the centres' region (cleared ground) and of the region the centre may go, for

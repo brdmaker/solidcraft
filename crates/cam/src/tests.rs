@@ -10,6 +10,25 @@ mod region_tests {
         (a - b).abs() <= tol
     }
 
+    /// Closing by 3 µm fills a 4 µm slit between two 10 × 10 squares (one shape of 20.004 × 10)
+    /// and leaves an L of 10 × 10 less a 5 × 5 corner as it was: area 75, six sharp corners.
+    #[test]
+    fn closing_fills_hairline_gaps_and_keeps_corners() {
+        let two = Area::rect(0.0, 0.0, 10.0, 10.0).unwrap().union(&Area::rect(10.004, 0.0, 20.004, 10.0).unwrap()).unwrap();
+        assert_eq!(two.shapes.len(), 2);
+        let c = two.closed(0.003).unwrap();
+        assert_eq!(c.shapes.len(), 1, "one shape");
+        assert!(close(c.area(), 200.04, 1e-3), "area {}", c.area());
+        let l = Area::from_rings(&[vec![[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [5.0, 5.0], [5.0, 10.0], [0.0, 10.0]]]).unwrap();
+        let c = l.closed(0.003).unwrap();
+        assert!(close(c.area(), 75.0, 1e-6), "area {}", c.area());
+        let ring = c.rings().next().unwrap();
+        assert_eq!(ring.len(), 6, "{ring:?}");
+        for p in [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [5.0, 5.0], [5.0, 10.0], [0.0, 10.0]] {
+            assert!(ring.iter().any(|q| close(q[0], p[0], GRID) && close(q[1], p[1], GRID)), "corner {p:?} kept: {ring:?}");
+        }
+    }
+
     #[test]
     fn rectangle_area_and_bounds() {
         let a = Area::rect(10.0, 0.0, -10.0, 5.0).unwrap();
@@ -736,6 +755,7 @@ mod plan_tests {
         let (ops, warnings) = plan_sheet(&j, &[(&f, &plan)], &[pls(0, 30.0), pls(1, 78.0)]).unwrap();
         let limit = format!("{:.0}°", 90.0 + (1.0f64 - 0.9 / 3.0).acos().to_degrees());
         assert!(!warnings.is_empty() && warnings.iter().all(|w| w.starts_with("round the parts: adaptive:") && w.contains(&limit)), "{warnings:#?}");
+        assert!(!warnings.iter().any(|w| w.contains("stopped after")), "{warnings:#?}");
 
         let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // the band's roughing
@@ -753,6 +773,18 @@ mod plan_tests {
             }
         }
         assert!(in_gap > 50, "the gap is cut at the skin's top ({in_gap} samples)");
+        // and all the way round: beside the middle of every side of both plates, 3.2 to 4.8 out
+        let low: Vec<[f64; 3]> =
+            band.iter().flat_map(|o| sample(o, [0.0, 0.0, 5.0])).filter(|a| !a.rapid && near(a.p[2], -5.5)).map(|a| a.p).collect();
+        for (x0, x1) in [(10.0, 50.0), (58.0, 98.0)] {
+            let xm = (x0 + x1) / 2.0;
+            for (side, q) in [("front", [xm, 10.0 - 4.0]), ("back", [xm, 40.0 + 4.0]), ("left", [x0 - 4.0, 25.0]), ("right", [x1 + 4.0, 25.0])] {
+                assert!(
+                    low.iter().any(|p| (p[0] - q[0]).hypot(p[1] - q[1]) < 1.0),
+                    "nothing cut at −5.5 beside the {side} of the plate at x {x0}…{x1}"
+                );
+            }
+        }
 
         // the contour, 3 outside each plate down to the skin's top
         let contour: Vec<&Operation> = ops.iter().filter(|o| o.kind == OpKind::Profile).collect();
@@ -896,10 +928,12 @@ mod plan_tests {
             }
             m => panic!("a rapid over the hole and one drilling cycle, not {m:?}"),
         }
-        assert!(!plan.ops.iter().any(|o| o.kind == OpKind::HoleMilling));
+        assert!(!plan.ops.iter().any(|o| matches!(o.kind, OpKind::HoleMilling | OpKind::ThroughHole)));
 
+        // milled through: a through hole of its own kind (run near the end: it leaks vacuum)
         let plan = plan_part(&f, &job(FLAT6, 8.0, ""), "P").unwrap();
-        let pts = sample(&op(&plan.ops, OpKind::HoleMilling), [20.0, 20.0, 13.0]);
+        assert!(!plan.ops.iter().any(|o| o.kind == OpKind::HoleMilling));
+        let pts = sample(&op(&plan.ops, OpKind::ThroughHole), [20.0, 20.0, 13.0]);
         let cutting: Vec<[f64; 3]> = pts.iter().filter(|a| !a.rapid && a.p[2] < 8.0).map(|a| a.p).collect();
         for p in &cutting {
             assert!((p[0] - 20.0).hypot(p[1] - 20.0) <= 2.0 + 1e-6, "the mill at {p:?} cuts the hole's wall");
@@ -920,7 +954,10 @@ mod plan_tests {
         let flat3 = r#"{"number": 2, "kind": "flat", "diameter": 3, "flute_length": 12, "rpm": 20000, "feed": 600, "plunge": 150, "stepdown": 1.5}"#;
         let plan = plan_part(&f, &job(&format!("{FLAT6}, {flat3}"), 8.0, ""), "P").unwrap();
         let ops = &plan.ops;
-        let holes = &op(ops, OpKind::HoleMilling);
+        // the counterbore (blind) and the hole under it (through, run later) together
+        let mut holes = op(ops, OpKind::HoleMilling);
+        holes.moves.extend(op(ops, OpKind::ThroughHole).moves);
+        let holes = &holes;
         assert_eq!(holes.tool, 2, "the smaller mill finishes holes");
         let pts = sample(holes, [20.0, 20.0, 13.0]);
         for a in pts.iter().filter(|a| !a.rapid && a.p[2] < 8.0) {
