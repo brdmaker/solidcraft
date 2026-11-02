@@ -170,6 +170,39 @@ mod part_tests {
         assert!(!f.unsupported.is_empty());
     }
 
+    /// An 80 × 80 × 10 plate with a Ø20 through bore and, round it, two half-moon pockets 1.5
+    /// deep: a Ø60 recess with a bar 8 wide across it (|x| 12 to 31) left standing. The pockets'
+    /// outer walls lie on one R30 circle but stop at the bar, 2 asin(4/30) = 15.3° apart each
+    /// side: not a Ø60 counterbore round the bore. The bore is one through hole of one step, and
+    /// the pockets' floor (one face: the halves meet between the bar's ends and the bore) is a
+    /// pocket of its own, not part of a hole.
+    #[test]
+    fn walls_on_one_circle_with_gaps_are_not_a_hole() {
+        let mut b =
+            cut(box_solid(v(-40.0, -40.0, 0.0), v(40.0, 40.0, 10.0)).unwrap(), cylinder(v(0.0, 0.0, 8.5), v(0.0, 0.0, 1.0), 30.0, 2.0).unwrap());
+        for x in [-31.0, 12.0] {
+            b = boolean(&b, &box_solid(v(x, -4.0, 8.0), v(x + 19.0, 4.0, 10.0)).unwrap(), BoolOp::Union).unwrap().unwrap();
+        }
+        b = cut(b, cylinder(v(0.0, 0.0, -1.0), v(0.0, 0.0, 1.0), 10.0, 12.0).unwrap());
+        let f = read_part(&b).unwrap();
+        assert_eq!(f.holes.len(), 1, "{:?}", f.holes);
+        let h = &f.holes[0];
+        assert!(h.through && (h.diameter - 20.0).abs() < 1e-6 && h.steps.len() == 1, "{h:?}");
+        let pockets: Vec<&crate::part::Floor> = f.floors.iter().filter(|fl| !fl.top && (fl.z - 8.5).abs() < 1e-6).collect();
+        assert_eq!(pockets.len(), 1, "{:?}", f.floors);
+        let annulus = PI * (900.0 - 100.0);
+        for p in &pockets {
+            assert!(!p.in_hole, "{p:?}");
+        }
+        let floors: f64 = pockets.iter().map(|p| p.area).sum();
+        // the floors are the annulus less the bar's two arms inside the circle, each
+        // ∫ (sqrt(900 − y²) − 12) dy over |y| ≤ 4 = [y sqrt(900 − y²) / 2 + 450 asin(y / 30)] − 96
+        let arm = 4.0 * (900.0f64 - 16.0).sqrt() + 900.0 * (4.0f64 / 30.0).asin() - 96.0;
+        let want = annulus - 2.0 * arm;
+        // the floors' outlines are chords within the area tolerance of the arcs
+        assert!((floors - want).abs() < 0.5, "floors {floors}, worked out {want}");
+    }
+
     /// A plain 10 × 20 × 30 block: every way up is reachable, so `auto` rests it on its largest
     /// face, 20 × 30 (X up, 10 tall; +X before −X); given an axis it turns as told: +Y up is 20
     /// tall, −Z up 30, each resting on the face across that axis.

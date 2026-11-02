@@ -167,16 +167,49 @@ fn concave(s: &Sample, c: [f64; 2]) -> bool {
     toward > 0.0
 }
 
-/// Does the round face go all the way round its axis? No gap between the angles of its points
-/// is wider than a quarter turn.
-fn full_turn<'a>(points: impl Iterator<Item = &'a Vec3>, c: [f64; 2]) -> bool {
-    let mut a: Vec<f64> = points.map(|p| (p.y - c[1]).atan2(p.x - c[0])).filter(|a| a.is_finite()).collect();
-    if a.len() < 3 {
-        return false;
+/// Most angle between two faces of one round surface that still meet, radians: faces split from
+/// one surface share their edges, so only rounding parts them.
+const TURN_GAP: f64 = 0.02;
+
+/// Do the round faces (each by its points) go all the way round their axis together? Each face
+/// covers the arc outside the widest gap between its points' angles (a face with no gap wider
+/// than a quarter turn, between its mesh's points, goes round by itself); the arcs must close
+/// the circle with no gap wider than [`TURN_GAP`]. Pockets beside one another round a common
+/// centre (kidney slots round a bore) have walls on one circle, with real gaps between them.
+fn full_turn<'a>(faces: impl Iterator<Item = &'a [Vec3]>, c: [f64; 2]) -> bool {
+    use std::f64::consts::{FRAC_PI_2, TAU};
+    let mut arcs: Vec<(f64, f64)> = Vec::new();
+    for points in faces {
+        let mut a: Vec<f64> = points.iter().map(|p| (p.y - c[1]).atan2(p.x - c[0])).filter(|a| a.is_finite()).collect();
+        if a.len() < 3 {
+            continue;
+        }
+        a.sort_by(f64::total_cmp);
+        let (Some(&first), Some(&last)) = (a.first(), a.last()) else { continue };
+        // the widest gap, and the angle after it: where the face's arc starts
+        let (mut gap, mut start) = (first + TAU - last, first);
+        for w in a.windows(2) {
+            if let (Some(&p), Some(&q)) = (w.first(), w.get(1))
+                && q - p > gap
+            {
+                (gap, start) = (q - p, q);
+            }
+        }
+        if gap < FRAC_PI_2 {
+            return true;
+        }
+        arcs.push((start.rem_euclid(TAU), TAU - gap));
     }
-    a.sort_by(f64::total_cmp);
-    let wrap = a.first().copied().unwrap_or(0.0) + std::f64::consts::TAU - a.last().copied().unwrap_or(0.0);
-    a.windows(2).filter_map(|w| Some(w.get(1)? - w.first()?)).fold(wrap, f64::max) < std::f64::consts::FRAC_PI_2
+    arcs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let Some(&(s0, l0)) = arcs.first() else { return false };
+    let mut reach = s0 + l0;
+    for &(s, l) in arcs.iter().skip(1) {
+        if s > reach + TURN_GAP {
+            return false;
+        }
+        reach = reach.max(s + l);
+    }
+    reach >= s0 + TAU - TURN_GAP
 }
 
 fn round_to(v: f64, step: f64) -> f64 {
@@ -309,8 +342,8 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
     let mut rounds: Vec<Round> = Vec::new();
     for g in groups {
         let Some(first) = g.first().copied() else { continue };
-        let points = g.iter().filter_map(|r| samples.get(r.0)).flat_map(|s| s.points.iter());
-        if full_turn(points, first.2) {
+        let faces = g.iter().filter_map(|r| samples.get(r.0)).map(|s| s.points.as_slice());
+        if full_turn(faces, first.2) {
             rounds.extend(g.into_iter().map(|mut r| {
                 r.7 = true;
                 r
