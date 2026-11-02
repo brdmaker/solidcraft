@@ -1,0 +1,30 @@
+{
+ "stock": {
+  "size": [
+   400,
+   300
+  ],
+  "thickness": 10,
+  "material": "aluminium 5083"
+ },
+ "parts": [
+  {
+   "design": "bearing-block.step",
+   "body": "BearingBlock",
+   "name": "bearing-block",
+   "quantity": 2
+  },
+  {
+   "design": "nema17-mount.step",
+   "body": "Nema17Mount",
+   "name": "nema17-mount",
+   "quantity": 2
+  },
+  {
+   "design": "stepped-plate.step",
+   "body": "SteppedPlate",
+   "name": "stepped-plate",
+   "quantity": 1
+  }
+ ]
+}

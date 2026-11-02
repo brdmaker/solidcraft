@@ -1,0 +1,30 @@
+{
+ "stock": {
+  "size": [
+   400,
+   300
+  ],
+  "thickness": 3,
+  "material": "aluminium 5083"
+ },
+ "parts": [
+  {
+   "design": "vent-cover.step",
+   "body": "VentCover",
+   "name": "vent-cover",
+   "quantity": 2
+  },
+  {
+   "design": "hex-plate.step",
+   "body": "HexPlate",
+   "name": "hex-plate",
+   "quantity": 2
+  },
+  {
+   "design": "washer-ring.step",
+   "body": "WasherRing",
+   "name": "washer-ring",
+   "quantity": 4
+  }
+ ]
+}

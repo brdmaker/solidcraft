@@ -271,6 +271,25 @@ fn relieved_corners_are_cut_clean() {
     assert!(r.rapid_hits.is_empty() && r.parts.iter().all(|p| p.free), "{:?} {:?}", r.rapid_hits, r.parts);
 }
 
+/// The washer ring of the 3 mm test sheet: a Ø70 / Ø36 ring with three kidney pockets 1.5 deep
+/// round its bore, whose outer walls lie on one R30.5 circle with gaps between them. Planned with
+/// the built-in tools and simulated on 0.1 mm cells it is cut clean (the bore milled, the kidneys
+/// pocketed, nothing left, nothing cut into the ring) and free: the kidneys' walls are not read
+/// as a Ø61 counterbore round the bore, which milled the ring away.
+#[test]
+fn a_ring_with_kidney_pockets_round_its_bore_is_cut_clean() {
+    let read = solidcraft_kernel::step_import(&std::fs::read_to_string(fixtures().join("sheets/washer-ring.step")).unwrap()).unwrap();
+    let body = read.bodies[0].body.clone();
+    let job = crate::job::Job::from_json(r#"{"stock": {"size": [100, 100], "thickness": 3}, "parts": [{"body": "W"}]}"#).unwrap();
+    let plan = crate::plan::plan_job(&job, std::slice::from_ref(&body)).unwrap();
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    assert!(plan.ops.iter().any(|o| o.kind == crate::toolpath::OpKind::Roughing && o.deepest() < 1.5 - 3.0 + 0.3), "the kidneys are pocketed");
+    let (r, _) = crate::sim::simulate(&job, &[body], &plan, 0.1).unwrap();
+    assert!(r.gouges.is_empty(), "{:?}", r.gouges);
+    assert!(r.left.is_empty(), "{:?}", r.left);
+    assert!(r.rapid_hits.is_empty() && r.parts.iter().all(|p| p.free), "{:?} {:?}", r.rapid_hits, r.parts);
+}
+
 /// The STEP file exported from the part's design.
 fn with_step(part: &Value) -> Value {
     let mut p = part.clone();

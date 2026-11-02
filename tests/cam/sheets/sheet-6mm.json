@@ -1,0 +1,30 @@
+{
+ "stock": {
+  "size": [
+   400,
+   300
+  ],
+  "thickness": 6,
+  "material": "aluminium 5083"
+ },
+ "parts": [
+  {
+   "design": "motor-bracket.step",
+   "body": "MotorBracket",
+   "name": "motor-bracket",
+   "quantity": 2
+  },
+  {
+   "design": "gusset.step",
+   "body": "Gusset",
+   "name": "gusset",
+   "quantity": 3
+  },
+  {
+   "design": "fork-clamp.step",
+   "body": "ForkClamp",
+   "name": "fork-clamp",
+   "quantity": 2
+  }
+ ]
+}

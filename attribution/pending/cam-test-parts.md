@@ -14,3 +14,14 @@
 | tests/cam/odd-slots.step | SolidCraft contributors | original CAM test part with angled, curved, L-shaped, triangular and island pockets, exported by SolidCraft from tests/cam/odd-slots.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/relieved-corners.png | SolidCraft contributors | original render of the CAM relieved-corners test part, drawn by solidcraft-cli from tests/cam/relieved-corners.sc | MIT OR Apache-2.0 |
 | tests/cam/relieved-corners.step | SolidCraft contributors | original CAM test part with dogboned and rounded pocket corners, exported by SolidCraft from tests/cam/relieved-corners.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/parts.png | SolidCraft contributors | original renders of the CAM test sheet parts, drawn by solidcraft-cli from tests/cam/sheets/*.sc | MIT OR Apache-2.0 |
+| tests/cam/sheets/sheets-simulated.png | SolidCraft contributors | original images of the CAM test sheets as simulated by solidcraft-cam | MIT OR Apache-2.0 |
+| tests/cam/sheets/vent-cover.step | SolidCraft contributors | original CAM test sheet part (vent cover), exported by SolidCraft from tests/cam/sheets/vent-cover.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/hex-plate.step | SolidCraft contributors | original CAM test sheet part (hex plate), exported by SolidCraft from tests/cam/sheets/hex-plate.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/washer-ring.step | SolidCraft contributors | original CAM test sheet part (washer ring), exported by SolidCraft from tests/cam/sheets/washer-ring.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/motor-bracket.step | SolidCraft contributors | original CAM test sheet part (motor bracket), exported by SolidCraft from tests/cam/sheets/motor-bracket.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/gusset.step | SolidCraft contributors | original CAM test sheet part (gusset), exported by SolidCraft from tests/cam/sheets/gusset.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/fork-clamp.step | SolidCraft contributors | original CAM test sheet part (fork clamp), exported by SolidCraft from tests/cam/sheets/fork-clamp.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/bearing-block.step | SolidCraft contributors | original CAM test sheet part (bearing block), exported by SolidCraft from tests/cam/sheets/bearing-block.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/nema17-mount.step | SolidCraft contributors | original CAM test sheet part (NEMA 17 mount), exported by SolidCraft from tests/cam/sheets/nema17-mount.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/stepped-plate.step | SolidCraft contributors | original CAM test sheet part (stepped pocket plate), exported by SolidCraft from tests/cam/sheets/stepped-plate.sc; no external CAD geometry | MIT OR Apache-2.0 |
