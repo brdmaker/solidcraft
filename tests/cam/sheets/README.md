@@ -1,6 +1,6 @@
 # Test sheets
 
-Nine aluminium parts on three sheets, one per thickness, for trying the whole chain on a machine:
+Ten aluminium parts on four sheets, one per thickness and one of mixed thicknesses, for trying the whole chain on a machine:
 plan, LinuxCNC program, placed models. Every inner corner is rounded wider than the cutter that
 reaches it or dogboned in the model (R1.75 for the Ø3 finishing cutter in pockets, R3.5 in
 through openings, which the Ø6 cuts free). Built with `solidcraft-cli` over MCP; the `.step` files
@@ -18,8 +18,9 @@ simulation cuts them.
 | `sheet-10mm.json` | `bearing-block` | 2 | 80 × 60 R4, 1 top chamfer; 608 bearing seat Ø22.2 × 7 over a Ø12 bore; a 20 × 30 pocket 4 deep, dogboned R1.75; 4 × M5 counterbores Ø10 × 5 |
 | | `nema17-mount` | 2 | 60 × 60 R4; Ø22.2 × 2 pilot recess over a Ø16 bore; 4 × M3 90° countersinks on the 31 mm square |
 | | `stepped-plate` | 1 | 110 × 70 R5; a 60 × 40 pocket 4 deep with R4 corners and a 36 × 18 step 3 deeper in it, dogboned R1.75; a pentagon pocket 5 deep (R13 corners circle) with R3 corners |
+| `sheet-mixed.json` (10 mm) | `bearing-block` 10 mm, `spacer-plate` 8 mm, `motor-bracket`, `gusset`, `fork-clamp` 6 mm | 1, 2, 1, 2, 1 | `spacer-plate`: 70 × 40 R5, 0.5 top chamfer; 2 × Ø8.5; a 30 × 14 pocket 3 deep, dogboned R1.75. Over the thinner parts the sheet is roughed adaptively to 0.1 above them, then faced to height |
 
-All three sheets are 400 × 300 with the work zero at the top centre and the built-in tool library.
-Simulated on 0.2 mm cells, each is cut clean: nothing left on a part past 0.05 mm, nothing cut
+All four sheets are 400 × 300 with the work zero at the top centre and the built-in tool library.
+Simulated on 0.2 mm cells, each is cut clean (the thinner parts' tops faced to height too): nothing left on a part past 0.05 mm, nothing cut
 into one, no rapid through material, every part free. The vent covers' windows drop loose 50 × 30
 pieces when cut free.

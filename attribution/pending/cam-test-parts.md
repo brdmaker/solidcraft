@@ -25,3 +25,4 @@
 | tests/cam/sheets/bearing-block.step | SolidCraft contributors | original CAM test sheet part (bearing block), exported by SolidCraft from tests/cam/sheets/bearing-block.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/sheets/nema17-mount.step | SolidCraft contributors | original CAM test sheet part (NEMA 17 mount), exported by SolidCraft from tests/cam/sheets/nema17-mount.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/sheets/stepped-plate.step | SolidCraft contributors | original CAM test sheet part (stepped pocket plate), exported by SolidCraft from tests/cam/sheets/stepped-plate.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/sheets/spacer-plate.step | SolidCraft contributors | original CAM test sheet part (8 mm spacer plate), exported by SolidCraft from tests/cam/sheets/spacer-plate.sc; no external CAD geometry | MIT OR Apache-2.0 |

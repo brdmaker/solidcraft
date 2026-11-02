@@ -83,6 +83,8 @@ pub fn scene_tools(job: &Job, ops: &[crate::toolpath::Operation]) -> Vec<SceneTo
             let t = job.tool(n)?;
             let z_min = ops.iter().filter(|o| o.tool == n).map(crate::toolpath::Operation::deepest).fold(f64::INFINITY, f64::min);
             let flat = t.kind == ToolKind::Flat;
+            // to a nanometre: no 0.8999999999999999 in the file
+            let r = |x: f64| (x * 1e9).round() / 1e9;
             Some(SceneTool {
                 number: n,
                 name: t.name.clone(),
@@ -92,18 +94,18 @@ pub fn scene_tools(job: &Job, ops: &[crate::toolpath::Operation]) -> Vec<SceneTo
                     ToolKind::Chamfer => "chamfer",
                 }
                 .into(),
-                diameter: t.diameter,
+                diameter: r(t.diameter),
                 flutes: t.flutes,
-                flute_length: t.flute_length,
-                tip_angle_deg: (!flat).then(|| t.tip_angle()),
-                stepdown: flat.then(|| t.stepdown()),
-                stepover: flat.then(|| t.stepover()),
-                peck: t.peck,
-                rpm: t.rpm,
-                feed: t.feed,
-                plunge: t.plunge,
-                chip_load: t.chip_load,
-                z_min: if z_min.is_finite() { z_min } else { 0.0 },
+                flute_length: r(t.flute_length),
+                tip_angle_deg: (!flat).then(|| r(t.tip_angle())),
+                stepdown: flat.then(|| r(t.stepdown())),
+                stepover: flat.then(|| r(t.stepover())),
+                peck: t.peck.map(r),
+                rpm: r(t.rpm),
+                feed: r(t.feed),
+                plunge: r(t.plunge),
+                chip_load: t.chip_load.map(r),
+                z_min: if z_min.is_finite() { r(z_min) } else { 0.0 },
             })
         })
         .collect()

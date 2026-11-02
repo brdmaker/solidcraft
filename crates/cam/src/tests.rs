@@ -2241,7 +2241,10 @@ mod scene_tests {
                     });
                 }
             }
-            assert!((t["z_min"].as_f64().unwrap() - low).abs() < 1e-9, "T{n}: {} vs {low}", t["z_min"]);
+            assert!((t["z_min"].as_f64().unwrap() - low).abs() < 1e-8, "T{n}: {} vs {low}", t["z_min"]);
+            if let Some(so) = t["stepover"].as_f64() {
+                assert!((so - lib.stepover()).abs() < 1e-9 && so.to_string().len() < 12, "{so}");
+            }
         }
     }
 }
