@@ -201,6 +201,13 @@ impl PathBuilder {
     /// horizontal, going round as often as it takes; then once round at `z`. A ring too short
     /// to ramp on is entered by plunging at `plunge` feed.
     pub fn ramp_ring(&mut self, ring: &Ring, start: usize, z: f64, angle: f64, feed: f64, plunge: f64) {
+        self.ramp_ring_fed(ring, start, z, angle, feed, plunge, &[]);
+    }
+
+    /// [`PathBuilder::ramp_ring`], the lap at `z` with a feed of its own on each piece of the
+    /// ring: `lap[i]` from vertex `i` to the next (`feed` where `lap` has none).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ramp_ring_fed(&mut self, ring: &Ring, start: usize, z: f64, angle: f64, feed: f64, plunge: f64, lap: &[f64]) {
         let len = ring_length(ring);
         let drop = self.at[2] - z;
         if drop > 1e-9 {
@@ -214,22 +221,48 @@ impl PathBuilder {
                 let z0 = self.at[2];
                 // At most 10 000 vertices of ramp: a ramp longer than that plunges the rest.
                 let mut guard = 0usize;
+                let ramp_feed = plunge.max(feed.min(feed * 0.5 + plunge));
                 while gone < run && guard < 10_000 {
                     let (Some(a), Some(b)) = (ring.get(i % n), ring.get((i + 1) % n)) else { break };
                     let seg = dist2(*a, *b);
+                    if gone + seg >= run && seg > 1e-9 {
+                        // down at `run` along this piece: the rest of it, and the lap from its
+                        // end round to its start and on to here, at depth
+                        let t = ((run - gone) / seg).clamp(0.0, 1.0);
+                        let q = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                        self.line([q[0], q[1], z], ramp_feed);
+                        let i = i % n;
+                        self.ring_fed(ring, i, z, feed, lap);
+                        if t > 1e-9 {
+                            self.line([q[0], q[1], z], lap.get(i).copied().unwrap_or(feed));
+                        }
+                        return;
+                    }
                     gone += seg;
                     let zz = (z0 - drop * (gone / run).min(1.0)).max(z);
-                    self.line([b[0], b[1], zz], plunge.max(feed.min(feed * 0.5 + plunge)));
+                    self.line([b[0], b[1], zz], ramp_feed);
                     i += 1;
                     guard += 1;
                 }
                 self.line([self.at[0], self.at[1], z], plunge);
                 let i = i % n;
-                self.ring(ring, i, z, feed);
+                self.ring_fed(ring, i, z, feed, lap);
                 return;
             }
         }
-        self.ring(ring, start, z, feed);
+        self.ring_fed(ring, start, z, feed, lap);
+    }
+
+    /// [`PathBuilder::ring`] with `lap[i]` the feed from vertex `i` to the next (`feed` where
+    /// `lap` has none).
+    pub fn ring_fed(&mut self, ring: &Ring, start: usize, z: f64, feed: f64, lap: &[f64]) {
+        let n = ring.len();
+        for i in 1..=n {
+            if let Some(p) = ring.get((start + i) % n) {
+                let f = lap.get((start + i - 1) % n.max(1)).copied().unwrap_or(feed);
+                self.line([p[0], p[1], z], f);
+            }
+        }
     }
 
     /// A circle of radius `r` about `c` at height `z`, clockwise (wall on the left of a hole),

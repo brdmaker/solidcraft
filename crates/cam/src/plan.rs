@@ -205,6 +205,85 @@ fn clear_rings(b: &mut PathBuilder, rings: &[Ring], allowed: &Area, z: f64, from
     }
 }
 
+/// `ring` with every piece longer than `max` split evenly: a feed can change partway along a
+/// long wall.
+fn split_long(ring: &Ring, max: f64) -> Ring {
+    let n = ring.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let (Some(a), Some(b)) = (ring.get(i), ring.get((i + 1) % n)) else { continue };
+        let k = ((a[0] - b[0]).hypot(a[1] - b[1]) / max.max(0.1)).ceil().clamp(1.0, 10_000.0) as usize;
+        for j in 0..k {
+            let t = j as f64 / k as f64;
+            out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+        }
+    }
+    out
+}
+
+/// Feeds round `ring` for a finishing pass taking `ae` off the wall beside it (material inside
+/// the ring when `material_inside`): the tool's feed raised by chip thinning, 1 / sin of the
+/// engagement acos(1 − ae / r), in tenths rounded down and at most `max_thinning` (and the rapid
+/// feed); the tool's own feed within the roughing tool's diameter (or this tool's) of every
+/// bend away from the material sharper than 20° at one vertex or curving tighter than four times
+/// its radius: an inside corner, where the pass takes more than `ae`. `lap[i]` is the feed from vertex `i` to the next.
+fn lap_feeds(ring: &Ring, material_inside: bool, ae: f64, t: &Tool, job: &Job) -> Vec<f64> {
+    let fd = &job.strategy.feeds;
+    let n = ring.len();
+    let r = t.diameter / 2.0;
+    if !fd.chip_thinning || fd.max_thinning <= 1.0 || n < 3 || !(ae > 0.0 && ae < r) {
+        return vec![t.feed; n];
+    }
+    let f = (1.0 / (1.0 - ae / r).acos().sin().max(1e-6)).min(fd.max_thinning);
+    let f = ((f * 10.0 + 1e-9).floor() / 10.0).max(1.0);
+    let fast = (t.feed * f).min(job.strategy.rapid_feed.max(t.feed));
+    let material_left = material_inside == (signed_area(ring) > 0.0);
+    let at = |i: usize| ring.get(i % n).copied().unwrap_or([0.0, 0.0]);
+    let seg = |i: usize| {
+        let (a, b) = (at(i), at(i + 1));
+        (b[0] - a[0]).hypot(b[1] - a[1])
+    };
+    let hot: Vec<usize> = (0..n)
+        .filter(|&k| {
+            let (a, b, c) = (at(k + n - 1), at(k), at(k + 1));
+            let (d1, d2) = ([b[0] - a[0], b[1] - a[1]], [c[0] - b[0], c[1] - b[1]]);
+            let turn = (d1[0] * d2[1] - d1[1] * d2[0]).atan2(d1[0] * d2[0] + d1[1] * d2[1]);
+            let away = if material_left { turn < 0.0 } else { turn > 0.0 };
+            // a corner (a sharp bend at one vertex), or a curve tighter than 4 r
+            let len = d1[0].hypot(d1[1]).min(d2[0].hypot(d2[1]));
+            away && turn.abs() > 1e-6 && (turn.abs() > 20f64.to_radians() || len / turn.abs() < 4.0 * r)
+        })
+        .collect();
+    let reach = job.rough_tool().map_or(2.0 * r, |rt| rt.diameter).max(2.0 * r);
+    let mut lap = vec![fast; n];
+    for &k in &hot {
+        // the pieces after the bend, then those before it, as far as `reach`
+        let mut gone = 0.0;
+        for j in 0..n {
+            let i = (k + j) % n;
+            if let Some(x) = lap.get_mut(i) {
+                *x = t.feed;
+            }
+            gone += seg(i);
+            if gone > reach {
+                break;
+            }
+        }
+        let mut gone = 0.0;
+        for j in 1..=n {
+            let i = (k + n - j) % n;
+            if let Some(x) = lap.get_mut(i) {
+                *x = t.feed;
+            }
+            gone += seg(i);
+            if gone > reach {
+                break;
+            }
+        }
+    }
+    lap
+}
+
 /// A pocket corner the finishing tool can't reach into: its tip, the lowest height it was
 /// found at and how far the material left reaches into it.
 struct Corner {
@@ -321,20 +400,32 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         cx.warn(format!("{label}: the job has no flat end mill: no facing, pockets, holes without a drill, or profile"));
     }
 
-    // Facing: the sheet above a part thinner than it.
+    // The sheet above a part thinner than it: roughed away adaptively level by level down to
+    // `top_stock_to_leave` above the part, over the part and the cutter's radius round it, then
+    // faced to height in one pass of rings.
     if let Some(t) = rough
         && sheet_top > f.top_z + Z_EPS
     {
         let rt = t.diameter / 2.0;
         let area = f.outline.offset(rt, PATH_TOL)?;
+        let leave = st.top_stock_to_leave;
+        let mut from = sheet_top;
+        if sheet_top > f.top_z + leave + Z_EPS {
+            let params = adaptive_params(st, t, ramp);
+            for z in levels(sheet_top, &[f.top_z + leave], t.stepdown()) {
+                let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
+                for note in rough_area(&mut b, &area, z, from, t, st, &params)? {
+                    cx.warn(format!("{label}: {note}"));
+                }
+                b.up();
+                ops.push(cx.op(OpKind::Facing, "top roughing", t, b.moves));
+                from = z;
+            }
+        }
         let rings = fill_rings(&area, t.stepover())?;
         let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
-        let mut from = sheet_top;
-        for z in levels(sheet_top, &[f.top_z], t.stepdown()) {
-            clear_rings(&mut b, &rings, &area, z, from, t, ramp);
-            b.up();
-            from = z;
-        }
+        clear_rings(&mut b, &rings, &area, f.top_z, from, t, ramp);
+        b.up();
         ops.push(cx.op(OpKind::Facing, "facing", t, b.moves));
     }
 
@@ -421,7 +512,20 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         for (z, region) in &pocket_floors {
             let mut fb = PathBuilder::new(cx.h, [0.0, 0.0]);
             let pocket = cx.pocket(*z)?;
-            let allowed = pocket.offset(-rt, PATH_TOL)?.intersection(&region.offset(rt, PATH_TOL)?)?;
+            // The wall passes (run first, down to this floor) clear a band beside every wall,
+            // as wide as the tool and the most the first pass leaves: the floor is left beyond
+            // it, and the rings reach a stepover into the band.
+            let band = t.diameter + st.wall_passes.iter().copied().fold(0.0, f64::max);
+            let todo = region.intersection(&pocket.offset(-band, PATH_TOL)?)?;
+            if todo.is_empty() {
+                continue;
+            }
+            // centres a radius less a stepover inside what is left: the rings reach a stepover
+            // into the band; a strip too thin for that gets centres over all of it
+            let inner = todo.offset(-(rt - t.stepover()).max(0.0), PATH_TOL)?;
+            let missed = todo.difference(&inner.offset(rt + PATH_TOL, PATH_TOL)?)?;
+            let centres = if missed.area() > 1e-3 { inner.union(&todo.offset((rt - t.stepover()).max(0.0), PATH_TOL)?)? } else { inner };
+            let allowed = pocket.offset(-rt, PATH_TOL)?.intersection(&centres)?;
             let rings = fill_rings(&allowed, t.stepover())?;
             clear_rings(&mut fb, &rings, &pocket.offset(-rt, PATH_TOL)?, *z, z + leave, t, ramp);
             fb.up();
@@ -431,7 +535,7 @@ pub fn plan_part(f: &PartFeatures, job: &Job, label: &str) -> Result<PartPlan> {
         }
         let mut from = f.top_z;
         let mut corners: Vec<Corner> = Vec::new();
-        for z in levels(f.top_z, &targets, t.stepdown()) {
+        for z in levels(f.top_z, &targets, st.finish_stepdown.unwrap_or(t.stepdown())) {
             let pocket = cx.pocket(z)?;
             let allowed = pocket.offset(-rt, PATH_TOL)?;
             if allowed.is_empty() && !pocket.is_empty() {
@@ -889,17 +993,36 @@ fn contour_and_separate(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Re
         inside.extend(path.shapes.iter().filter_map(|sh| sh.first().map(climb_inside)));
     }
     let skin_top = cx.cut_to;
-    // the wall passes round the outline, level by level down to the skin, each leaving less
+    let st = &cx.job.strategy;
+    let finish_step = st.finish_stepdown.unwrap_or(t.flute_length);
+    // what each pass takes off the wall: roughing left `stock_to_leave`
+    let mut prev = st.stock_to_leave;
+    let passes: Vec<(f64, f64)> = st
+        .wall_passes
+        .iter()
+        .map(|left| {
+            let ae = prev - left;
+            prev = *left;
+            (*left, ae)
+        })
+        .collect();
+    let last_ae = prev;
+    // pieces of at most half the roughing tool: the slower feed by an inside corner stops soon
+    let piece = cx.job.rough_tool().map_or(t.diameter, |r| r.diameter) / 2.0;
+    // the wall passes round the outline down to the skin (in one pass, or level by level), each
+    // leaving less
     let mut from = cx.sheet_top;
-    for z in levels(cx.sheet_top, &[skin_top], t.stepdown()) {
+    for z in levels(cx.sheet_top, &[skin_top], finish_step) {
         let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
-        for left in &cx.job.strategy.wall_passes {
+        for (left, ae) in &passes {
             for r in cx.f.outline.offset(rt + left, PATH_TOL)?.shapes.iter().filter_map(|sh| sh.first()) {
+                let r = &split_long(r, piece);
                 let start = nearest_vertex(r, [b.at[0], b.at[1]]);
                 let Some(&p) = r.get(start) else { continue };
+                let lap = lap_feeds(r, true, *ae, t, cx.job);
                 b.travel_to(p, from);
                 b.line([p[0], p[1], from], t.plunge);
-                b.ramp_ring(r, start, z, ramp, t.feed, t.plunge);
+                b.ramp_ring_fed(r, start, z, ramp, t.feed, t.plunge, &lap);
                 b.up();
             }
         }
@@ -908,17 +1031,19 @@ fn contour_and_separate(cx: &mut Ctx, ops: &mut Vec<Operation>, ramp: f64) -> Re
         }
         from = z;
     }
-    // the separation: the last pass, leaving nothing, round the outline down to the skin level
-    // by level, then through the skin round it and inside each cutout
+    // the separation: the last pass, leaving nothing, round the outline down to the skin (in
+    // one pass, or level by level), then through the skin round it and inside each cutout
     let mut from = cx.sheet_top;
-    for z in levels(cx.sheet_top, &[skin_top], t.stepdown()) {
+    for z in levels(cx.sheet_top, &[skin_top], finish_step) {
         let mut b = PathBuilder::new(cx.h, [0.0, 0.0]);
         for r in &outside {
+            let r = &split_long(r, piece);
             let start = nearest_vertex(r, [b.at[0], b.at[1]]);
             let Some(&p) = r.get(start) else { continue };
+            let lap = lap_feeds(r, true, last_ae, t, cx.job);
             b.travel_to(p, from);
             b.line([p[0], p[1], from], t.plunge);
-            b.ramp_ring(r, start, z, ramp, t.feed, t.plunge);
+            b.ramp_ring_fed(r, start, z, ramp, t.feed, t.plunge, &lap);
             b.up();
         }
         if !b.moves.is_empty() {

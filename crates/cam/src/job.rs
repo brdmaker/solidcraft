@@ -156,6 +156,15 @@ pub struct Strategy {
     /// the last pass leaves none (default [0.3, 0.1]; empty: the last pass only). Round the
     /// parts, the last pass is the separation's.
     pub wall_passes: Vec<f64>,
+    /// Depth of each finishing pass round a wall, mm. By default the wall passes round the
+    /// parts and the separation's last pass go down the whole height in one pass (the roughing
+    /// round the parts left an even `stock_to_leave`), and a pocket's walls go down level by
+    /// level in the finishing tool's stepdown (they also clear corners and dogbones roughing
+    /// could not reach). A depth here sets both.
+    pub finish_stepdown: Option<f64>,
+    /// Material roughing leaves on top of a part thinner than the sheet for the facing pass that
+    /// brings it to height, mm (default 0.1).
+    pub top_stock_to_leave: f64,
     /// Steepest ramp into the material, degrees from horizontal (default 3).
     pub ramp_angle_deg: f64,
     /// Height above the sheet for rapid moves, mm (default 5).
@@ -333,6 +342,8 @@ impl Default for Strategy {
             stock_to_leave: 0.5,
             floor_stock_to_leave: 0.2,
             wall_passes: vec![0.3, 0.1],
+            finish_stepdown: None,
+            top_stock_to_leave: 0.1,
             ramp_angle_deg: 3.0,
             clearance: 5.0,
             retract: 1.0,
@@ -773,6 +784,14 @@ impl Job {
             )));
         }
         length("strategy.tabs.height", st.tabs.height, 0.0)?;
+        if let Some(d) = st.finish_stepdown
+            && !(d.is_finite() && (0.01..=1000.0).contains(&d))
+        {
+            return Err(CamError::Invalid(format!("strategy.finish_stepdown must be from 0.01 to 1000 mm; it is {d}")));
+        }
+        if !(st.top_stock_to_leave.is_finite() && (0.0..=5.0).contains(&st.top_stock_to_leave)) {
+            return Err(CamError::Invalid(format!("strategy.top_stock_to_leave must be from 0 to 5 mm; it is {}", st.top_stock_to_leave)));
+        }
         let fd = &st.feeds;
         if !(fd.max_thinning.is_finite() && (1.0..=5.0).contains(&fd.max_thinning)) {
             return Err(CamError::Invalid(format!("strategy.feeds.max_thinning must be from 1 to 5; it is {}", fd.max_thinning)));

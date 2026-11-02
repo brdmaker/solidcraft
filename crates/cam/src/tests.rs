@@ -824,8 +824,9 @@ mod plan_tests {
         }
     }
 
-    /// The floor pass runs exactly on the floor and reaches every point of it a Ø6 tool can
-    /// reach: the pocket less its four corner squares (3 × 3, where the round tool can't go).
+    /// The floor pass runs exactly on the floor; with the wall passes (run first, down to the
+    /// floor) it reaches every point of it a Ø6 tool can reach: the pocket less its four corner
+    /// squares (3 × 3, where the round tool can't go).
     #[test]
     fn the_floor_is_finished_at_its_height_and_covered() {
         let f = read_part(&pocket_plate()).unwrap();
@@ -837,13 +838,18 @@ mod plan_tests {
             assert!(rect_dist(*p, -15.0, -10.0, 15.0, 10.0) <= -(3.0 - PATH_TOL - 1e-6), "floor pass at {p:?} cuts the wall");
         }
         assert!(pts.iter().all(|a| a.p[2] >= 6.0 - 1e-9), "nothing below the floor");
+        let walls: Vec<[f64; 3]> = sample(&op(&plan.ops, OpKind::WallFinish), [0.0, 0.0, 15.0])
+            .iter()
+            .filter(|a| !a.rapid && (a.p[2] - 6.0).abs() < 1e-9)
+            .map(|a| a.p)
+            .collect();
         let mut x: f64 = -15.0 + 0.05;
         while x < 15.0 {
             let mut y: f64 = -10.0 + 0.05;
             while y < 10.0 {
                 let corner = (x.abs() > 12.0) && (y.abs() > 7.0);
                 if !corner {
-                    let near = floor.iter().any(|p| (p[0] - x).hypot(p[1] - y) <= 3.0 + 0.01);
+                    let near = floor.iter().chain(&walls).any(|p| (p[0] - x).hypot(p[1] - y) <= 3.0 + 0.01);
                     assert!(near, "the floor point ({x:.2}, {y:.2}) is left uncut");
                 }
                 y += 0.5;
@@ -937,8 +943,8 @@ mod plan_tests {
     /// - roughing clears a band round them down to the skin's top, −6 + 0.5 = −5.5, in levels of
     ///   at most 3 (−2.75, −5.5), its centre never nearer the plates than 3 + 0.5, through the
     ///   gap between them (centres between x 53.5 and 54.5) and all the way round at −5.5;
-    /// - the contour's wall passes run 3.3 and 3.1 outside each plate at −2.75 and −5.5;
-    /// - last of all the separation: its pass 3 outside each plate at −2.75 and −5.5, then
+    /// - the contour's wall passes run 3.3 and 3.1 outside each plate down to −5.5 in one pass;
+    /// - last of all the separation: its pass 3 outside each plate down to −5.5 in one, then
     ///   through the skin at −5.6, −5.7 … −6.2 (to the spoilboard allowance), both plates at each
     ///   level before the next, the tool only ever going down while it cuts (no tabs);
     /// - each kind of work goes level by level over the sheet, the deepest last.
@@ -991,16 +997,15 @@ mod plan_tests {
             }
         }
 
-        // the contour: the wall passes leaving 0.3 and 0.1, 3.3 and 3.1 outside each plate,
-        // level by level down to the skin's top
+        // the contour: the wall passes leaving 0.3 and 0.1, 3.3 and 3.1 outside each plate, down
+        // to the skin's top in one pass
         let contour: Vec<&Operation> = ops.iter().filter(|o| o.kind == OpKind::Profile).collect();
         let levels: Vec<f64> = contour.iter().map(|o| o.deepest()).collect();
-        assert_eq!(levels.len(), 4, "{levels:?}");
-        assert!(near(levels[0], -2.75) && near(levels[1], -2.75) && near(levels[2], -5.5) && near(levels[3], -5.5), "{levels:?}");
-        // the separation: the last pass, 3 outside each plate, at −2.75 and −5.5, then through the
-        // skin; level by level, both plates at each
+        assert!(levels.len() == 2 && levels.iter().all(|l| near(*l, -5.5)), "{levels:?}");
+        // the separation: the last pass, 3 outside each plate, down to −5.5 in one, then through
+        // the skin level by level, both plates at each
         let sep: Vec<&Operation> = ops.iter().filter(|o| o.kind == OpKind::Separation).collect();
-        let want: Vec<f64> = [-2.75, -5.5].into_iter().chain((1..=7).map(|k| -5.5 - 0.1 * k as f64)).flat_map(|z| [z; 2]).collect();
+        let want: Vec<f64> = [-5.5].into_iter().chain((1..=7).map(|k| -5.5 - 0.1 * k as f64)).flat_map(|z| [z; 2]).collect();
         let got: Vec<f64> = sep.iter().map(|o| o.deepest()).collect();
         assert!(got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-9), "{got:?}");
         for o in contour.iter().chain(&sep) {
@@ -1061,11 +1066,11 @@ mod plan_tests {
             let d = plan.ops.iter().filter(|o| o.kind == kind).map(|o| o.deepest()).fold(f64::INFINITY, f64::min);
             assert!((d - 0.5).abs() < 1e-9, "{kind:?} down to {d}");
         }
-        // the separation's last pass round the outline at 3.25 and 0.5 (6 down to the skin in
-        // levels of at most 3), then the skin, 0.5 to −0.2 in 0.1 steps, inside the cutout too
+        // the separation's last pass round the outline down to the skin's top (0.5) in one, then
+        // the skin, 0.5 to −0.2 in 0.1 steps, inside the cutout too
         let all: Vec<f64> = plan.ops.iter().filter(|o| o.kind == OpKind::Separation).map(|o| o.deepest()).collect();
-        assert_eq!(all.len(), 9, "{all:?}");
-        assert!((all[0] - 3.25).abs() < 1e-9 && (all[1] - 0.5).abs() < 1e-9, "{all:?}");
+        assert_eq!(all.len(), 8, "{all:?}");
+        assert!((all[0] - 0.5).abs() < 1e-9, "{all:?}");
         let sep: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Separation && o.deepest() < 0.5 - 1e-9).collect();
         assert_eq!(sep.len(), 7, "0.5 to −0.2 in 0.1 steps");
         for o in &sep {
@@ -2206,6 +2211,38 @@ mod scene_tests {
             assert!(lo[0] >= -60.0 && hi[0] <= 60.0 && lo[1] >= -30.0 && hi[1] <= 30.0);
         }
         assert_eq!(stl_bounds(&read("placed.stl")).0, tris, "every copy");
+        // the tool table: the tools the program loads, in its order, each with the library's
+        // data and the lowest point of its moves, worked out from the moves here
+        let program = String::from_utf8(read("job.ngc")).unwrap();
+        let loaded: Vec<u32> = program.lines().filter_map(|l| l.strip_prefix('T')?.split(' ').next()?.parse().ok()).fold(Vec::new(), |mut v, n| {
+            if !v.contains(&n) {
+                v.push(n);
+            }
+            v
+        });
+        let tools = doc["tools"].as_array().unwrap();
+        assert_eq!(tools.iter().map(|t| t["number"].as_u64().unwrap() as u32).collect::<Vec<_>>(), loaded);
+        assert!(!loaded.is_empty());
+        for t in tools {
+            let n = t["number"].as_u64().unwrap() as u32;
+            let lib = job.tool(n).unwrap();
+            assert_eq!(t["diameter"].as_f64().unwrap(), lib.diameter);
+            assert_eq!(t["flutes"].as_u64().unwrap() as u32, lib.flutes);
+            assert_eq!(t["flute_length"].as_f64().unwrap(), lib.flute_length);
+            assert_eq!((t["rpm"].as_f64().unwrap(), t["feed"].as_f64().unwrap(), t["plunge"].as_f64().unwrap()), (lib.rpm, lib.feed, lib.plunge));
+            assert_eq!(t["chip_load"].as_f64(), lib.chip_load);
+            assert_eq!(t["name"].as_str().unwrap(), lib.name);
+            let mut low = f64::INFINITY;
+            for op in plan.ops.iter().filter(|o| o.tool == n) {
+                for m in &op.moves {
+                    low = low.min(match m {
+                        crate::toolpath::Move::Drill { bottom, .. } => *bottom,
+                        _ => m.end()[2],
+                    });
+                }
+            }
+            assert!((t["z_min"].as_f64().unwrap() - low).abs() < 1e-9, "T{n}: {} vs {low}", t["z_min"]);
+        }
     }
 }
 
@@ -2480,5 +2517,196 @@ mod remaining_tests {
         assert!((r_on.removed_volume - r_off.removed_volume).abs() < 1e-6 * r_off.removed_volume, "{} {}", r_on.removed_volume, r_off.removed_volume);
         assert!(r_on.air_minutes < r_off.air_minutes, "air {} min with the model, {} without", r_on.air_minutes, r_off.air_minutes);
         assert!(r_on.feed_minutes < r_off.feed_minutes);
+    }
+}
+
+mod finish_tests {
+    use solidcraft_geom::Vec3;
+    use solidcraft_kernel::{Body, BoolOp, boolean, box_solid};
+
+    use crate::job::Job;
+    use crate::part::read_part;
+    use crate::plan::plan_part;
+    use crate::toolpath::{Heights, Move, OpKind, Operation, PathBuilder};
+
+    fn v(x: f64, y: f64, z: f64) -> Vec3 {
+        Vec3::new(x, y, z)
+    }
+
+    const TOOLS: &str = r#"[{"number": 1, "kind": "flat", "diameter": 6, "flute_length": 22, "rpm": 18000, "feed": 1200, "plunge": 300, "stepdown": 3},
+        {"number": 2, "kind": "flat", "diameter": 3, "flute_length": 12, "rpm": 22000, "feed": 600, "plunge": 150, "stepdown": 1.5}]"#;
+
+    fn job(thickness: f64, extra: &str) -> Job {
+        Job::from_json(&format!(
+            r#"{{"stock": {{"size": [120, 100], "thickness": {thickness}}}, "tools": {TOOLS}, "parts": [{{"body": "P"}}] {extra}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// The heights of the level laps (moves that stay at one height) of `ops`, highest first.
+    fn lap_levels(ops: &[&Operation]) -> Vec<f64> {
+        let mut z: Vec<f64> = Vec::new();
+        for op in ops {
+            let mut at = [f64::NAN; 3];
+            for m in &op.moves {
+                if let Move::Line { to, .. } = m
+                    && (to[2] - at[2]).abs() < 1e-12
+                {
+                    let r = (to[2] * 1e6).round() / 1e6;
+                    if !z.contains(&r) {
+                        z.push(r);
+                    }
+                }
+                at = m.end();
+            }
+        }
+        z.sort_by(|a, b| b.total_cmp(a));
+        z
+    }
+
+    /// An L: a 60 × 40 × 10 plate less its 30 × 20 back-right quarter, the inside corner at
+    /// (0, 0).
+    fn l_plate() -> Body {
+        let b = box_solid(v(-30.0, -20.0, 0.0), v(30.0, 20.0, 10.0)).unwrap();
+        boolean(&b, &box_solid(v(0.0, 0.0, -1.0), v(31.0, 21.0, 11.0)).unwrap(), BoolOp::Cut).unwrap().unwrap()
+    }
+
+    /// Round the parts the wall passes and the separation's last pass go down to the skin's top
+    /// (0.5) in one pass each; `finish_stepdown` 3 takes them level by level as before: 9.5 in
+    /// four even steps of 2.375, 7.625, 5.25, 2.875, 0.5. Their laps run at the feed chip thinning gives the cut they take: roughing left 0.5,
+    /// the passes take 0.2, 0.2 and 0.1; acos(1 − 0.2/3) = 21.0°, 1/sin = 2.79, held to twice the
+    /// tool's 1200: 2400 (0.1: 3.9, also 2400). Within the roughing tool's 6 mm of the L's
+    /// inside corner (its paths' corner 3 + left out along each wall) the pass takes more: 1200.
+    #[test]
+    fn wall_passes_round_the_parts_go_down_in_one_pass_at_thinned_feeds() {
+        let f = read_part(&l_plate()).unwrap();
+        let plan = plan_part(&f, &job(10.0, ""), "P").unwrap();
+        let of = |k: OpKind| plan.ops.iter().filter(|o| o.kind == k && o.name.ends_with("contour")).collect::<Vec<_>>();
+        let contours = of(OpKind::Profile);
+        assert_eq!(lap_levels(&contours), vec![0.5]);
+        let full: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Separation && o.deepest() > 0.5 - 1e-9).collect();
+        assert_eq!(lap_levels(&full), vec![0.5]);
+        let stepped = plan_part(&f, &job(10.0, r#", "strategy": {"finish_stepdown": 3}"#), "P").unwrap();
+        let contours3: Vec<&Operation> = stepped.ops.iter().filter(|o| o.name.ends_with("contour")).collect();
+        assert_eq!(lap_levels(&contours3), vec![7.625, 5.25, 2.875, 0.5]);
+        let (mut fast, mut slow) = (0, 0);
+        for op in contours.iter().chain(&full) {
+            let mut at = [f64::NAN; 3];
+            for m in &op.moves {
+                if let Move::Line { to, feed } = m
+                    && (to[2] - 0.5).abs() < 1e-9
+                    && (at[2] - 0.5).abs() < 1e-9
+                {
+                    // the inside corner's paths turn within 3.3 √2 = 4.7 of (0, 0); 6 along the
+                    // walls from there (and the 3 mm piece that reaches past it) and further, the
+                    // pass takes only its share
+                    let near = [at, *to].iter().any(|p| p[0].hypot(p[1]) < 5.0);
+                    let far = [at, *to].iter().all(|p| p[0].hypot(p[1]) > 3.3 + 6.0 + 3.0 + 1.5);
+                    if near {
+                        assert_eq!(*feed, 1200.0, "{at:?} → {to:?}");
+                        slow += 1;
+                    } else if far {
+                        assert_eq!(*feed, 2400.0, "{at:?} → {to:?}");
+                        fast += 1;
+                    }
+                }
+                at = m.end();
+            }
+        }
+        assert!(fast > 10 && slow > 4, "{fast} fast, {slow} slow");
+    }
+
+    /// A ramp ends where it is down, not at the end of the piece it is on: 0.2 at 3° takes
+    /// 0.2 / tan 3° = 3.816 of a 50 square's first side, at the ramp feed (half the feed and the
+    /// plunge: 800); then round at the feed, back to where the ramp ended.
+    #[test]
+    fn a_ramp_ends_where_it_is_down() {
+        let mut b = PathBuilder::new(Heights { clearance: 5.0, retract: 1.0 }, [0.0, 0.0]);
+        b.travel_to([0.0, 0.0], 0.0);
+        b.line([0.0, 0.0, 0.0], 300.0);
+        let n = b.moves.len();
+        let ring = vec![[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]];
+        b.ramp_ring(&ring, 0, -0.2, 3f64.to_radians(), 1000.0, 300.0);
+        let run = 0.2 / 3f64.to_radians().tan();
+        let want = [
+            ([run, 0.0, -0.2], 800.0),
+            ([50.0, 0.0, -0.2], 1000.0),
+            ([50.0, 50.0, -0.2], 1000.0),
+            ([0.0, 50.0, -0.2], 1000.0),
+            ([0.0, 0.0, -0.2], 1000.0),
+            ([run, 0.0, -0.2], 1000.0),
+        ];
+        let got: Vec<([f64; 3], f64)> = b.moves[n..]
+            .iter()
+            .map(|m| match m {
+                Move::Line { to, feed } => (*to, *feed),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for ((p, f), (q, g)) in got.iter().zip(&want) {
+            assert!((0..3).all(|k| (p[k] - q[k]).abs() < 1e-9) && f == g, "{got:?}");
+        }
+    }
+
+    /// A 30 × 20 pocket 4 deep (floor at 6) in a 60 × 40 × 10 plate, finished with the Ø3: its
+    /// walls, run first down to the floor, clear 3 + 0.3 (the tool and the most the first pass
+    /// leaves) beside them, so the floor's rings keep their centres 3.3 + 1.5 − 0.45 (the
+    /// stepover) = 4.35 in from the walls; simulated, the floor is cut everywhere but in the
+    /// pocket's sharp corners.
+    #[test]
+    fn floor_rings_leave_the_band_the_walls_cleared() {
+        let b = box_solid(v(-30.0, -20.0, 0.0), v(30.0, 20.0, 10.0)).unwrap();
+        let b = boolean(&b, &box_solid(v(-15.0, -10.0, 6.0), v(15.0, 10.0, 11.0)).unwrap(), BoolOp::Cut).unwrap().unwrap();
+        let j = job(10.0, "");
+        let plan = crate::plan::plan_job(&j, std::slice::from_ref(&b)).unwrap();
+        let floors: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::FloorFinish).collect();
+        assert!(!floors.is_empty());
+        // work coordinates: the sheet's top at 0, the floor at −4; the pocket's middle where the
+        // part lies
+        let place = &plan.nesting.placements[0];
+        let mut n = 0;
+        for op in &floors {
+            for m in &op.moves {
+                let p = m.end();
+                if (p[2] + 4.0).abs() < 1e-9 {
+                    let (x, y) = (p[0] - place.offset[0], p[1] - place.offset[1]);
+                    let (hx, hy) = if place.quarter_turns % 2 == 1 { (10.0, 15.0) } else { (15.0, 10.0) };
+                    let wall = (hx - x.abs()).min(hy - y.abs());
+                    assert!(wall >= 4.35 - 0.02, "a floor move {wall:.3} from the wall: {p:?}");
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 20);
+        // nothing left but the pocket's four sharp corners the Ø3 can't reach into: each at most
+        // r² (1 − π/4) = 0.48 mm² across
+        let (r, _) = crate::sim::simulate(&j, &[b], &plan, 0.1).unwrap();
+        assert!(r.gouges.is_empty(), "{:?}", r.gouges);
+        assert!(r.left.len() <= 4 && r.left.iter().all(|s| s.area <= 0.5), "{:?}", r.left);
+    }
+
+    /// A 40 × 30 × 6 plate on a 10 mm sheet: the 4 above it roughed adaptively in the Ø6's 3 mm
+    /// steps down to 0.1 above it (3.9 in two even steps: levels 8.05 and 6.1), then faced at 6 in one pass; simulated, its
+    /// top is flat at its height (nothing left, nothing cut into it).
+    #[test]
+    fn a_thinner_part_is_roughed_to_a_tenth_above_then_faced() {
+        let b = box_solid(v(0.0, 0.0, 0.0), v(40.0, 30.0, 6.0)).unwrap();
+        let j = job(10.0, "");
+        let f = read_part(&b).unwrap();
+        let plan = plan_part(&f, &j, "P").unwrap();
+        let rough: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Facing && o.name.ends_with("top roughing")).collect();
+        let face: Vec<&Operation> = plan.ops.iter().filter(|o| o.kind == OpKind::Facing && o.name.ends_with(": facing")).collect();
+        assert_eq!(rough.iter().map(|o| (o.deepest() * 1e9).round() / 1e9).collect::<Vec<_>>(), vec![8.05, 6.1]);
+        assert_eq!(face.len(), 1);
+        assert_eq!(lap_levels(&face), vec![6.0]);
+        assert!((face[0].deepest() - 6.0).abs() < 1e-12);
+        // 0.1 under the default: faced straight from the sheet's top
+        let thin = box_solid(v(0.0, 0.0, 0.0), v(40.0, 30.0, 9.95)).unwrap();
+        let p2 = plan_part(&read_part(&thin).unwrap(), &j, "P").unwrap();
+        assert!(p2.ops.iter().all(|o| !o.name.ends_with("top roughing")) && p2.ops.iter().any(|o| o.name.ends_with(": facing")));
+        let plan = crate::plan::plan_job(&j, std::slice::from_ref(&b)).unwrap();
+        let (r, _) = crate::sim::simulate(&j, &[b], &plan, 0.1).unwrap();
+        assert!(r.left.is_empty() && r.gouges.is_empty() && r.parts.iter().all(|p| p.free), "{:?} {:?} {:?}", r.left, r.gouges, r.parts);
     }
 }

@@ -34,8 +34,79 @@ pub struct SceneDoc {
     pub placed_model: String,
     /// The LinuxCNC program for the job (same work zero).
     pub program: String,
+    /// The tools the program loads, in the order it first loads them: what a tool table needs.
+    pub tools: Vec<SceneTool>,
     /// Copies that did not fit on the sheet.
     pub unplaced: Vec<String>,
+}
+
+/// One tool of the program, as the job's tool library has it (lengths in mm, speeds in rpm and
+/// mm/min).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct SceneTool {
+    /// `T<number> M6`; the pocket and the tool table's number.
+    pub number: u32,
+    pub name: String,
+    /// `flat`, `drill` or `chamfer`.
+    pub kind: String,
+    pub diameter: f64,
+    pub flutes: u32,
+    pub flute_length: f64,
+    /// Included angle of a drill's point or a chamfer cutter, degrees.
+    pub tip_angle_deg: Option<f64>,
+    /// End mills: depth of a roughing pass and the side step, mm.
+    pub stepdown: Option<f64>,
+    pub stepover: Option<f64>,
+    /// Drills: the peck depth (G83), if any.
+    pub peck: Option<f64>,
+    pub rpm: f64,
+    pub feed: f64,
+    pub plunge: f64,
+    /// Feed per tooth the feed comes from, if the library gives one.
+    pub chip_load: Option<f64>,
+    /// The lowest the program takes the tool's tip (work coordinates).
+    pub z_min: f64,
+}
+
+/// The tools `ops` load, in order of first use, with the job's data for each.
+pub fn scene_tools(job: &Job, ops: &[crate::toolpath::Operation]) -> Vec<SceneTool> {
+    use crate::job::ToolKind;
+    let mut order: Vec<u32> = Vec::new();
+    for op in ops {
+        if !order.contains(&op.tool) {
+            order.push(op.tool);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|n| {
+            let t = job.tool(n)?;
+            let z_min = ops.iter().filter(|o| o.tool == n).map(crate::toolpath::Operation::deepest).fold(f64::INFINITY, f64::min);
+            let flat = t.kind == ToolKind::Flat;
+            Some(SceneTool {
+                number: n,
+                name: t.name.clone(),
+                kind: match t.kind {
+                    ToolKind::Flat => "flat",
+                    ToolKind::Drill => "drill",
+                    ToolKind::Chamfer => "chamfer",
+                }
+                .into(),
+                diameter: t.diameter,
+                flutes: t.flutes,
+                flute_length: t.flute_length,
+                tip_angle_deg: (!flat).then(|| t.tip_angle()),
+                stepdown: flat.then(|| t.stepdown()),
+                stepover: flat.then(|| t.stepover()),
+                peck: t.peck,
+                rpm: t.rpm,
+                feed: t.feed,
+                plunge: t.plunge,
+                chip_load: t.chip_load,
+                z_min: if z_min.is_finite() { z_min } else { 0.0 },
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -212,6 +283,7 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
         parts,
         placed_model: "placed.stl".into(),
         program: "job.ngc".into(),
+        tools: scene_tools(job, &plan.ops),
         unplaced: plan.nesting.unplaced.iter().map(|u| format!("{} #{}: {}", u.label, u.copy + 1, u.reason)).collect(),
     };
     let json = serde_json::to_string_pretty(&doc).map_err(|e| CamError::Invalid(format!("scene: {e}")))?;
