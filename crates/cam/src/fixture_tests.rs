@@ -290,6 +290,56 @@ fn a_ring_with_kidney_pockets_round_its_bore_is_cut_clean() {
     assert!(r.rapid_hits.is_empty() && r.parts.iter().all(|p| p.free), "{:?} {:?}", r.rapid_hits, r.parts);
 }
 
+/// The turned test parts (tests/cam/lathe, parts.json): each STEP file reads back as one solid
+/// turned about Z. Its volume is the one worked out from its half-section's profile by Pappus
+/// (2π times the profile's area times its centroid's radius), to within the meshing (0.02 %);
+/// it spans z 0 to its length and is its finished diameter across in X and Y; and every face is
+/// a flat face square to Z or a cylinder, cone, torus or sphere about the Z axis, as a lathe
+/// cuts. The profile in parts.json agrees: its largest radius is half the diameter, its last z
+/// the length.
+#[test]
+fn the_lathe_parts_are_turned_about_z_as_designed() {
+    use solidcraft_kernel::{FaceSurface, face_surface};
+    let dir = fixtures().join("lathe");
+    let parts: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("parts.json")).unwrap()).unwrap();
+    let parts = parts["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 6);
+    for p in parts {
+        let name = p["design"].as_str().unwrap();
+        let read = solidcraft_kernel::step_import(&std::fs::read_to_string(dir.join(name.replace(".sc", ".step"))).unwrap()).unwrap();
+        assert_eq!(read.bodies.len(), 1, "{name}");
+        let b = &read.bodies[0].body;
+        let (d, length, want) = (f(&p["diameter"]), f(&p["length"]), f(&p["volume_mm3"]));
+        let v = b.volume_at(0.002).unwrap();
+        assert!((v - want).abs() <= 2e-4 * want, "{name}: volume {v:.2}, worked out {want:.2}");
+        let bounds = b.tessellate(0.002).unwrap().bounds();
+        let (lo, hi) = (bounds.min, bounds.max);
+        for (got, w) in [(lo.x, -d / 2.0), (hi.x, d / 2.0), (lo.y, -d / 2.0), (hi.y, d / 2.0), (lo.z, 0.0), (hi.z, length)] {
+            assert!((got - w).abs() < 0.01, "{name}: box {lo:?} {hi:?}, want Ø{d} × {length}");
+        }
+        let on_axis = |q: solidcraft_geom::Vec3| q.x.hypot(q.y) < 1e-6;
+        let along_z = |a: solidcraft_geom::UnitVec3| a.z.abs() > 1.0 - 1e-9;
+        for i in 0..b.face_count() {
+            let ok = match face_surface(b, i) {
+                Some(FaceSurface::Plane { normal, .. }) => along_z(normal),
+                Some(FaceSurface::Cylinder { origin, axis, .. }) => along_z(axis) && on_axis(origin),
+                Some(FaceSurface::Cone { apex, axis, .. }) => along_z(axis) && on_axis(apex),
+                Some(FaceSurface::Torus { center, axis, .. }) => along_z(axis) && on_axis(center),
+                Some(FaceSurface::Sphere { center, .. }) => on_axis(center),
+                None => false,
+            };
+            assert!(ok, "{name}: face {i} is not turned about Z: {:?}", face_surface(b, i));
+        }
+        // the profile's own extent
+        let pts: Vec<[f64; 2]> =
+            p["profile"].as_array().unwrap().iter().flat_map(|s| s.as_array().unwrap()[1..].iter().map(|q| [f(&q[0]), f(&q[1])])).collect();
+        let r_max = pts.iter().map(|q| q[0]).fold(0.0, f64::max);
+        let z_max = pts.iter().map(|q| q[1]).fold(0.0, f64::max);
+        assert!((r_max - d / 2.0).abs() < 1e-6 && (z_max - length).abs() < 1e-6, "{name}: profile reaches r {r_max}, z {z_max}");
+        assert!(f(&p["stock_bar_diameter"]) > d, "{name}: a bar to turn it from");
+    }
+}
+
 /// The STEP file exported from the part's design.
 fn with_step(part: &Value) -> Value {
     let mut p = part.clone();

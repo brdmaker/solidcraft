@@ -26,3 +26,10 @@
 | tests/cam/sheets/nema17-mount.step | SolidCraft contributors | original CAM test sheet part (NEMA 17 mount), exported by SolidCraft from tests/cam/sheets/nema17-mount.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/sheets/stepped-plate.step | SolidCraft contributors | original CAM test sheet part (stepped pocket plate), exported by SolidCraft from tests/cam/sheets/stepped-plate.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/sheets/spacer-plate.step | SolidCraft contributors | original CAM test sheet part (8 mm spacer plate), exported by SolidCraft from tests/cam/sheets/spacer-plate.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/lathe/parts.png | SolidCraft contributors | original renders of the lathe test parts, drawn by solidcraft-cli from tests/cam/lathe/*.sc | MIT OR Apache-2.0 |
+| tests/cam/lathe/stepped-shaft.step | SolidCraft contributors | original turned test part (stepped shaft), exported by SolidCraft from tests/cam/lathe/stepped-shaft.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/lathe/flanged-bushing.step | SolidCraft contributors | original turned test part (flanged bushing), exported by SolidCraft from tests/cam/lathe/flanged-bushing.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/lathe/bearing-sleeve.step | SolidCraft contributors | original turned test part (bearing sleeve), exported by SolidCraft from tests/cam/lathe/bearing-sleeve.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/lathe/taper-arbor.step | SolidCraft contributors | original turned test part (taper arbor), exported by SolidCraft from tests/cam/lathe/taper-arbor.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/lathe/v-pulley.step | SolidCraft contributors | original turned test part (V-belt pulley), exported by SolidCraft from tests/cam/lathe/v-pulley.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/lathe/knob.step | SolidCraft contributors | original turned test part (knob), exported by SolidCraft from tests/cam/lathe/knob.sc; no external CAD geometry | MIT OR Apache-2.0 |
