@@ -312,12 +312,12 @@ fn the_lathe_parts_are_turned_about_z_as_designed() {
         let (d, length, want) = (f(&p["diameter"]), f(&p["length"]), f(&p["volume_mm3"]));
         let v = b.volume_at(0.002).unwrap();
         assert!((v - want).abs() <= 2e-4 * want, "{name}: volume {v:.2}, worked out {want:.2}");
-        let bounds = b.tessellate(0.002).unwrap().bounds();
+        let bounds = b.mesh(&solidcraft_kernel::MeshTolerance::chord(0.002)).unwrap().bounds();
         let (lo, hi) = (bounds.min, bounds.max);
         for (got, w) in [(lo.x, -d / 2.0), (hi.x, d / 2.0), (lo.y, -d / 2.0), (hi.y, d / 2.0), (lo.z, 0.0), (hi.z, length)] {
             assert!((got - w).abs() < 0.01, "{name}: box {lo:?} {hi:?}, want Ø{d} × {length}");
         }
-        let on_axis = |q: solidcraft_geom::Vec3| q.x.hypot(q.y) < 1e-6;
+        let on_axis = |q: solidcore_record::Vec3| q.x.hypot(q.y) < 1e-6;
         let along_z = |a: solidcraft_geom::UnitVec3| a.z.abs() > 1.0 - 1e-9;
         for i in 0..b.face_count() {
             let ok = match face_surface(b, i) {

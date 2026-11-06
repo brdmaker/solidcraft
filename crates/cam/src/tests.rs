@@ -134,7 +134,7 @@ mod region_tests {
 mod part_tests {
     use std::f64::consts::PI;
 
-    use solidcraft_geom::Vec3;
+    use solidcore_record::Vec3;
     use solidcraft_kernel::{Body, BoolOp, boolean, box_solid, cylinder};
 
     use crate::part::read_part;
@@ -471,7 +471,7 @@ mod job_tests {
     /// given (`[]`), it does not.
     #[test]
     fn tools_outside_the_rack_are_warned_about() {
-        let b = solidcraft_kernel::box_solid(solidcraft_geom::Vec3::new(0.0, 0.0, 0.0), solidcraft_geom::Vec3::new(40.0, 30.0, 6.0)).unwrap();
+        let b = solidcraft_kernel::box_solid(solidcore_record::Vec3::new(0.0, 0.0, 0.0), solidcore_record::Vec3::new(40.0, 30.0, 6.0)).unwrap();
         let plan = |rack: &str| {
             let j = Job::from_json(&format!(
                 r#"{{"stock": {{"size": [120, 80], "thickness": 6}}, {rack} "strategy": {{"roughing": {{"pattern": "offset"}}}},
@@ -660,7 +660,7 @@ mod nest_tests {
 }
 
 mod plan_tests {
-    use solidcraft_geom::Vec3;
+    use solidcore_record::Vec3;
     use solidcraft_kernel::{Body, BoolOp, boolean, box_solid, cylinder};
 
     use crate::job::Job;
@@ -1223,7 +1223,7 @@ mod plan_tests {
 }
 
 mod adaptive_tests {
-    use solidcraft_geom::Vec3;
+    use solidcore_record::Vec3;
     use solidcraft_kernel::{Body, BoolOp, boolean, box_solid};
 
     use crate::job::Job;
@@ -2132,7 +2132,8 @@ mod adaptive_tests {
 
 #[cfg(test)]
 mod scene_tests {
-    use solidcraft_geom::Vec3;
+    use solidcore_record::Vec3;
+    use solidcraft_geom::Vec3Geom;
 
     /// A binary STL: 80-byte header, the count, 50 bytes a triangle; a 1 × 2 × 3 box as written
     /// for the stock: 12 triangles facing out (their signed volumes add up to +6).
@@ -2251,7 +2252,7 @@ mod scene_tests {
 
 #[cfg(test)]
 mod sim_tests {
-    use solidcraft_geom::Vec3;
+    use solidcore_record::Vec3;
     use solidcraft_kernel::{BoolOp, boolean, box_solid};
 
     use crate::sim::{Cutter, HeightMap, simulate, sweep};
@@ -2405,7 +2406,7 @@ mod sim_tests {
 }
 
 mod remaining_tests {
-    use solidcraft_geom::Vec3;
+    use solidcore_record::Vec3;
     use solidcraft_kernel::{BoolOp, boolean, box_solid};
 
     use crate::job::Job;
@@ -2524,7 +2525,7 @@ mod remaining_tests {
 }
 
 mod finish_tests {
-    use solidcraft_geom::Vec3;
+    use solidcore_record::Vec3;
     use solidcraft_kernel::{Body, BoolOp, boolean, box_solid};
 
     use crate::job::Job;

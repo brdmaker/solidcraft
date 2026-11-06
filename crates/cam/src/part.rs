@@ -8,7 +8,8 @@
 
 use schemars::JsonSchema;
 use serde::Serialize;
-use solidcraft_geom::{Mesh, Plane, Vec2, Vec3};
+use solidcore_record::{Plane, Vec2, Vec3};
+use solidcraft_geom::{Mesh, PlaneGeom, Seg2Geom, Vec3Geom};
 use solidcraft_kernel::{Body, FaceSurface, face_surface};
 
 use crate::job::Up;
@@ -242,7 +243,7 @@ pub fn read_part(body: &Body) -> Result<PartFeatures> {
     let size = body.size();
     let tol = (size * 1e-6).max(1e-6);
     let mesh_tol = (size * 2e-5).clamp(0.001, 0.01);
-    let mesh = body.tessellate(mesh_tol)?;
+    let mesh = body.mesh(&solidcraft_kernel::MeshTolerance::chord(mesh_tol))?;
     let samples = samples(&mesh, nf);
     let top_z = samples.iter().map(|s| s.zmax).fold(f64::NEG_INFINITY, f64::max);
     let bottom_z = samples.iter().map(|s| s.zmin).fold(f64::INFINITY, f64::min);
@@ -433,10 +434,19 @@ fn floor(body: &Body, mesh: &Mesh, face: usize, s: &Sample, top_z: f64, tol: f64
     // Each edge as a polyline: exact where the kernel reads it, else the mesh's own polyline.
     let mut pieces: Vec<Vec<[f64; 2]>> = Vec::new();
     for (i, segs) in idx.iter().zip(exact) {
-        let pts: Vec<[f64; 2]> = match segs {
-            Some(segs) => segs.iter().flat_map(|seg| seg.polyline(AREA_TOL)).map(|p: Vec2| [p.x, p.y]).collect(),
-            None => mesh.edges.get(*i).map(|e| e.iter().map(|p| [p.x, p.y]).collect()).unwrap_or_default(),
-        };
+        // lines and arcs exactly; an edge with a free-form piece as the mesh draws it
+        let exact: Option<Vec<[f64; 2]>> = segs.and_then(|segs| {
+            segs.iter()
+                .map(|piece| match piece {
+                    solidcraft_kernel::PlanarPiece::Seg(seg) => {
+                        Some(seg.polyline(AREA_TOL).into_iter().map(|p: Vec2| [p.x, p.y]).collect::<Vec<_>>())
+                    }
+                    solidcraft_kernel::PlanarPiece::Spline(_) => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|v| v.concat())
+        });
+        let pts: Vec<[f64; 2]> = exact.unwrap_or_else(|| mesh.edges.get(*i).map(|e| e.iter().map(|p| [p.x, p.y]).collect()).unwrap_or_default());
         if pts.len() >= 2 {
             pieces.push(pts);
         }

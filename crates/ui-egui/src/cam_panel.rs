@@ -301,7 +301,8 @@ pub fn open(app: &mut SolveApp) {
 
 /// Add each body of the open design as a part.
 fn add_open_design(app: &SolveApp, panel: &mut CamPanel) {
-    for b in &app.session.world_state().bodies {
+    let Ok(world) = app.session.world_state() else { return };
+    for b in &world.bodies {
         if !panel.parts.iter().any(|p| p.design.is_empty() && p.body == b.name) {
             panel.parts.push(PartRow { design: String::new(), body: b.name.clone(), quantity: "1".into(), orient: 0 });
         }
@@ -408,7 +409,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut ask = None;
     let mut remove = None;
     let title = tr("cam_panel.title").to_string();
-    let closed = ui_kit::Window::new(egui::Id::new("sc_cam_job"), "settings", &title).cards(5.0).page_rows(24.0).show_body(ctx, |ui| {
+    let closed = ui_kit::Window::new(egui::Id::unique("sc_cam_job"), "settings", &title).cards(5.0).page_rows(24.0).show_body(ctx, |ui| {
         // the actions and what they did, above the form so they stay in view
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(!d.busy(), |ui| {

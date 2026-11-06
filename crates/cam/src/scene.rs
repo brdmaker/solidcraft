@@ -9,7 +9,8 @@
 
 use schemars::JsonSchema;
 use serde::Serialize;
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
+use solidcraft_geom::Vec3Geom;
 use solidcraft_kernel::Body;
 
 use crate::job::{Job, Origin, Up};
@@ -219,7 +220,7 @@ pub fn placed_copies(job: &Job, bodies: &[Body], plan: &JobPlan, tol: f64) -> Re
             continue;
         }
         let turned = crate::part::turned(body, *up)?;
-        let mesh = turned.tessellate(tol)?;
+        let mesh = turned.mesh(&solidcraft_kernel::MeshTolerance::chord(tol))?;
         let tris: Tris = mesh.triangles.iter().filter_map(|tr| mesh.tri(tr)).collect();
         for pl in plan.nesting.placements.iter().filter(|pl| pl.part == i) {
             // exact quarter turns

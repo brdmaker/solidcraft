@@ -247,7 +247,7 @@ pub(crate) fn read_job(s: &Session, v: &Value) -> Result<(Job, Option<PathBuf>)>
 pub(crate) fn part_body(s: &Session, base: Option<&Path>, part: &PartRef) -> Result<solidcraft_kernel::Body> {
     let label = part.label();
     if part.design.is_empty() {
-        let state = s.world_state();
+        let state = s.world_state()?;
         return state
             .body(&part.body)
             .map(|b| b.body.clone())
@@ -279,7 +279,7 @@ pub(crate) fn part_body(s: &Session, base: Option<&Path>, part: &PartRef) -> Res
     if let Some(e) = design.model.results.iter().find_map(|r| r.error.clone()) {
         return Err(fail(format!("the design has a feature that fails ({e})")));
     }
-    let state = design.world_state();
+    let state = design.world_state()?;
     state.body(&part.body).map(|b| b.body.clone()).ok_or_else(|| fail(format!("no body named `{}`", part.body)))
 }
 

@@ -14,7 +14,7 @@
 
 use schemars::JsonSchema;
 use serde::Serialize;
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
 use solidcraft_kernel::Body;
 
 use crate::job::{Job, ToolKind};

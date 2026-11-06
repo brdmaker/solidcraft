@@ -4159,6 +4159,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "solidcore-record",
  "solidcraft-geom",
  "solidcraft-kernel",
  "thiserror 2.0.21",

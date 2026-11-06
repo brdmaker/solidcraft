@@ -53,7 +53,7 @@ impl Profile {
 
 /// The profile of `body`, turned about its Z axis with its `front` end away from the chuck.
 pub fn read(body: &Body, front: Front) -> Result<Profile> {
-    let mesh = body.tessellate(MESH_TOL)?;
+    let mesh = body.mesh(&solidcraft_kernel::MeshTolerance::chord(MESH_TOL))?;
     let b = mesh.bounds();
     let (lo, hi) = (b.min, b.max);
     if !(lo.x.is_finite() && hi.x.is_finite() && hi.z > lo.z) {

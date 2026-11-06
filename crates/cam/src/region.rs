@@ -11,7 +11,8 @@ use i_overlay::float::scale::FixedScaleFloatOverlay;
 use i_overlay::mesh::float::outline::offset::OutlineOffset;
 use i_overlay::mesh::float::style::{LineJoin, OutlineStyle};
 use serde::Serialize;
-use solidcraft_geom::{Region2, Vec2};
+use solidcore_record::{Region2, Vec2};
+use solidcraft_geom::Loop2Geom;
 
 use crate::{CamError, Result};
 

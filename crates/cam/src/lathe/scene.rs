@@ -10,7 +10,8 @@
 
 use schemars::JsonSchema;
 use serde::Serialize;
-use solidcraft_geom::Vec3;
+use solidcore_record::Vec3;
+use solidcraft_geom::Vec3Geom;
 use solidcraft_kernel::Body;
 
 use super::job::{Front, LatheJob, LatheToolKind, ToolSide};
@@ -219,7 +220,7 @@ pub fn revolve(area: &Area) -> Vec<[Vec3; 3]> {
 
 /// The part `body`'s triangles placed in work coordinates: its axis on Z, its front face at Z0.
 fn placed_part(body: &Body, front: Front) -> Result<Vec<[Vec3; 3]>> {
-    let mesh = body.tessellate(MODEL_TOL)?;
+    let mesh = body.mesh(&solidcraft_kernel::MeshTolerance::chord(MODEL_TOL))?;
     let b = mesh.bounds();
     let place = |v: &Vec3| match front {
         Front::PlusZ => Vec3::new(v.x, v.y, v.z - b.max.z),

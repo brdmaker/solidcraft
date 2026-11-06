@@ -1,5 +1,5 @@
-use solidcraft_geom::Vec3;
-use solidcraft_geom::{Loop2, Plane, Region2, Vec2};
+use solidcore_record::Vec3;
+use solidcore_record::{Loop2, Plane, Region2, Vec2};
 use solidcraft_kernel::{Body, BoolOp, boolean, cylinder};
 
 use super::job::LatheJob;
