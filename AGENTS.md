@@ -27,8 +27,8 @@ Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelle
 - A PR's title and first sentence make sense to someone who never saw your chat or the issue: `skills/solidcraft-contributing/SKILL.md`.
 - Code, comments, commit messages and docs are in English, always: `skills/solidcraft-contributing/SKILL.md` ("Working as an agent").
 - Independent work runs in parallel, dependent work stays sequential: `skills/solidcraft-contributing/SKILL.md` ("Working as an agent").
-- Show observable changes with real screenshots or a recording, captured yourself (CAM: the toolpath preview, shown in the conversation).
-- Run `cargo xtask ci` before every commit (CAM-only commits: `cargo xtask cam`, see the CAM skill). `cargo xtask skills` keeps this file and `skills/` honest.
+- Show observable changes with real screenshots or a recording, captured yourself.
+- Run `cargo xtask ci` before every commit. `cargo xtask skills` keeps this file and `skills/` honest.
 
 ## Working on X: read the skill first
 | Working on | Read |
@@ -39,15 +39,15 @@ Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelle
 | A command, a crate boundary | `skills/solidcraft-commands/SKILL.md` |
 | A dialog, panel, camera, icon, colour | `skills/solidcraft-ui/SKILL.md` |
 | Labels, messages, translations | `skills/solidcraft-ui-text/SKILL.md` |
-| Saving something new in a design, import, export | `skills/solidcraft-file-formats/SKILL.md` |
+| Saving something new, import, export | `skills/solidcraft-file-formats/SKILL.md` |
 | Preferences, a changed default | `skills/solidcraft-preferences/SKILL.md` |
 | Writing or running tests | `skills/solidcraft-tests/SKILL.md` |
 | Slow work, the window thread, wasm | `skills/solidcraft-performance/SKILL.md` |
 | Releases, installers, packages | `skills/solidcraft-packaging/SKILL.md` |
-| Running the app, control channel, MCP tools | `skills/solidcraft-agent-tools/SKILL.md` |
+| Running the app, MCP tools | `skills/solidcraft-agent-tools/SKILL.md` |
 | Building a part over MCP | `skills/solidcraft-modeling/SKILL.md` |
 | Changing an existing design | `skills/solidcraft-editing/SKILL.md` |
 | A bug report, a crash, a wrong result | `skills/solidcraft-reporting/SKILL.md` |
 | Checking, porting, designs in git | `skills/solidcraft-checking/SKILL.md` |
 | Assemblies, joints, motion | `skills/solidcraft-mechanisms/SKILL.md` |
-| CAM: router toolpaths, G-code, `crates/cam` | `skills/solidcraft-cam/SKILL.md` |
+| CAM, `crates/cam` | `skills/solidcraft-cam/SKILL.md` |
