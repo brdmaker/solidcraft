@@ -294,11 +294,16 @@ pub fn export(job: &Job, bodies: &[Body], plan: &JobPlan) -> Result<SceneFiles> 
 
 /// The scene packed into one zip archive: `scene.json` and every model, compressed.
 pub fn zip(scene: &SceneFiles) -> Result<Vec<u8>> {
+    pack(&scene.json, &scene.files)
+}
+
+/// `scene.json` holding `json` and `files` packed into one zip archive, compressed.
+pub fn pack(json: &str, files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     use std::io::Write as _;
     let fail = |e: String| CamError::Invalid(format!("scene archive: {e}"));
     let mut w = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = ::zip::write::SimpleFileOptions::default().compression_method(::zip::CompressionMethod::Deflated);
-    for (name, bytes) in std::iter::once(("scene.json", scene.json.as_bytes())).chain(scene.files.iter().map(|(n, b)| (n.as_str(), b.as_slice()))) {
+    for (name, bytes) in std::iter::once(("scene.json", json.as_bytes())).chain(files.iter().map(|(n, b)| (n.as_str(), b.as_slice()))) {
         w.start_file(name, opts).map_err(|e| fail(e.to_string()))?;
         w.write_all(bytes).map_err(|e| fail(e.to_string()))?;
     }

@@ -1,11 +1,13 @@
 //! The LinuxCNC lathe program for a turning plan: XZ plane (G18), X as a diameter (G7), feed per
-//! revolution (G95) and constant surface speed held under the machine's top speed (G96 … D). The
-//! moves are the tools' imaginary tips, so the program runs without nose radius compensation
-//! (G40): touch each tool off on that tip. Moves are straight lines; curves are within the plan's
-//! path tolerance of their chords.
+//! revolution (G95). Turning, boring, grooving and parting run at constant surface speed held
+//! under the machine's (and the tool's) top speed (G96 … D); drilling and threading at a fixed
+//! speed (G97). Threads are cut a pass at a time with G33 (X set by the rapid before it), drills
+//! peck with plain feeds and rapids. The moves are the tools' touch-off points (turning tools'
+//! and boring bars' imaginary tips), so the program runs without nose radius compensation (G40).
+//! Moves are straight lines; curves are within the plan's path tolerance of their chords.
 
 use super::job::{LatheJob, LatheToolKind, SpindleDirection, ToolSide};
-use super::plan::{LathePlan, TipMove};
+use super::plan::{LathePlan, Spindle, TipMove};
 use crate::job::Coolant;
 use crate::{CamError, Result};
 
@@ -17,23 +19,36 @@ fn num(x: f64, decimals: u32) -> String {
 pub fn tool_line(job: &LatheJob, plan: &LathePlan, n: u32, decimals: u32) -> String {
     let f = |x: f64| num(x, decimals);
     let Some(t) = job.tool(n) else { return format!("TOOL T{n}") };
-    let kind = match t.kind {
-        LatheToolKind::Turning => "turning",
-    };
+    let kind = t.kind.name();
     let z_min = plan.ops.iter().filter(|o| o.tool == n).flat_map(|o| o.moves.iter()).map(|m| m.to()[1]).fold(f64::INFINITY, f64::min);
-    let mut line = format!(
-        "TOOL T{n} kind={kind} insert={} approach={} nose_radius={} feed={} depth={} surface_speed={}",
-        f(t.insert_angle_deg),
-        f(t.approach_deg),
-        f(t.nose_radius),
-        f(t.feed),
-        f(t.depth),
-        f(t.speed(&job.stock.material).unwrap_or(0.0))
-    );
+    let mut line = format!("TOOL T{n} kind={kind}");
+    match t.kind {
+        LatheToolKind::Turning | LatheToolKind::Boring => {
+            line.push_str(&format!(" insert={} approach={} nose_radius={}", f(t.insert_angle_deg), f(t.approach_deg), f(t.nose_radius)));
+            if let Some(b) = t.min_bore {
+                line.push_str(&format!(" min_bore={}", f(b)));
+            }
+        }
+        LatheToolKind::Grooving => line.push_str(&format!(" width={} nose_radius={}", f(t.blade_width()), f(t.nose_radius))),
+        LatheToolKind::Threading => line.push_str(&format!(" tip_angle={} nose_radius={}", f(t.point_angle()), f(t.nose_radius))),
+        LatheToolKind::Drill => {
+            line.push_str(&format!(" diameter={} tip_angle={}", f(t.diameter.unwrap_or(0.0)), f(t.point_angle())));
+            if let Some(p) = t.peck {
+                line.push_str(&format!(" peck={}", f(p)));
+            }
+        }
+    }
+    if matches!(t.kind, LatheToolKind::Grooving | LatheToolKind::Boring) {
+        line.push_str(&format!(" reach={}", f(t.reach())));
+    }
+    line.push_str(&format!(" feed={} depth={} surface_speed={}", f(t.feed), f(t.depth), f(t.speed(&job.stock.material).unwrap_or(0.0))));
+    if let Some(r) = t.max_rpm {
+        line.push_str(&format!(" max_rpm={}", f(r)));
+    }
     if z_min.is_finite() {
         line.push_str(&format!(" z_min={}", f(z_min)));
     }
-    let name = if t.name.is_empty() { format!("{kind} R{}", f(t.nose_radius)) } else { t.name.clone() };
+    let name = if t.name.is_empty() { kind.to_string() } else { t.name.clone() };
     line.push_str(&format!(" name={name}"));
     line
 }
@@ -96,6 +111,8 @@ pub fn linuxcnc(job: &LatheJob, plan: &LathePlan, title: &str) -> Result<String>
     };
     let mut tool = None;
     let mut motion = "";
+    // the last point written: unchanged axes are not repeated
+    let mut last: Option<[f64; 2]> = None;
     for op in &plan.ops {
         out(crate::post::comment(&op.name))?;
         if tool != Some(op.tool) {
@@ -103,8 +120,15 @@ pub fn linuxcnc(job: &LatheJob, plan: &LathePlan, title: &str) -> Result<String>
             out(format!("T{} M6 G43", op.tool))?;
             tool = Some(op.tool);
             motion = "";
+            last = Some(change);
         }
-        out(format!("G96 S{} D{} {spindle}", f(op.surface_speed), f(m.max_rpm)))?;
+        match op.spindle {
+            Spindle::SurfaceSpeed(v) => {
+                let top = job.tool(op.tool).and_then(|t| t.max_rpm).map_or(m.max_rpm, |r| r.min(m.max_rpm));
+                out(format!("G96 S{} D{} {spindle}", f(v), f(top)))?
+            }
+            Spindle::Rpm(r) => out(format!("G97 S{} {spindle}", f(r.min(m.max_rpm).round())))?,
+        }
         if let Some(c) = coolant {
             out(c.into())?;
         }
@@ -113,10 +137,23 @@ pub fn linuxcnc(job: &LatheJob, plan: &LathePlan, title: &str) -> Result<String>
             let (code, p) = match mv {
                 TipMove::Rapid(p) => ("G0", p),
                 TipMove::Feed(p) => ("G1", p),
+                TipMove::Thread { to, pitch } => {
+                    // synchronised with the spindle, one pass along Z (X set by the move before)
+                    out(format!("G33 Z{} K{}", f(to[1]), f(*pitch)))?;
+                    motion = "G33";
+                    last = Some(*to);
+                    continue;
+                }
             };
             let word = if code == motion { String::new() } else { format!("{code} ") };
+            let x = if last.is_some_and(|q| (q[0] - p[0]).abs() < 1e-9) { String::new() } else { format!("X{} ", dia(p[0])) };
+            let z = if last.is_some_and(|q| (q[1] - p[1]).abs() < 1e-9) { String::new() } else { format!("Z{}", f(p[1])) };
+            last = Some(*p);
+            if x.is_empty() && z.is_empty() {
+                continue;
+            }
             motion = code;
-            out(format!("{word}X{} Z{}", dia(p[0]), f(p[1])))?;
+            out(format!("{word}{x}{z}").trim_end().to_string())?;
         }
     }
     out(format!("G0 X{} Z{}", dia(change[0]), f(change[1])))?;

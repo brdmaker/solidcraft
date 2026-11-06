@@ -1,12 +1,12 @@
 //! Plan a lathe job, write its LinuxCNC program and a drawing of the simulated half section:
-//! `cargo run -p solidcraft-cam --example lathe -- JOB.json OUT.ngc [OUT.svg]`. The part's
+//! `cargo run -p solidcraft-cam --example lathe -- JOB.json OUT.ngc [OUT.svg [OUT.zip]]`. The part's
 //! `design` is a STEP file relative to the job. Prints the operations, the warnings and the
-//! simulation's report.
+//! simulation's report; the zip holds the scene (models, tool data, the program).
 
 use std::path::Path;
 use std::process::ExitCode;
 
-use solidcraft_cam::lathe::{job::LatheJob, plan, post, profile, sim};
+use solidcraft_cam::lathe::{job::LatheJob, plan, post, profile, scene, sim};
 
 fn main() -> ExitCode {
     match run() {
@@ -21,7 +21,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(job_path), Some(out)) = (args.first(), args.get(1)) else {
-        return Err("usage: lathe JOB.json OUT.ngc [OUT.svg]".into());
+        return Err("usage: lathe JOB.json OUT.ngc [OUT.svg [OUT.zip]]".into());
     };
     let base = Path::new(job_path).parent().unwrap_or(Path::new("."));
     let text = std::fs::read_to_string(job_path).map_err(|e| format!("{job_path}: {e}"))?;
@@ -46,7 +46,11 @@ fn run() -> Result<(), String> {
     if let Some(svg) = args.get(2) {
         std::fs::write(svg, sim::svg(&pl, &left, 8.0).map_err(|e| e.to_string())?).map_err(|e| format!("{svg}: {e}"))?;
     }
-    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    if let Some(zip) = args.get(3) {
+        let scene = scene::export(&job, &body.body, &pl, &report, &left).map_err(|e| e.to_string())?;
+        std::fs::write(zip, scene.zip().map_err(|e| e.to_string())?).map_err(|e| format!("{zip}: {e}"))?;
+    }
+    println!("{}", serde_json::to_string(&report).map_err(|e| e.to_string())?);
     println!("{} lines in {out}", program.lines().count());
     Ok(())
 }

@@ -7,8 +7,8 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::job::{LatheJob, LatheTool};
-use super::plan::{LathePlan, TipMove};
+use super::job::{LatheJob, LatheTool, LatheToolKind};
+use super::plan::{LatheOpKind, LathePlan, TipMove};
 use crate::region::{Area, Ring};
 use crate::{CamError, Result};
 
@@ -60,6 +60,11 @@ fn dir(deg: f64) -> [f64; 2] {
 
 /// The insert of `t` with its nose's centre at `c` ([z, r]): its outline's points.
 pub fn insert(t: &LatheTool, c: [f64; 2]) -> Vec<[f64; 2]> {
+    insert_sized(t, c, EDGE)
+}
+
+/// The insert with edges `edge` long.
+fn insert_sized(t: &LatheTool, c: [f64; 2], edge: f64) -> Vec<[f64; 2]> {
     let (lead, trail) = (t.lead_angle(), t.trail_angle());
     let half = (t.insert_angle_deg / 2.0).to_radians();
     let rn = t.nose_radius;
@@ -67,9 +72,9 @@ pub fn insert(t: &LatheTool, c: [f64; 2]) -> Vec<[f64; 2]> {
     // the sharp corner the nose rounds, and where the round meets the edges
     let corner = [c[0] - bis[0] * rn / half.sin(), c[1] - bis[1] * rn / half.sin()];
     let (ul, ut) = (dir(lead), dir(trail));
-    let a = [corner[0] + ul[0] * EDGE, corner[1] + ul[1] * EDGE];
-    let b = [corner[0] + ut[0] * EDGE, corner[1] + ut[1] * EDGE];
-    let far = [a[0] + ut[0] * EDGE, a[1] + ut[1] * EDGE];
+    let a = [corner[0] + ul[0] * edge, corner[1] + ul[1] * edge];
+    let b = [corner[0] + ut[0] * edge, corner[1] + ut[1] * edge];
+    let far = [a[0] + ut[0] * edge, a[1] + ut[1] * edge];
     let mut pts = vec![a, far, b];
     // the nose: the round between the edges' tangent points, the side facing away from the insert
     let t_lead = [corner[0] + ul[0] * rn / half.tan(), corner[1] + ul[1] * rn / half.tan()];
@@ -111,9 +116,34 @@ fn hull(mut pts: Vec<[f64; 2]>) -> Ring {
     lower
 }
 
-/// The nose centre of the tip at `p` ([x radius, z]) as [z, r].
-fn centre(t: &LatheTool, p: [f64; 2]) -> [f64; 2] {
-    [p[1] + t.nose_radius, p[0] + t.nose_radius]
+/// The tool `t`'s outline with its tip (where it is touched off) at `p` ([x radius, z]), as
+/// [z, r] points: a turning insert with its nose's centre above and behind the tip; a boring bar's
+/// mirrored, its nose's centre below; a grooving blade standing up from its corner toward the
+/// chuck; a threading tool's V standing on its point; a drill's cone and body along the axis.
+pub fn shape(t: &LatheTool, p: [f64; 2]) -> Vec<[f64; 2]> {
+    let rn = t.nose_radius;
+    match t.kind {
+        LatheToolKind::Turning => insert(t, [p[1] + rn, p[0] + rn]),
+        LatheToolKind::Boring => {
+            let c = [p[1] + rn, p[0] - rn];
+            insert_sized(t, c, EDGE / 2.0).into_iter().map(|q| [q[0], 2.0 * c[1] - q[1]]).collect()
+        }
+        LatheToolKind::Grooving => {
+            let (w, h) = (t.blade_width(), t.reach() + 5.0);
+            vec![[p[1], p[0]], [p[1] + w, p[0]], [p[1] + w, p[0] + h], [p[1], p[0] + h]]
+        }
+        LatheToolKind::Threading => {
+            let h = super::plan::THREAD_V;
+            let s = h * (t.point_angle().to_radians() / 2.0).tan();
+            vec![[p[1], p[0]], [p[1] + s, p[0] + h], [p[1] + s, p[0] + h + 10.0], [p[1] - s, p[0] + h + 10.0], [p[1] - s, p[0] + h]]
+        }
+        LatheToolKind::Drill => {
+            let r = t.diameter.unwrap_or(0.0) / 2.0;
+            let cone = r / (t.point_angle().to_radians() / 2.0).tan();
+            let body = 60.0;
+            vec![[p[1], 0.0], [p[1] + cone, r], [p[1] + cone + body, r], [p[1] + cone + body, 0.0]]
+        }
+    }
 }
 
 fn pieces(a: &Area, min_area: f64, min_thickness: f64) -> Vec<Piece> {
@@ -144,7 +174,48 @@ pub fn part_area(plan: &LathePlan) -> Result<Area> {
     let pts: Vec<[f64; 2]> = p.od.iter().enumerate().map(|(i, r)| [i as f64 * p.dz - l, *r]).collect();
     ring.extend(super::plan::simplify(&pts, 0.0005));
     ring.push([0.0, 0.0]);
-    Area::union_of(&[ring])
+    let mut area = Area::union_of(&[ring])?;
+    // less the bore (through the parting allowance where it goes through)
+    let mut bores: Vec<Ring> = Vec::new();
+    let mut i = 0;
+    let n = p.id.len();
+    while i < n {
+        if p.id.get(i).copied().unwrap_or(0.0) <= 0.0 {
+            i += 1;
+            continue;
+        }
+        let a = i;
+        while i < n && p.id.get(i).copied().unwrap_or(0.0) > 0.0 {
+            i += 1;
+        }
+        let b = i - 1;
+        let z = |k: usize| k as f64 * p.dz - l;
+        let mut pts: Vec<[f64; 2]> = (a..=b).map(|k| [z(k), p.id.get(k).copied().unwrap_or(0.0)]).collect();
+        let za = if a == 0 { back - 1.0 } else { z(a) };
+        if let Some(f) = pts.first().copied() {
+            pts.insert(0, [za, f[1]]);
+        }
+        let mut ring: Ring = vec![[za, -1.0]];
+        ring.extend(super::plan::simplify(&pts, 0.0005));
+        let zb = if b + 1 >= n { 1.0 } else { z(b) };
+        if let Some(last) = ring.last().copied() {
+            ring.push([zb, last[1]]);
+        }
+        ring.push([zb, -1.0]);
+        bores.push(ring);
+    }
+    if !bores.is_empty() {
+        area = area.difference(&Area::union_of(&bores)?)?;
+    }
+    // threads cut to their minor diameter
+    for t in &plan.threads {
+        let (a, b, f) = (t.z[0], t.z[1], t.flank);
+        let top = t.major + 1.0;
+        let flank_top = f * (top - t.minor) / (t.major - t.minor).max(1e-9);
+        let groove: Ring = vec![[a, t.minor], [b, t.minor], [b + flank_top, top], [a - flank_top, top]];
+        area = area.difference(&Area::union_of(&[groove])?)?;
+    }
+    Ok(area)
 }
 
 /// Simulate `plan`.
@@ -161,14 +232,15 @@ pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Are
         for m in &op.moves {
             let to = m.to();
             let from = at.unwrap_or(to);
-            let mut pts = insert(t, centre(t, from));
-            pts.extend(insert(t, centre(t, to)));
+            let mut pts = shape(t, from);
+            pts.extend(shape(t, to));
             let swept = hull(pts);
-            if swept.iter().any(|q| q[0] < su.jaws) {
+            // a drill on the axis passes inside the jaws
+            if t.kind != LatheToolKind::Drill && swept.iter().any(|q| q[0] < su.jaws) {
                 jaw_hits += 1;
             }
             match m {
-                TipMove::Feed(_) => batch.push(swept),
+                TipMove::Feed(_) | TipMove::Thread { .. } => batch.push(swept),
                 TipMove::Rapid(_) => {
                     if !batch.is_empty() {
                         left = left.difference(&Area::union_of(&batch)?)?;
@@ -186,8 +258,21 @@ pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Are
             left = left.difference(&Area::union_of(&batch)?)?;
         }
     }
-    let part = part_area(plan)?;
-    let window = Area::rect(su.turned_to, 0.0, su.front + 1.0, su.radius + 1.0)?;
+    let mut part = part_area(plan)?;
+    // the parting cut: the kerf behind the part is no gouge, nor what stays in the chuck behind it
+    let mut from = su.turned_to;
+    for op in plan.ops.iter().filter(|o| o.kind == LatheOpKind::Parting) {
+        let w = job.tool(op.tool).map_or(0.0, LatheTool::blade_width);
+        let z = op.moves.iter().map(|m| m.to()[1]).fold(f64::INFINITY, f64::min);
+        if z.is_finite() && w > 0.0 {
+            part = part.difference(&Area::rect(z, -1.0, z + w, su.radius + 1.0)?)?;
+            from = from.max(z + w);
+        }
+    }
+    if from > su.turned_to {
+        part = part.difference(&Area::rect(su.turned_to - 1.0, -1.0, from, su.radius + 1.0)?)?;
+    }
+    let window = Area::rect(from, 0.0, su.front + 1.0, su.radius + 1.0)?;
     let extra = left.intersection(&window)?.difference(&part)?;
     let cut = part.difference(&left)?;
     // the paths are chords within PATH_TOL of the nose's path, the part's outline within the
