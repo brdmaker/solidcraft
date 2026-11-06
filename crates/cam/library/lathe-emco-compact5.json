@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "name": "Emco Compact 5 CNC, 6-station turret: turning tools",
+  "note": "Starting values for a small bench lathe (spindle to 3200 rpm): check them against the insert maker's data and your machine. Tool numbers are the turret's stations. Touch each tool off on its imaginary tip (the corner where the tangents to its nose at the front and below meet): the program drives that point, nose radius allowed for.",
+  "tools": [
+    {"number": 1, "name": "Roughing: CCMT 06 80° insert, 95° holder, R0.4", "kind": "turning", "insert_angle_deg": 80, "approach_deg": 95, "nose_radius": 0.4,
+     "feed": 0.1, "depth": 0.5, "surface_speed": {"aluminium": 150, "brass": 120, "steel": 70}},
+    {"number": 2, "name": "Finishing: VCMT 11 35° insert, 93° holder, R0.2", "kind": "turning", "insert_angle_deg": 35, "approach_deg": 93, "nose_radius": 0.2,
+     "feed": 0.05, "depth": 0.5, "surface_speed": {"aluminium": 180, "brass": 150, "steel": 90}}
+  ]
+}

@@ -1,4 +1,4 @@
-//! SolidCraft CAM for 3-axis routers machining from the top.
+//! SolidCraft CAM for 3-axis routers machining from the top, and for lathes ([`lathe`]).
 //!
 //! Toolpaths come from the exact solid: machining features are read from the B-rep faces
 //! (planes, vertical cylinders and cones), so holes keep their true diameters and arcs stay arcs.
@@ -7,6 +7,7 @@
 
 pub mod adaptive;
 pub mod job;
+pub mod lathe;
 pub mod nest;
 pub mod part;
 pub mod plan;
