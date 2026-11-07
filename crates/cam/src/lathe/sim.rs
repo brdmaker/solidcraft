@@ -335,3 +335,103 @@ pub fn svg(plan: &LathePlan, left: &Area, scale: f64) -> Result<String> {
     writeln!(o, "</svg>").map_err(e)?;
     Ok(o)
 }
+
+/// The colour each kind of operation's feeds are drawn in.
+pub fn colour(kind: LatheOpKind) -> &'static str {
+    match kind {
+        LatheOpKind::Facing => "#7c3aed",
+        LatheOpKind::Drilling => "#0891b2",
+        LatheOpKind::Roughing => "#d97706",
+        LatheOpKind::Boring => "#db2777",
+        LatheOpKind::Finishing => "#16a34a",
+        LatheOpKind::Grooving => "#c2410c",
+        LatheOpKind::Threading => "#4f46e5",
+        LatheOpKind::Parting => "#b91c1c",
+    }
+}
+
+/// The picture [`svg`] draws, as a PNG `width` pixels wide: the bar as left (grey), the part's
+/// outline (blue), each operation's feeds in its [`colour`], rapids faint, the jaws' face (red)
+/// and the axis.
+pub fn png(plan: &LathePlan, left: &Area, width: u32) -> Result<Vec<u8>> {
+    use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform};
+    let su = &plan.setup;
+    let (z0, z1) = (su.jaws - 2.0, su.front + 6.0);
+    let (r0, r1) = (-1.0, su.radius + 6.0);
+    if !(z1 > z0 && r1 > r0 && z0.is_finite() && r1.is_finite()) {
+        return Err(CamError::Invalid("the bar has no size".into()));
+    }
+    let width = width.clamp(64, 4096);
+    let scale = f64::from(width) / (z1 - z0);
+    let height = (((r1 - r0) * scale).round() as u32).clamp(16, 4096);
+    let mut pm = Pixmap::new(width, height).ok_or_else(|| CamError::Invalid("picture size".into()))?;
+    pm.fill(crate::preview::rgb("#ffffff", 1.0));
+    // (z, r) in mm → pixels, r up
+    let tf = Transform::from_row(scale as f32, 0.0, 0.0, -(scale as f32), (-z0 * scale) as f32, (r1 * scale) as f32);
+    let paint = |hex: &str, a: f32| {
+        let mut p = Paint::default();
+        p.set_color(crate::preview::rgb(hex, a));
+        p.anti_alias = true;
+        p
+    };
+    let line = |w: f64| Stroke { width: (w / scale) as f32, ..Stroke::default() };
+    let rings = |a: &Area| {
+        let mut pb = PathBuilder::new();
+        for ring in a.rings() {
+            for (i, q) in ring.iter().enumerate() {
+                if i == 0 {
+                    pb.move_to(q[0] as f32, q[1] as f32);
+                } else {
+                    pb.line_to(q[0] as f32, q[1] as f32);
+                }
+            }
+            pb.close();
+        }
+        pb.finish()
+    };
+    if let Some(p) = rings(left) {
+        pm.fill_path(&p, &paint("#c8ccd2", 1.0), FillRule::EvenOdd, tf, None);
+        pm.stroke_path(&p, &paint("#7a808a", 1.0), &line(0.6), tf, None);
+    }
+    if let Some(p) = rings(&part_area(plan)?) {
+        pm.stroke_path(&p, &paint("#2f6fd6", 1.0), &line(1.2), tf, None);
+    }
+    for op in &plan.ops {
+        let mut feeds = PathBuilder::new();
+        let mut rapids = PathBuilder::new();
+        let mut at: Option<[f64; 2]> = None;
+        for m in &op.moves {
+            let q = m.to();
+            if let Some(a) = at {
+                let pb = if matches!(m, TipMove::Rapid(_)) { &mut rapids } else { &mut feeds };
+                pb.move_to(a[1] as f32, a[0] as f32);
+                pb.line_to(q[1] as f32, q[0] as f32);
+            }
+            at = Some(q);
+        }
+        let c = colour(op.kind);
+        if let Some(p) = rapids.finish() {
+            let mut s = line(0.6);
+            s.dash = StrokeDash::new(vec![(3.0 / scale) as f32, (3.0 / scale) as f32], 0.0);
+            pm.stroke_path(&p, &paint(c, 0.35), &s, tf, None);
+        }
+        if let Some(p) = feeds.finish() {
+            pm.stroke_path(&p, &paint(c, 0.9), &line(0.8), tf, None);
+        }
+    }
+    let mut jaws = PathBuilder::new();
+    jaws.move_to(su.jaws as f32, r0 as f32);
+    jaws.line_to(su.jaws as f32, r1 as f32);
+    if let Some(p) = jaws.finish() {
+        pm.stroke_path(&p, &paint("#dc2626", 1.0), &line(2.0), tf, None);
+    }
+    let mut axis = PathBuilder::new();
+    axis.move_to(z0 as f32, 0.0);
+    axis.line_to(z1 as f32, 0.0);
+    if let Some(p) = axis.finish() {
+        let mut s = line(0.8);
+        s.dash = StrokeDash::new(vec![(8.0 / scale) as f32, (3.0 / scale) as f32, (2.0 / scale) as f32, (3.0 / scale) as f32], 0.0);
+        pm.stroke_path(&p, &paint("#555555", 1.0), &s, tf, None);
+    }
+    crate::preview::encode(&pm)
+}

@@ -121,3 +121,56 @@ pub struct JobSimulateResult {
     /// The picture written, if one was asked for.
     pub image: Option<String>,
 }
+
+/// A lathe job to plan and simulate.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct LathePlanParams {
+    /// The lathe job as an object, or the path of a job file: {machine?, stock: {diameter,
+    /// material?, length?, in_chuck?, face_allowance?, parting_allowance?, chuck_clearance?},
+    /// part: {body, design?, name?, front?, threads?}, library?, tools?, strategy?, post?}. The
+    /// part's `design` is relative to the job file (an object: to the open design's folder); an
+    /// empty `design` takes the body from the open design.
+    pub job: serde_json::Value,
+    /// A PNG to draw the simulated half section in.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// What `cam.lathe.plan` returns.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LathePlanResult {
+    /// The machine, the bar as set up, the part's outline and bore, the tools in the order the
+    /// program loads them, the operations, the threads, the warnings and the simulation's report:
+    /// what an exported scene's `scene.json` says.
+    pub scene: solidcraft_cam::lathe::scene::LatheSceneDoc,
+    /// The picture written, if one was asked for.
+    pub image: Option<String>,
+}
+
+/// A lathe job to write out: its program, or its scene for a machine's viewer.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct LatheWriteParams {
+    /// The lathe job (as for `cam.lathe.plan`): an object or the path of a job file.
+    pub job: serde_json::Value,
+    /// The file to write: the program (`.ngc`), or the scene (a `.zip`, or a folder).
+    pub path: String,
+}
+
+/// What `cam.lathe.gcode` and `cam.lathe.export_scene` return.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LatheWriteResult {
+    /// The file or folder written.
+    pub path: String,
+    /// The files written: the program, or the scene's files as named in the archive or folder.
+    pub files: Vec<String>,
+    /// Lines in the program.
+    pub lines: usize,
+    /// The tools the program loads, in order of first use.
+    pub tools: Vec<u32>,
+    /// Operations in the order they run.
+    pub operations: Vec<String>,
+    /// The plan's warnings.
+    pub warnings: Vec<String>,
+}

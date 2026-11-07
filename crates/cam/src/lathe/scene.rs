@@ -96,6 +96,9 @@ pub struct SceneTurnedPart {
     pub outline: Vec<[f64; 2]>,
     /// The bore: [z, diameter] where the part is hollow, within 0.002 (empty: solid).
     pub bore: Vec<[f64; 2]>,
+    /// Whether the outline was read from the part's exact faces (all of revolution about Z);
+    /// else from its mesh, within 0.001.
+    pub exact: bool,
     pub model: String,
 }
 
@@ -269,10 +272,7 @@ fn op_kind(k: LatheOpKind) -> &'static str {
 /// what [`super::sim::simulate`] made of `plan`.
 pub fn export(job: &LatheJob, body: &Body, plan: &LathePlan, report: &LatheSimReport, left: &Area) -> Result<LatheSceneFiles> {
     let su = &plan.setup;
-    let p = &plan.profile;
-    let l = p.length;
-    let r = |x: f64| (x * 1e6).round() / 1e6;
-    let title = if job.part.name.is_empty() { job.part.body.clone() } else { job.part.name.clone() };
+    let title = title(job);
     let back_z = su.front - su.length;
     let mut files = Vec::new();
     let bar = Area::rect(back_z, 0.0, su.front, su.radius)?;
@@ -281,7 +281,25 @@ pub fn export(job: &LatheJob, body: &Body, plan: &LathePlan, report: &LatheSimRe
     let turned = left.simplified(super::plan::PATH_TOL)?;
     files.push(("turned.stl".to_string(), crate::scene::stl("turned", &revolve(&turned))));
     files.push(("job.ngc".to_string(), super::post::linuxcnc(job, plan, &title)?.into_bytes()));
+    let doc = describe(job, plan, report);
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| CamError::Invalid(format!("scene: {e}")))?;
+    Ok(LatheSceneFiles { doc, json, files })
+}
 
+/// The job's title: the part's name, else its body's.
+pub fn title(job: &LatheJob) -> String {
+    if job.part.name.is_empty() { job.part.body.clone() } else { job.part.name.clone() }
+}
+
+/// What the scene file says of a planned and simulated job (the models it names are written by
+/// [`export`]).
+pub fn describe(job: &LatheJob, plan: &LathePlan, report: &LatheSimReport) -> LatheSceneDoc {
+    let su = &plan.setup;
+    let p = &plan.profile;
+    let l = p.length;
+    let r = |x: f64| (x * 1e6).round() / 1e6;
+    let title = title(job);
+    let back_z = su.front - su.length;
     let mut order: Vec<u32> = Vec::new();
     for op in &plan.ops {
         if !order.contains(&op.tool) {
@@ -369,7 +387,7 @@ pub fn export(job: &LatheJob, body: &Body, plan: &LathePlan, report: &LatheSimRe
         super::plan::simplify(&pts, 0.002).into_iter().map(|q| [r(q[0]), r(2.0 * q[1])]).collect()
     };
     let bore = if p.id.iter().any(|v| *v > 0.0) { line(&p.id) } else { Vec::new() };
-    let doc = LatheSceneDoc {
+    LatheSceneDoc {
         version: 1,
         machine_type: "lathe".into(),
         units: "mm".into(),
@@ -404,6 +422,7 @@ pub fn export(job: &LatheJob, body: &Body, plan: &LathePlan, report: &LatheSimRe
             z: [0.0, r(-l)],
             outline: line(&p.od),
             bore,
+            exact: p.exact,
             model: "part.stl".into(),
         },
         turned_model: "turned.stl".into(),
@@ -413,7 +432,5 @@ pub fn export(job: &LatheJob, body: &Body, plan: &LathePlan, report: &LatheSimRe
         threads,
         warnings: plan.warnings.clone(),
         simulation: report.clone(),
-    };
-    let json = serde_json::to_string_pretty(&doc).map_err(|e| CamError::Invalid(format!("scene: {e}")))?;
-    Ok(LatheSceneFiles { doc, json, files })
+    }
 }

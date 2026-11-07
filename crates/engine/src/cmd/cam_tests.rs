@@ -245,3 +245,124 @@ fn simulate_reports_and_draws() {
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A folder of its own for a test's files.
+fn lathe_out(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("solidcraft-lathe-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// The flanged bushing (tests/cam/lathe: Ø40 × 5 flange, Ø25 body to 30, a Ø16 bore through,
+/// brass) from a Ø45 bar, its design relative to the job file: read from its exact faces, the bar
+/// 30 + 0.5 + 3 + 2 + 20 = 55.5 → 56 long, 36 out of the chuck (the jaws at 0.5 − 36), faced,
+/// drilled Ø8 (T5, the largest turret drill under Ø16), roughed, bored (T6), finished and parted
+/// off; the picture is a PNG as wide as asked (1600).
+#[test]
+fn lathe_plan_turns_the_flanged_bushing_from_its_design() {
+    let out = lathe_out("plan");
+    let job = json!({
+        "stock": {"diameter": 45, "material": "brass"},
+        "part": {"design": fixtures().join("lathe/flanged-bushing.sc").to_string_lossy(), "body": "FlangedBushing"}
+    });
+    let job_path = out.join("job.json");
+    std::fs::write(&job_path, job.to_string()).unwrap();
+    let image = out.join("bushing.png");
+    let mut s = Session::default();
+    let r = run(&mut s, "cam.lathe.plan", json!({"job": job_path.to_string_lossy(), "image": image.to_string_lossy()}));
+    let sc = &r["scene"];
+    assert_eq!(sc["machine_type"], "lathe");
+    assert_eq!(sc["part"]["exact"], json!(true));
+    assert!((sc["part"]["max_diameter"].as_f64().unwrap() - 40.0).abs() < 1e-6);
+    assert_eq!(
+        (sc["stock"]["length"].as_f64(), sc["stock"]["stick_out"].as_f64(), sc["stock"]["jaws_z"].as_f64()),
+        (Some(56.0), Some(36.0), Some(-35.5))
+    );
+    let kinds: Vec<&str> = sc["operations"].as_array().unwrap().iter().map(|o| o["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["facing", "drilling", "roughing", "boring", "finishing", "parting"]);
+    assert_eq!(sc["operations"][1]["tool"], json!(5));
+    let sim = &sc["simulation"];
+    assert!(sim["gouges"].as_array().unwrap().is_empty() && sim["rapid_hits"].as_array().unwrap().is_empty() && sim["jaw_hits"] == json!(0));
+    let png = std::fs::read(&image).unwrap();
+    assert_eq!(&png[1..4], b"PNG");
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 1600);
+}
+
+/// The same job (its STEP file) written out: the program on G18 G7, the drill (T5) at a fixed
+/// speed (G97), T1 at brass's 120 m/min under the machine's 3200 rpm (G96 S120 D3200); the
+/// scene as a zip and as a folder with its five files, the folder's program the same.
+#[test]
+fn lathe_gcode_and_scene_are_written() {
+    let out = lathe_out("write");
+    let job = json!({
+        "stock": {"diameter": 45, "material": "brass"},
+        "part": {"design": fixtures().join("lathe/flanged-bushing.step").to_string_lossy(), "body": "FlangedBushing"}
+    });
+    let mut s = Session::default();
+    let ngc = out.join("bushing.ngc");
+    let r = run(&mut s, "cam.lathe.gcode", json!({"job": job, "path": ngc.to_string_lossy()}));
+    assert_eq!(r["tools"], json!([1, 5, 6, 2, 3]));
+    let prog = std::fs::read_to_string(&ngc).unwrap();
+    assert_eq!(r["lines"].as_u64().unwrap() as usize, prog.lines().count());
+    for w in ["G18 G7 G21 G90 G40 G80 G95", "T5 M6 G43", "G96 S120 D3200 M3", "M30"] {
+        assert!(prog.lines().any(|l| l == w), "{w}");
+    }
+    assert!(prog.lines().any(|l| l.starts_with("G97 S") && l.ends_with(" M3")), "the drill at a fixed speed");
+    let zip = out.join("bushing.zip");
+    let r = run(&mut s, "cam.lathe.export_scene", json!({"job": job, "path": zip.to_string_lossy()}));
+    assert_eq!(r["files"], json!(["scene.json", "stock.stl", "part.stl", "turned.stl", "job.ngc"]));
+    assert_eq!(&std::fs::read(&zip).unwrap()[0..2], b"PK");
+    let folder = out.join("scene");
+    run(&mut s, "cam.lathe.export_scene", json!({"job": job, "path": folder.to_string_lossy()}));
+    let doc: Value = serde_json::from_slice(&std::fs::read(folder.join("scene.json")).unwrap()).unwrap();
+    assert_eq!(doc["program"], "job.ngc");
+    assert_eq!(std::fs::read_to_string(folder.join("job.ngc")).unwrap(), prog, "the scene's program is the one written alone");
+}
+
+/// A job that can't be turned is refused with the reason: no job, a body the open design
+/// doesn't have, a bar narrower than the part, an unknown thread.
+#[test]
+fn lathe_jobs_that_cannot_be_turned_are_refused() {
+    let mut s = Session::default();
+    assert!(s.execute("cam.lathe.plan", &json!({})).is_err());
+    let err = s.execute("cam.lathe.plan", &json!({"job": {"stock": {"diameter": 20}, "part": {"body": "Nothing"}}})).unwrap_err().to_string();
+    assert!(err.contains("no body named `Nothing`"), "{err}");
+    let bushing = fixtures().join("lathe/flanged-bushing.step").to_string_lossy().into_owned();
+    let err = s
+        .execute("cam.lathe.plan", &json!({"job": {"stock": {"diameter": 30}, "part": {"design": bushing, "body": "FlangedBushing"}}}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("the part is Ø40.000; the bar is Ø30.000"), "{err}");
+    let err = s
+        .execute("cam.lathe.plan", &json!({"job": {"stock": {"diameter": 45}, "part": {"design": bushing, "body": "FlangedBushing", "threads": [{"designation": "M13", "z_from": 0, "z_to": 5}]}}}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("M13"), "{err}");
+}
+
+/// The knob as its design builds it (tests/cam/lathe/knob.sc, brass, from a Ø28 bar): its R2
+/// grip groove is half a torus whose two edges both lie on the tube's ring (r 12.5), so only its
+/// meridian says the groove is cut in: read exactly, the knob is Ø25 at most and Ø21 at the
+/// groove's bottom (z 22.5 from its chuck end: work Z 22.5 − 36.708), not Ø29. Its M12 thread
+/// over z 0 to 12 is cut by T4.
+#[test]
+fn lathe_plan_reads_the_knob_design_with_its_grip_groove_cut_in() {
+    let job = json!({
+        "stock": {"diameter": 28, "material": "brass"},
+        "part": {"design": fixtures().join("lathe/knob.sc").to_string_lossy(), "body": "Knob", "threads": [{"designation": "M12", "z_from": 0, "z_to": 12}]}
+    });
+    let mut s = Session::default();
+    let r = run(&mut s, "cam.lathe.plan", json!({"job": job}));
+    let part = &r["scene"]["part"];
+    assert_eq!(part["exact"], json!(true));
+    assert!((part["max_diameter"].as_f64().unwrap() - 25.0).abs() < 1e-6, "{}", part["max_diameter"]);
+    let l = part["length"].as_f64().unwrap();
+    let at = |z: f64| {
+        let o = part["outline"].as_array().unwrap();
+        let w = o.windows(2).find(|w| w[0][0].as_f64().unwrap() <= z && w[1][0].as_f64().unwrap() >= z).unwrap();
+        let (z0, d0, z1, d1) = (w[0][0].as_f64().unwrap(), w[0][1].as_f64().unwrap(), w[1][0].as_f64().unwrap(), w[1][1].as_f64().unwrap());
+        d0 + (d1 - d0) * (z - z0) / (z1 - z0).max(1e-12)
+    };
+    assert!((at(22.5 - l) - 21.0).abs() < 0.01, "{}", at(22.5 - l));
+    assert!(r["scene"]["operations"].as_array().unwrap().iter().any(|o| o["kind"] == "threading" && o["tool"] == 4));
+}

@@ -11,7 +11,7 @@ use super::CommandSpec;
 use crate::params::bad;
 use crate::schema::cam::{
     JobExportSceneParams, JobExportSceneResult, JobGcodeParams, JobGcodeResult, JobNestParams, JobNestResult, JobSimulateParams, JobSimulateResult,
-    NestedPart, PartInspectParams,
+    LathePlanParams, LathePlanResult, LatheWriteParams, LatheWriteResult, NestedPart, PartInspectParams,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
@@ -21,11 +21,53 @@ const JOB_NEST_CONTRACT: TypedContract<JobNestParams> = TypedContract::new();
 const JOB_EXPORT_SCENE_CONTRACT: TypedContract<JobExportSceneParams> = TypedContract::new();
 const JOB_GCODE_CONTRACT: TypedContract<JobGcodeParams> = TypedContract::new();
 const JOB_SIMULATE_CONTRACT: TypedContract<JobSimulateParams> = TypedContract::new();
+const LATHE_PLAN_CONTRACT: TypedContract<LathePlanParams> = TypedContract::new();
+const LATHE_WRITE_CONTRACT: TypedContract<LatheWriteParams> = TypedContract::new();
 
 /// Largest job file read (bytes).
 const MAX_JOB_BYTES: usize = 4 << 20;
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("cam.lathe.plan", "Simulate Lathe Job", crate::checked!("cam.lathe.plan", lathe_plan))
+        .icon("play")
+        .noundo()
+        .contract(&LATHE_PLAN_CONTRACT)
+        .output(output_schema_for::<LathePlanResult>)
+        .params(
+            "job: a lathe job object or the path of a job file: {stock: {diameter, material? (aluminium | brass | steel), length? \
+             (default: what the part needs and the chuck holds), in_chuck? (20), face_allowance? (0.5), parting_allowance? (3), \
+             chuck_clearance? (2)}, part: {body, design? (.sc or STEP, relative to the job file; empty: the open design), name?, \
+             front? (+z | -z: the end of its Z axis away from the chuck), threads? [{designation (M12, M12x1.25), z_from, z_to}]}, \
+             library? (a lathe tool library file; default the Emco Compact 5's six-station turret), tools?, machine?, strategy? \
+             {rough_tool?, finish_tool?, leave_radial? (0.2), leave_axial? (0.1), clearance? (1), change_clearance? (10)}, post? \
+             {coolant?, decimals?, blend_tolerance?}}; image? (a .png path) → reads the part's profile about its Z axis (from its exact \
+             faces where all are of revolution about Z), plans facing, drilling, roughing, boring, finishing, grooving, threading and \
+             parting, and simulates them in the bar's half section: the scene (machine, bar as set up, part outline and bore, tools \
+             in order with their data, operations, threads, warnings, simulation: gouges, material left, rapids through material, \
+             moves at the jaws). The image draws the half section with the paths. Read-only but for the image",
+        ),
+    CommandSpec::new("cam.lathe.gcode", "Write Lathe G-code", crate::checked!("cam.lathe.gcode", lathe_gcode))
+        .icon("export")
+        .noundo()
+        .contract(&LATHE_WRITE_CONTRACT)
+        .output(output_schema_for::<LatheWriteResult>)
+        .params(
+            "job: as for cam.lathe.plan; path: the .ngc file → plans the job and writes its LinuxCNC lathe program: G18 G7 (X a \
+             diameter) G21 G90 G40 G80 G95 (feed per revolution), G54 with Z0 the finished front face, each tool T<n> M6 G43 at the \
+             change position, G96 S D (constant surface speed under the top speed) or G97 S for drills and threads, G0/G1 moves of \
+             the tools' touch-off points, threads in G33 passes, M30. Returns the path, line count, tools, operations and warnings",
+        ),
+    CommandSpec::new("cam.lathe.export_scene", "Export Lathe Job Scene", crate::checked!("cam.lathe.export_scene", lathe_export_scene))
+        .icon("export")
+        .noundo()
+        .contract(&LATHE_WRITE_CONTRACT)
+        .output(output_schema_for::<LatheWriteResult>)
+        .params(
+            "job: as for cam.lathe.plan; path: a .zip file or a folder → plans and simulates the job and writes, for a machine's \
+             own viewer, in work coordinates (Z0 the finished front face, the part toward -Z, X and Y radial): stock.stl (the bar as \
+             set up), part.stl (the part where it is turned), turned.stl (the bar as the simulation leaves it), job.ngc and \
+             scene.json (as cam.lathe.plan returns it). Returns the files written, the tools, operations and warnings",
+        ),
     CommandSpec::new("cam.part.inspect", "Inspect Machining Features", crate::checked!("cam.part.inspect", part_inspect))
         .icon("list")
         .noundo()
@@ -208,6 +250,130 @@ fn job_export_scene(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let result = JobExportSceneResult { path: dir, files, scene: out.doc, warnings: plan.warnings };
     serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// A lathe job from the parameter, and the folder its part's design is relative to.
+fn read_lathe_job(s: &Session, v: &Value) -> Result<(solidcraft_cam::lathe::job::LatheJob, Option<PathBuf>)> {
+    let cmd = "cam.lathe";
+    let (text, base) = match v {
+        Value::String(path) => {
+            let bytes = solidcraft_io::vfs::read(path, MAX_JOB_BYTES).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            let text = String::from_utf8(bytes).map_err(|_| EngineError::Other(format!("{path}: not UTF-8 text")))?;
+            (text, Path::new(path).parent().map(Path::to_path_buf))
+        }
+        Value::Object(_) => (v.to_string(), s.path.as_deref().and_then(|p| Path::new(p).parent()).map(Path::to_path_buf)),
+        _ => return Err(bad(cmd, "job: a lathe job object or the path of a job file")),
+    };
+    // its tool library, if it names one, relative to the job (or the open design)
+    let load = |lib: &str| -> solidcraft_cam::Result<String> {
+        let path = match &base {
+            Some(dir) if Path::new(lib).is_relative() => dir.join(lib),
+            _ => PathBuf::from(lib),
+        };
+        let shown = path.display().to_string();
+        let bytes = solidcraft_io::vfs::read(&shown, MAX_JOB_BYTES).map_err(|e| solidcraft_cam::CamError::Invalid(format!("{shown}: {e}")))?;
+        String::from_utf8(bytes).map_err(|_| solidcraft_cam::CamError::Invalid(format!("{shown}: not UTF-8 text")))
+    };
+    let job = solidcraft_cam::lathe::job::LatheJob::from_json_with(&text, &load).map_err(|e| match v {
+        Value::String(path) => EngineError::Other(format!("{path}: {e}")),
+        _ => bad(cmd, e.to_string()),
+    })?;
+    Ok((job, base))
+}
+
+/// A lathe job read, its part's body, its plan and simulation.
+struct LatheRun {
+    job: solidcraft_cam::lathe::job::LatheJob,
+    body: solidcraft_kernel::Body,
+    plan: solidcraft_cam::lathe::plan::LathePlan,
+    report: solidcraft_cam::lathe::sim::LatheSimReport,
+    left: solidcraft_cam::region::Area,
+}
+
+fn lathe_run(s: &Session, cmd: &str, p: &Value) -> Result<LatheRun> {
+    use solidcraft_cam::lathe::{plan, profile, sim};
+    let (job, base) = read_lathe_job(s, p.get("job").ok_or_else(|| bad(cmd, "job: a lathe job object or the path of a job file"))?)?;
+    let part = PartRef {
+        name: job.part.name.clone(),
+        design: job.part.design.clone(),
+        body: job.part.body.clone(),
+        quantity: 1,
+        orient: Default::default(),
+    };
+    let body = part_body(s, base.as_deref(), &part)?;
+    let other = |e: solidcraft_cam::CamError| EngineError::Other(format!("{}: {e}", part.label()));
+    let prof = profile::read(&body, job.part.front).map_err(other)?;
+    let plan = plan::plan(&job, prof).map_err(other)?;
+    let (report, left) = sim::simulate(&job, &plan).map_err(other)?;
+    Ok(LatheRun { job, body, plan, report, left })
+}
+
+fn lathe_plan(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.lathe.plan";
+    let image = p.get("image").and_then(Value::as_str).map(str::to_string);
+    let run = lathe_run(s, cmd, p)?;
+    if let Some(path) = &image {
+        let png = solidcraft_cam::lathe::sim::png(&run.plan, &run.left, 1600).map_err(|e| EngineError::Other(e.to_string()))?;
+        solidcraft_io::vfs::write(path, &png).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    }
+    let result = LathePlanResult { scene: solidcraft_cam::lathe::scene::describe(&run.job, &run.plan, &run.report), image };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// What a lathe write returns: the run's tools, operations and warnings.
+fn lathe_written(run: &LatheRun, path: String, files: Vec<String>, lines: usize) -> Result<Value> {
+    let mut tools: Vec<u32> = Vec::new();
+    for op in &run.plan.ops {
+        if !tools.contains(&op.tool) {
+            tools.push(op.tool);
+        }
+    }
+    let result = LatheWriteResult {
+        path,
+        files,
+        lines,
+        tools,
+        operations: run.plan.ops.iter().map(|o| o.name.clone()).collect(),
+        warnings: run.plan.warnings.clone(),
+    };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+fn lathe_gcode(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.lathe.gcode";
+    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad(cmd, "path: the .ngc file to write"))?.to_string();
+    let run = lathe_run(s, cmd, p)?;
+    let title = solidcraft_cam::lathe::scene::title(&run.job);
+    let program = solidcraft_cam::lathe::post::linuxcnc(&run.job, &run.plan, &title).map_err(|e| EngineError::Other(e.to_string()))?;
+    solidcraft_io::vfs::write(&path, program.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let name = Path::new(&path).file_name().map_or(path.clone(), |f| f.to_string_lossy().into_owned());
+    lathe_written(&run, path, vec![name], program.lines().count())
+}
+
+fn lathe_export_scene(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.lathe.export_scene";
+    let dir = p.get("path").and_then(Value::as_str).ok_or_else(|| bad(cmd, "path: a .zip file or a folder to write the scene into"))?.to_string();
+    let run = lathe_run(s, cmd, p)?;
+    let out = solidcraft_cam::lathe::scene::export(&run.job, &run.body, &run.plan, &run.report, &run.left)
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+    let fail = |f: &Path, e: String| EngineError::Other(format!("{}: {e}", f.display()));
+    let mut files = vec!["scene.json".to_string()];
+    files.extend(out.files.iter().map(|(name, _)| name.clone()));
+    if dir.to_ascii_lowercase().ends_with(".zip") {
+        let bytes = out.zip().map_err(|e| EngineError::Other(e.to_string()))?;
+        solidcraft_io::vfs::write(&dir, &bytes).map_err(|e| fail(Path::new(&dir), e.to_string()))?;
+    } else {
+        let folder = Path::new(&dir);
+        solidcraft_io::vfs::create_dir_all(&folder.to_string_lossy()).map_err(|e| fail(folder, e.to_string()))?;
+        let json_path = folder.join("scene.json");
+        solidcraft_io::vfs::write(&json_path.to_string_lossy(), out.json.as_bytes()).map_err(|e| fail(&json_path, e.to_string()))?;
+        for (name, bytes) in &out.files {
+            let f = folder.join(name);
+            solidcraft_io::vfs::write(&f.to_string_lossy(), bytes).map_err(|e| fail(&f, e.to_string()))?;
+        }
+    }
+    let lines = out.files.iter().find(|(n, _)| n == "job.ngc").map_or(0, |(_, b)| b.iter().filter(|c| **c == b'\n').count());
+    lathe_written(&run, dir, files, lines)
 }
 
 /// The job from the parameter, and the folder its parts' designs are relative to.

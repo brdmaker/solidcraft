@@ -12,6 +12,7 @@
 //! of the cut from the axis is the outer radius there, the nearest the inner.
 
 use solidcore_record::brep::Loop;
+use solidcraft_geom::brep::eval::CurveEval;
 use solidcraft_kernel::{Body, FaceSurface, face_surface};
 
 use super::job::Front;
@@ -75,6 +76,9 @@ pub fn read(body: &Body, front: Front) -> Result<Profile> {
 /// turn (as a sine), and still count as turned about Z.
 const AXIS_TOL: f64 = 1e-6;
 
+/// Points taken along each edge of a face (besides its ends), to find the face's extent.
+const EDGE_SAMPLES: usize = 16;
+
 /// One face of revolution about Z, in the part's own z (from its chuck end).
 #[derive(Clone, Copy, Debug)]
 enum Turned {
@@ -123,7 +127,9 @@ fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
         return Ok(None);
     }
     let rec = body.record();
-    // each face's vertices (with its poles)
+    // each face's vertices (with its poles) and points along its edges: a meridian arc shows
+    // which side of a torus's tube the face is on, and how far along the axis it reaches, where its
+    // ends lie on the tube's ring
     let corners = |f: usize| -> Vec<[f64; 3]> {
         let mut out = Vec::new();
         for lp in rec.faces.get(f).map(|x| x.loops.as_slice()).unwrap_or_default() {
@@ -131,8 +137,13 @@ fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
             match lp {
                 Loop::Edges { edges } => {
                     for oe in edges {
-                        if let Some(e) = rec.edges.get(oe.edge as usize) {
-                            vs.extend(e.vertices);
+                        let Some(e) = rec.edges.get(oe.edge as usize) else { continue };
+                        vs.extend(e.vertices);
+                        if let Ok(c) = CurveEval::new(e.parameters()) {
+                            let [t0, t1] = e.interval;
+                            out.extend(
+                                (1..EDGE_SAMPLES).filter_map(|i| c.point(t0 + (t1 - t0) * i as f64 / EDGE_SAMPLES as f64)).map(|p| [p.x, p.y, p.z]),
+                            );
                         }
                     }
                 }

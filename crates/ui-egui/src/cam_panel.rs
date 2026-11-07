@@ -1,25 +1,29 @@
 //! The CAM Job window: a router job's sheet, parts and main settings as a form, simulated and
-//! written out with `cam.job.simulate`, `cam.job.gcode` and `cam.job.export_scene`. Open job…
+//! written out with `cam.job.simulate`, `cam.job.gcode` and `cam.job.export_scene`; or, switched
+//! to the lathe, a lathe job (`cam_lathe.rs`) with `cam.lathe.plan`, `cam.lathe.gcode` and
+//! `cam.lathe.export_scene`. Open job…
 //! and Save job… read and write the job file; parts come from design or STEP files, or from the
 //! open design's bodies. Simulate shows the machined sheet and the simulation's report. Planning
 //! and simulating a sheet takes from seconds to minutes, so each command runs on a copy of the
 //! session beside the window (in the browser, where no thread can start, here). The command
-//! search's Simulate Job (`ui.start` of `cam.job.simulate`) opens it.
+//! search's Simulate Job (`ui.start` of `cam.job.simulate`) opens it on the router, Simulate Lathe
+//! Job (`cam.lathe.plan`) on the lathe.
 
 use egui::RichText;
 use serde_json::{Map, Value, json};
 
 use crate::SolveApp;
+use crate::cam_lathe::{self, LatheAsk, LathePanel};
 use crate::i18n::{format, tr};
 use crate::theme::Tokens;
 use crate::ui_kit::{self, StatusTone};
 
 /// A number of the job: where it lives (keys from the job's root), its label's message id, and
 /// whether it may be left empty (the job's default then).
-struct Num {
-    path: &'static [&'static str],
-    label: &'static str,
-    optional: bool,
+pub(crate) struct Num {
+    pub(crate) path: &'static [&'static str],
+    pub(crate) label: &'static str,
+    pub(crate) optional: bool,
 }
 
 const fn num(path: &'static [&'static str], label: &'static str) -> Num {
@@ -132,8 +136,15 @@ pub struct Simulated {
     picture: Option<egui::ColorImage>,
 }
 
+/// The machines the window plans for: the router's and the lathe's message ids.
+const MACHINES: &[&str] = &["cam_panel.router", "cam_panel.lathe"];
+
 /// The window's state.
 pub struct CamPanel {
+    /// Which of [`MACHINES`] the job is for: 0 the router, 1 the lathe.
+    pub mode: usize,
+    /// The lathe job.
+    pub lathe: LathePanel,
     /// The job as last read or written: settings the form has no field for are kept from it.
     pub base: Value,
     /// The numbers as typed, one for each of [`STOCK`], [`STRATEGY`] and [`FEEDS`].
@@ -152,7 +163,7 @@ pub struct CamPanel {
 }
 
 /// The job's value at `path` (array indices as numbers).
-fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
+pub(crate) fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
         Ok(i) => v.get(i),
         Err(_) => v.get(*k),
@@ -160,7 +171,7 @@ fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
 }
 
 /// Set the job's value at `path`, making the objects (and array) on the way.
-fn set(v: &mut Value, path: &[&str], value: Value) {
+pub(crate) fn set(v: &mut Value, path: &[&str], value: Value) {
     let Some((last, head)) = path.split_last() else { return };
     let mut cur = v;
     for (i, k) in head.iter().enumerate() {
@@ -187,7 +198,7 @@ fn set(v: &mut Value, path: &[&str], value: Value) {
 }
 
 /// A number as the form shows it: no trailing zeros.
-fn shown(x: f64) -> String {
+pub(crate) fn shown(x: f64) -> String {
     let s = format!("{x:.4}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
@@ -234,7 +245,19 @@ impl CamPanel {
                 }
             })
             .collect();
-        CamPanel { base: job, numbers, choices, switches, parts, cell: "0.25".into(), running: None, result: None, message: None }
+        CamPanel {
+            mode: 0,
+            lathe: LathePanel::from_job(json!({"stock": {"diameter": 30}, "part": {"body": ""}}), None),
+            base: job,
+            numbers,
+            choices,
+            switches,
+            parts,
+            cell: "0.25".into(),
+            running: None,
+            result: None,
+            message: None,
+        }
     }
 
     /// The job the form describes, or what is wrong with it.
@@ -279,6 +302,11 @@ impl CamPanel {
         Ok(job)
     }
 
+    /// The job of the machine the window is on.
+    pub fn current_job(&self) -> Result<Value, String> {
+        if self.mode == 1 { self.lathe.job() } else { self.job() }
+    }
+
     pub fn busy(&self) -> bool {
         self.running.is_some()
     }
@@ -296,7 +324,26 @@ pub fn open(app: &mut SolveApp) {
     }
     let mut panel = CamPanel::from_job(json!({"stock": {"size": [400, 300], "thickness": 10}, "parts": []}), None);
     add_open_design(app, &mut panel);
+    use_open_body(app, &mut panel.lathe);
     app.cam_job = Some(panel);
+}
+
+/// Open the window on the lathe: a Ø30 bar of steel with the Emco Compact 5's tools, the part
+/// the open design's first body.
+pub fn open_lathe(app: &mut SolveApp) {
+    open(app);
+    if let Some(panel) = app.cam_job.as_mut() {
+        panel.mode = 1;
+    }
+}
+
+/// The lathe job's part: the open design's first body.
+fn use_open_body(app: &SolveApp, lathe: &mut LathePanel) {
+    let Ok(world) = app.session.world_state() else { return };
+    if let Some(b) = world.bodies.first() {
+        lathe.design.clear();
+        lathe.body.clone_from(&b.name);
+    }
 }
 
 /// Add each body of the open design as a part.
@@ -355,12 +402,11 @@ pub fn tick(panel: &mut CamPanel, wait: bool) {
 fn finish(panel: &mut CamPanel, command: &str, r: Result<Value, String>) {
     match r {
         Err(e) => panel.message = Some((e, true)),
+        Ok(v) if command == "cam.lathe.plan" => {
+            panel.lathe.result = Some(cam_lathe::LatheSimulated { scene: v["scene"].clone(), texture: None, picture: read_picture(&v) });
+        }
         Ok(v) if command == "cam.job.simulate" => {
-            let picture = v["image"].as_str().and_then(|p| solidcraft_engine::io::vfs::read(p, 64 << 20).ok()).and_then(|bytes| {
-                let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-                let size = [img.width() as usize, img.height() as usize];
-                Some(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
-            });
+            let picture = read_picture(&v);
             let warnings = v["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect();
             panel.result = Some(Simulated { report: v["report"].clone(), warnings, texture: None, picture });
         }
@@ -369,6 +415,14 @@ fn finish(panel: &mut CamPanel, command: &str, r: Result<Value, String>) {
             panel.message = Some((format("cam_panel.written", &[("path", path)]), false));
         }
     }
+}
+
+/// The picture a simulation wrote (its `image`).
+fn read_picture(v: &Value) -> Option<egui::ColorImage> {
+    let bytes = solidcraft_engine::io::vfs::read(v["image"].as_str()?, 64 << 20).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
 
 /// The report's lines: label and value.
@@ -396,6 +450,7 @@ enum Ask {
     Simulate,
     Gcode,
     Zip,
+    Lathe(LatheAsk),
 }
 
 /// Draw the window when it is open. Called once per frame.
@@ -431,15 +486,25 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
         });
         if let Some(r) = &d.running {
-            let what = if r.command == "cam.job.simulate" { "cam_panel.simulating" } else { "cam_panel.writing" };
+            let what = if matches!(r.command, "cam.job.simulate" | "cam.lathe.plan") { "cam_panel.simulating" } else { "cam_panel.writing" };
             ui_kit::status_line(ui, tr(what), StatusTone::Dim);
         }
         if let Some((m, error)) = &d.message {
             ui_kit::status_line(ui, m, if *error { StatusTone::Error } else { StatusTone::Dim });
         }
+        let machines: Vec<&str> = MACHINES.iter().map(|l| tr(l)).collect();
+        ui_kit::choice_row(ui, tr("cam_panel.machine"), "sc_cam_machine", &mut d.mode, &machines);
         // the settings on the left, the simulation on the right
         ui.columns(2, |cols| {
             let [left, right] = cols else { return };
+            if d.mode == 1 {
+                let running = d.running.is_some();
+                if let Some(a) = ui_kit::scope(left, |ui| cam_lathe::form(ui, &mut d.lathe)) {
+                    ask = Some(Ask::Lathe(a));
+                }
+                cam_lathe::result(right, &mut d.lathe, running);
+                return;
+            }
             ui_kit::scope(left, |ui| {
                 ui.label(RichText::new(tr("cam_panel.sheet")).strong());
                 let mut k = 0;
@@ -552,6 +617,14 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     match ask {
         None => {}
         Some(Ask::AddOpen) => add_open_design(app, &mut d),
+        Some(Ask::Lathe(LatheAsk::UseOpen)) => use_open_body(app, &mut d.lathe),
+        Some(Ask::Lathe(LatheAsk::ChooseFile)) => {
+            app.pick_open_for(&["sc", "step", "stp"], |app, path| {
+                let (Some(path), Some(panel)) = (path, app.cam_job.as_mut()) else { return };
+                panel.lathe.design = path;
+                panel.lathe.body.clear();
+            });
+        }
         Some(Ask::Open) => {
             app.pick_open_for(&["json"], |app, path| {
                 let (Some(path), Some(panel)) = (path, app.cam_job.as_mut()) else { return };
@@ -559,24 +632,34 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     .map_err(|e| e.to_string())
                     .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()))
                 {
+                    Ok(job) if cam_lathe::is_lathe_job(&job) => {
+                        let dir = std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf);
+                        panel.lathe = LathePanel::from_job(job, dir.as_deref());
+                        panel.mode = 1;
+                    }
                     Ok(job) => {
                         let dir = std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf);
                         let mut fresh = CamPanel::from_job(job, dir.as_deref());
                         fresh.cell.clone_from(&panel.cell);
+                        fresh.lathe = std::mem::replace(&mut panel.lathe, LathePanel::from_job(Value::Null, None));
                         *panel = fresh;
                     }
                     Err(e) => panel.message = Some((format!("{path}: {e}"), true)),
                 }
             });
         }
-        Some(Ask::Save) => match d.job() {
+        Some(Ask::Save) => match d.current_job() {
             Ok(job) => {
                 app.pick_save("job.json", &["json"], move |app, path| {
                     let (Some(path), Some(panel)) = (path, app.cam_job.as_mut()) else { return };
                     let text = serde_json::to_string_pretty(&job).unwrap_or_default();
                     panel.message = Some(match solidcraft_engine::io::vfs::write(&path, text.as_bytes()) {
                         Ok(()) => {
-                            panel.base = job;
+                            if panel.mode == 1 {
+                                panel.lathe.base = job;
+                            } else {
+                                panel.base = job;
+                            }
                             (format("cam_panel.written", &[("path", &path)]), false)
                         }
                         Err(e) => (format!("{path}: {e}"), true),
@@ -591,6 +674,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 panel.parts.push(PartRow { design: path, body: String::new(), quantity: "1".into(), orient: 0 });
             });
         }
+        Some(Ask::Simulate) if d.mode == 1 => match d.lathe.job() {
+            Ok(job) => start(app, &mut d, "cam.lathe.plan", json!({"job": job, "image": picture_path().to_string_lossy()})),
+            Err(e) => d.message = Some((e, true)),
+        },
         Some(Ask::Simulate) => match (d.job(), d.cell.trim().replace(',', ".").parse::<f64>()) {
             (Ok(job), Ok(cell)) => {
                 let params = json!({"job": job, "cell": cell, "image": picture_path().to_string_lossy()});
@@ -599,11 +686,13 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             (Err(e), _) => d.message = Some((e, true)),
             (_, Err(_)) => d.message = Some((format("cam_panel.not_a_number", &[("field", tr("cam_panel.cell"))]), true)),
         },
-        Some(ask @ (Ask::Gcode | Ask::Zip)) => match d.job() {
+        Some(ask @ (Ask::Gcode | Ask::Zip)) => match d.current_job() {
             Ok(job) => {
-                let (name, ext, command) = match ask {
-                    Ask::Gcode => ("job.ngc", "ngc", "cam.job.gcode"),
-                    _ => ("job.zip", "zip", "cam.job.export_scene"),
+                let (name, ext, command) = match (ask, d.mode == 1) {
+                    (Ask::Gcode, false) => ("job.ngc", "ngc", "cam.job.gcode"),
+                    (Ask::Gcode, true) => ("job.ngc", "ngc", "cam.lathe.gcode"),
+                    (_, false) => ("job.zip", "zip", "cam.job.export_scene"),
+                    (_, true) => ("job.zip", "zip", "cam.lathe.export_scene"),
                 };
                 app.pick_save(name, &[ext], move |app, path| {
                     let Some(path) = path else { return };

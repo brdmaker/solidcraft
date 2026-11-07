@@ -67,7 +67,7 @@ pub fn legend() -> Vec<(OpKind, &'static str, &'static str)> {
     .collect()
 }
 
-fn rgb(hex: &str, alpha: f32) -> Color {
+pub(crate) fn rgb(hex: &str, alpha: f32) -> Color {
     let v = |i: usize| hex.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(0);
     let mut c = Color::from_rgba8(v(1), v(3), v(5), 255);
     c.apply_opacity(alpha);
@@ -209,7 +209,7 @@ pub fn png(scene: &Scene, width: u32) -> Result<Vec<u8>> {
     encode(&pm)
 }
 
-fn encode(pm: &Pixmap) -> Result<Vec<u8>> {
+pub(crate) fn encode(pm: &Pixmap) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut out, pm.width(), pm.height());
