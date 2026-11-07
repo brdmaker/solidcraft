@@ -18,9 +18,10 @@ const EDGE: f64 = 6.0;
 /// r²(1 − π/4): 0.0086 mm² at R0.2), mm².
 const AREA_TOL: f64 = 0.01;
 
-/// Pieces thinner than this on average along the axis are the paths' and the outline's round-off,
-/// mm.
-const MIN_THICKNESS: f64 = 0.002;
+/// Pieces thinner than this on average along the axis are round-off: the paths' tolerance, and
+/// the profile's step along the axis (a square shoulder is held to the nearest sample, so a
+/// strip up to a step thick may stand against it), mm.
+const MIN_THICKNESS: f64 = super::plan::PATH_TOL + super::profile::STEP;
 
 /// A piece of material, in work coordinates: its Z span, its diameter span and its area (mm²).
 #[derive(Clone, Debug, Serialize, JsonSchema)]

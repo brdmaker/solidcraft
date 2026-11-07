@@ -1,9 +1,18 @@
 //! The turned part's profile: its outer and inner radius along its axis, sampled finely from the
-//! solid. The part is meshed within [`MESH_TOL`] and cut by a plane square to Z at every sample:
-//! the farthest point of the cut from the axis is the outer radius there, the nearest the inner
-//! (zero where the part is solid to the axis).
+//! solid.
+//!
+//! From the exact B-rep where every face is one of revolution about Z (a plane square to Z, a
+//! cylinder, cone, sphere or torus on the axis): each face spans the heights of its vertices and
+//! has its radius in closed form there. At each sample the farthest face from the axis is the
+//! outer radius; the faces a ray out from the axis crosses just off the sample say whether the
+//! axis is in the material (an odd count) or a bore is, as wide as the nearest of them.
+//!
+//! A part with any other face (a flat, a cross hole, a free-form surface) is read from its mesh
+//! instead, within [`MESH_TOL`]: cut by a plane square to Z at every sample, the farthest point
+//! of the cut from the axis is the outer radius there, the nearest the inner.
 
-use solidcraft_kernel::Body;
+use solidcore_record::brep::Loop;
+use solidcraft_kernel::{Body, FaceSurface, face_surface};
 
 use super::job::Front;
 use crate::{CamError, Result};
@@ -31,6 +40,8 @@ pub struct Profile {
     pub od: Vec<f64>,
     /// Inner radius at each sample: a bore's (0: solid to the axis).
     pub id: Vec<f64>,
+    /// Read from the exact faces (else from the mesh).
+    pub exact: bool,
 }
 
 impl Profile {
@@ -51,8 +62,201 @@ impl Profile {
     }
 }
 
-/// The profile of `body`, turned about its Z axis with its `front` end away from the chuck.
+/// The profile of `body`, turned about its Z axis with its `front` end away from the chuck: from
+/// its exact faces where they are all of revolution about Z, else from its mesh.
 pub fn read(body: &Body, front: Front) -> Result<Profile> {
+    match exact(body, front)? {
+        Some(p) => Ok(p),
+        None => from_mesh(body, front),
+    }
+}
+
+/// How far off the axis a face's axis or centre may lie, and how far from square to Z a plane may
+/// turn (as a sine), and still count as turned about Z.
+const AXIS_TOL: f64 = 1e-6;
+
+/// One face of revolution about Z, in the part's own z (from its chuck end).
+#[derive(Clone, Copy, Debug)]
+enum Turned {
+    /// A plane square to the axis at `z`, out to `r`.
+    Face { z: f64, r: f64 },
+    /// A face of revolution from `z0` to `z1` with its radius at each z.
+    Round { z0: f64, z1: f64, shape: Shape },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    Cylinder {
+        r: f64,
+    },
+    /// The radius grows by `slope` per unit of z from `r0` at z 0.
+    Cone {
+        r0: f64,
+        slope: f64,
+    },
+    /// About the axis point at `zc`: radius `r` (a sphere); a torus's tube of radius `r` round a
+    /// ring of radius `ring`, on its `outer` side or its inner.
+    Ring {
+        zc: f64,
+        ring: f64,
+        r: f64,
+        outer: bool,
+    },
+}
+
+impl Shape {
+    fn radius(self, z: f64) -> f64 {
+        match self {
+            Shape::Cylinder { r } => r,
+            Shape::Cone { r0, slope } => (r0 + slope * z).max(0.0),
+            Shape::Ring { zc, ring, r, outer } => {
+                let h = (r * r - (z - zc) * (z - zc)).max(0.0).sqrt();
+                (if outer { ring + h } else { ring - h }).max(0.0)
+            }
+        }
+    }
+}
+
+/// The profile from the exact faces, or `None` where a face is not of revolution about Z.
+fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
+    if body.is_mesh() {
+        return Ok(None);
+    }
+    let rec = body.record();
+    // each face's vertices (with its poles)
+    let corners = |f: usize| -> Vec<[f64; 3]> {
+        let mut out = Vec::new();
+        for lp in rec.faces.get(f).map(|x| x.loops.as_slice()).unwrap_or_default() {
+            let mut vs: Vec<u32> = Vec::new();
+            match lp {
+                Loop::Edges { edges } => {
+                    for oe in edges {
+                        if let Some(e) = rec.edges.get(oe.edge as usize) {
+                            vs.extend(e.vertices);
+                        }
+                    }
+                }
+                Loop::Vertex { vertex } => vs.push(*vertex),
+            }
+            out.extend(vs.iter().filter_map(|v| rec.vertices.get(*v as usize)).map(|v| v.point));
+        }
+        out
+    };
+    let all: Vec<[f64; 3]> = (0..rec.faces.len()).flat_map(corners).collect();
+    let lo = all.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min);
+    let hi = all.iter().map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max);
+    if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+        return Ok(None);
+    }
+    let (along, sign) = match front {
+        Front::PlusZ => (lo, 1.0),
+        Front::MinusZ => (hi, -1.0),
+    };
+    let zp = |z: f64| sign * (z - along);
+    let on_axis = |x: f64, y: f64| x.hypot(y) < AXIS_TOL.max(1e-9 * (hi - lo));
+    let mut faces: Vec<Turned> = Vec::with_capacity(rec.faces.len());
+    for f in 0..rec.faces.len() {
+        let pts = corners(f);
+        let zs: Vec<f64> = pts.iter().map(|p| zp(p[2])).collect();
+        let z0 = zs.iter().copied().fold(f64::INFINITY, f64::min);
+        let z1 = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let r_of = |p: &[f64; 3]| p[0].hypot(p[1]);
+        let Some(surface) = face_surface(body, f) else { return Ok(None) };
+        let round = |shape: Shape| (z0.is_finite() && z1 >= z0).then_some(Turned::Round { z0, z1, shape });
+        let t = match surface {
+            FaceSurface::Plane { normal, point } => {
+                let n = normal.vec();
+                if n.z.abs() < 1.0 - AXIS_TOL {
+                    return Ok(None);
+                }
+                let r = pts.iter().map(r_of).fold(0.0, f64::max);
+                Some(Turned::Face { z: zp(point.z), r })
+            }
+            FaceSurface::Cylinder { origin, axis, radius } => {
+                if axis.vec().z.abs() < 1.0 - AXIS_TOL || !on_axis(origin.x, origin.y) {
+                    return Ok(None);
+                }
+                round(Shape::Cylinder { r: radius })
+            }
+            FaceSurface::Cone { apex, axis, half_angle } => {
+                let a = axis.vec();
+                if a.z.abs() < 1.0 - AXIS_TOL || !on_axis(apex.x, apex.y) {
+                    return Ok(None);
+                }
+                // r = (z − apex) along the axis · tan(half angle), in the part's z
+                let slope = half_angle.tan() * a.z.signum() * sign;
+                round(Shape::Cone { r0: -slope * zp(apex.z), slope })
+            }
+            FaceSurface::Sphere { center, radius } => {
+                if !on_axis(center.x, center.y) {
+                    return Ok(None);
+                }
+                round(Shape::Ring { zc: zp(center.z), ring: 0.0, r: radius, outer: true })
+            }
+            FaceSurface::Torus { center, axis, major, minor } => {
+                if axis.vec().z.abs() < 1.0 - AXIS_TOL || !on_axis(center.x, center.y) {
+                    return Ok(None);
+                }
+                // its side of the tube: where its corners lie off the ring
+                let off = pts.iter().map(|p| r_of(p) - major).fold(0.0, |a: f64, d| if d.abs() > a.abs() { d } else { a });
+                round(Shape::Ring { zc: zp(center.z), ring: major, r: minor, outer: off >= 0.0 })
+            }
+        };
+        match t {
+            Some(t) => faces.push(t),
+            None => return Ok(None),
+        }
+    }
+    let length = hi - lo;
+    let n = ((length / STEP).ceil() as usize + 1).clamp(2, MAX_SAMPLES);
+    let dz = length / (n - 1) as f64;
+    let tol = EPS.max(1e-9 * length);
+    let mut od = vec![0.0f64; n];
+    let mut id = vec![0.0f64; n];
+    let shift = RAY_SHIFT.max(1e-7 * length);
+    for i in 0..n {
+        let z = i as f64 * dz;
+        let mut o = 0.0f64;
+        for t in &faces {
+            match *t {
+                Turned::Face { z: zf, r } if (zf - z).abs() <= tol => o = o.max(r),
+                Turned::Round { z0, z1, shape } if z >= z0 - tol && z <= z1 + tol => o = o.max(shape.radius(z.clamp(z0, z1))),
+                _ => {}
+            }
+        }
+        // the bore just either side of the sample (inside the part): where a face square to the
+        // axis stands at it (a bore's floor, a counterbore's step), the narrower
+        let bore = |zq: f64| {
+            let mut radii: Vec<f64> = faces
+                .iter()
+                .filter_map(|t| match *t {
+                    Turned::Round { z0, z1, shape } if zq > z0 && zq < z1 => Some(shape.radius(zq)),
+                    _ => None,
+                })
+                .filter(|r| *r > 1e-9)
+                .collect();
+            radii.sort_by(f64::total_cmp);
+            radii.dedup_by(|a, b| (*a - *b).abs() < 1e-7);
+            // an even count: the axis is outside the material, the nearest face is a bore's
+            match radii.first() {
+                Some(r) if radii.len().is_multiple_of(2) && *r < o - 0.01 => *r,
+                _ => 0.0,
+            }
+        };
+        let d = [z - shift, z + shift].into_iter().filter(|zq| *zq > 0.0 && *zq < length).map(bore).fold(f64::INFINITY, f64::min);
+        if let (Some(slot), Some(di)) = (od.get_mut(i), id.get_mut(i)) {
+            *slot = o;
+            *di = if d.is_finite() { d } else { 0.0 };
+        }
+    }
+    if od.iter().any(|v| !v.is_finite()) || od.iter().all(|v| *v <= 0.0) {
+        return Err(CamError::Geometry("the part's profile could not be read".into()));
+    }
+    Ok(Some(Profile { length, dz, od, id, exact: true }))
+}
+
+/// The profile from the mesh: each sample's plane cut through it.
+fn from_mesh(body: &Body, front: Front) -> Result<Profile> {
     let mesh = body.mesh(&solidcraft_kernel::MeshTolerance::chord(MESH_TOL))?;
     let b = mesh.bounds();
     let (lo, hi) = (b.min, b.max);
@@ -178,5 +382,5 @@ pub fn read(body: &Body, front: Front) -> Result<Profile> {
     if od.iter().any(|v| !v.is_finite()) {
         return Err(CamError::Geometry("the part's profile could not be read".into()));
     }
-    Ok(Profile { length, dz, od, id })
+    Ok(Profile { length, dz, od, id, exact: false })
 }

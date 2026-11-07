@@ -74,8 +74,9 @@ fn the_profile_is_read_from_the_solid() {
     let b = union(cyl(10.0, 0.0, 30.0), cyl(6.0, 30.0, 50.0));
     let p = read(&b, super::job::Front::PlusZ).unwrap();
     assert!((p.length - 50.0).abs() < 1e-9);
-    for (z, r) in [(1.0, 10.0), (29.9, 10.0), (30.1, 6.0), (49.9, 6.0)] {
-        assert!((p.od_at(z) - r).abs() < 0.002, "r at z {z}: {}", p.od_at(z));
+    assert!(p.exact);
+    for (z, r) in [(1.0, 10.0), (29.9, 10.0), (30.0, 10.0), (30.1, 6.0), (49.9, 6.0)] {
+        assert!((p.od_at(z) - r).abs() < 1e-9, "r at z {z}: {}", p.od_at(z));
     }
     assert!(p.id.iter().all(|r| *r == 0.0));
     let q = read(&b, super::job::Front::MinusZ).unwrap();
@@ -83,7 +84,7 @@ fn the_profile_is_read_from_the_solid() {
     // a bore: a Ø8 hole through
     let tube = cut(cyl(10.0, 0.0, 30.0), cyl(4.0, -1.0, 31.0));
     let t = read(&tube, super::job::Front::PlusZ).unwrap();
-    assert!((t.id[t.index(15.0)] - 4.0).abs() < 0.002, "{}", t.id[t.index(15.0)]);
+    assert!(t.exact && t.id.iter().all(|r| (r - 4.0).abs() < 1e-9), "{}", t.id[t.index(15.0)]);
 }
 
 /// The tip positions of an operation's feeds.
@@ -405,4 +406,96 @@ fn the_scene_holds_the_bar_the_part_the_tools_and_the_program() {
     assert!((turned / want - 1.0).abs() < 1e-3, "turned {turned}, by Pappus {want}");
     // the part parted off: the turned bar is the stub in the chuck and the tube
     assert!(turned > part && turned < bar);
+}
+
+/// The radii where the level `z` crosses the half section `profile` (`parts.json`: lines and
+/// three-point arcs in (r, z)).
+fn section_radii(profile: &serde_json::Value, z: f64) -> Vec<f64> {
+    let pt = |v: &serde_json::Value| [v[0].as_f64().unwrap(), v[1].as_f64().unwrap()];
+    let mut out = Vec::new();
+    for seg in profile.as_array().unwrap() {
+        let seg = seg.as_array().unwrap();
+        match seg[0].as_str().unwrap() {
+            "line" => {
+                let (a, b) = (pt(&seg[1]), pt(&seg[2]));
+                if (a[1] - z) * (b[1] - z) < 0.0 {
+                    out.push(a[0] + (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]));
+                }
+            }
+            _ => {
+                // the circle through the three points, and the crossings within the arc's z span
+                let (a, m, b) = (pt(&seg[1]), pt(&seg[2]), pt(&seg[3]));
+                let d = 2.0 * (a[0] * (m[1] - b[1]) + m[0] * (b[1] - a[1]) + b[0] * (a[1] - m[1]));
+                let sq = |p: [f64; 2]| p[0] * p[0] + p[1] * p[1];
+                let cx = (sq(a) * (m[1] - b[1]) + sq(m) * (b[1] - a[1]) + sq(b) * (a[1] - m[1])) / d;
+                let cz = (sq(a) * (b[0] - m[0]) + sq(m) * (a[0] - b[0]) + sq(b) * (m[0] - a[0])) / d;
+                let rad = (a[0] - cx).hypot(a[1] - cz);
+                let h2 = rad * rad - (z - cz) * (z - cz);
+                if h2 <= 0.0 {
+                    continue;
+                }
+                // which side of the circle the arc's middle lies on
+                let side = (m[0] - cx).signum();
+                let (lo, hi) = (a[1].min(b[1]).min(m[1]), a[1].max(b[1]).max(m[1]));
+                if z > lo && z < hi {
+                    out.push(cx + side * h2.sqrt());
+                }
+            }
+        }
+    }
+    out.sort_by(f64::total_cmp);
+    out
+}
+
+/// The six lathe parts' profiles read from their exact faces (every face a plane, cylinder,
+/// cone, sphere or torus about Z) match their half sections in `parts.json`: at every sample
+/// clear of a corner, the outer radius is the farthest crossing of the level with the section,
+/// and where the level crosses it an even number of times beyond the axis the bore is the
+/// nearest, to 1e-5 (the section's points are given to 6 decimals).
+#[test]
+fn the_lathe_parts_profiles_are_read_exactly() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/cam/lathe");
+    let parts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("parts.json")).unwrap()).unwrap();
+    for p in parts["parts"].as_array().unwrap() {
+        let name = p["design"].as_str().unwrap();
+        let r = solidcraft_kernel::step_import(&std::fs::read_to_string(dir.join(name.replace(".sc", ".step"))).unwrap()).unwrap();
+        let prof = read(&r.bodies[0].body, super::job::Front::PlusZ).unwrap();
+        assert!(prof.exact, "{name}");
+        assert!((prof.length - p["length"].as_f64().unwrap()).abs() < 1e-6, "{name}: {}", prof.length);
+        let corners: Vec<f64> =
+            p["profile"].as_array().unwrap().iter().flat_map(|s| s.as_array().unwrap()[1..].iter().map(|q| q[1].as_f64().unwrap())).collect();
+        let mut checked = 0;
+        for i in 0..prof.od.len() {
+            let z = i as f64 * prof.dz;
+            if corners.iter().any(|c| (c - z).abs() < 1e-3) {
+                continue;
+            }
+            let radii = section_radii(&p["profile"], z);
+            let Some(&far) = radii.last() else { continue };
+            let bore = if radii.len() % 2 == 0 { radii[0] } else { 0.0 };
+            assert!(
+                (prof.od[i] - far).abs() < 1e-5 && (prof.id[i] - bore).abs() < 1e-5,
+                "{name} at z {z}: {} {} want {far} {bore}",
+                prof.od[i],
+                prof.id[i]
+            );
+            checked += 1;
+        }
+        assert!(checked > prof.od.len() / 2, "{name}: {checked}");
+    }
+}
+
+/// A part with a face not of revolution about its axis (a flat milled on a Ø20 shaft) is read
+/// from its mesh instead: still Ø20 where the flat is not, and the flat's corner (r 10) where
+/// it is, within the mesh's tolerance.
+#[test]
+fn a_part_with_a_flat_is_read_from_its_mesh() {
+    let shaft = cyl(10.0, 0.0, 30.0);
+    let flat = solidcraft_kernel::box_solid(v(8.0, -20.0, 10.0), v(20.0, 20.0, 20.0)).unwrap();
+    let b = cut(shaft, flat);
+    let p = read(&b, super::job::Front::PlusZ).unwrap();
+    assert!(!p.exact);
+    assert!((p.od_at(5.0) - 10.0).abs() < 0.002 && (p.od_at(15.0) - 10.0).abs() < 0.002);
+    let exact_shaft = read(&cyl(10.0, 0.0, 30.0), super::job::Front::PlusZ).unwrap();
+    assert!(exact_shaft.exact && exact_shaft.od.iter().all(|r| (r - 10.0).abs() < 1e-9));
 }

@@ -500,7 +500,7 @@ fn mirrored(p: &Profile, hole: f64, depth: f64) -> Profile {
                 }
             })
             .collect();
-    Profile { length: l, dz: p.dz, od, id: vec![0.0; p.id.len()] }
+    Profile { length: l, dz: p.dz, od, id: vec![0.0; p.id.len()], exact: p.exact }
 }
 
 /// Moves in a mirrored profile's terms back in the bore: each radius negated.
