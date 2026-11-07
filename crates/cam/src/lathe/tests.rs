@@ -472,7 +472,7 @@ fn the_lathe_parts_profiles_are_read_exactly() {
             }
             let radii = section_radii(&p["profile"], z);
             let Some(&far) = radii.last() else { continue };
-            let bore = if radii.len() % 2 == 0 { radii[0] } else { 0.0 };
+            let bore = if radii.len().is_multiple_of(2) { radii[0] } else { 0.0 };
             assert!(
                 (prof.od[i] - far).abs() < 1e-5 && (prof.id[i] - bore).abs() < 1e-5,
                 "{name} at z {z}: {} {} want {far} {bore}",
