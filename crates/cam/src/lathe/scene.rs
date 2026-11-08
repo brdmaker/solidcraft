@@ -136,6 +136,8 @@ pub struct SceneLatheTool {
     /// The lowest diameter and Z the program takes the tool's touch-off point to.
     pub x_min: f64,
     pub z_min: f64,
+    /// What holds it, placed from its touch-off point (none: not checked).
+    pub holder: Option<super::job::Holder>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -335,6 +337,7 @@ pub fn describe(job: &LatheJob, plan: &LathePlan, report: &LatheSimReport) -> La
                 max_rpm: t.max_rpm,
                 x_min: if x_min.is_finite() { r(x_min) } else { 0.0 },
                 z_min: if z_min.is_finite() { r(z_min) } else { 0.0 },
+                holder: t.holder,
             }
         })
         .collect();

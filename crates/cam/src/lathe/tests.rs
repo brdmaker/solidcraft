@@ -265,7 +265,8 @@ fn a_thread_is_cut_in_passes() {
 }
 
 /// The six lathe test parts (tests/cam/lathe) from their bars: each planned and simulated with
-/// nothing cut into it, no rapid through material, nothing at the jaws; every piece of material
+/// nothing cut into it, no rapid through material, nothing at the jaws, no holder (the
+/// library's) running into the bar; every piece of material
 /// left meets a span a warning names (the V-groove's flanks, the grip groove's, the internal
 /// ring groove, the bores' chamfers at the chuck end, the bore past the boring bar's reach). The
 /// hollow parts are drilled and the threaded ones threaded.
@@ -294,6 +295,7 @@ fn the_lathe_test_parts_turn_clean() {
         let (r, _) = simulate(&j, &pl).unwrap();
         assert!(r.gouges.is_empty(), "{name}: {:?}", r.gouges);
         assert!(r.rapid_hits.is_empty() && r.jaw_hits == 0, "{name}: {:?} {}", r.rapid_hits, r.jaw_hits);
+        assert!(r.holder_hits.is_empty(), "{name}: the library's holders hit {:?}", r.holder_hits);
         // a part whose profile never meets the axis is hollow: it is drilled; a thread is cut
         let hollow = !p["profile"].as_array().unwrap().iter().any(|seg| seg.as_array().unwrap()[1..].iter().any(|q| q[0].as_f64().unwrap() == 0.0));
         let has = |k: LatheOpKind| pl.ops.iter().any(|o| o.kind == k);
@@ -498,4 +500,75 @@ fn a_part_with_a_flat_is_read_from_its_mesh() {
     assert!((p.od_at(5.0) - 10.0).abs() < 0.002 && (p.od_at(15.0) - 10.0).abs() < 0.002);
     let exact_shaft = read(&cyl(10.0, 0.0, 30.0), super::job::Front::PlusZ).unwrap();
     assert!(exact_shaft.exact && exact_shaft.od.iter().all(|r| (r - 10.0).abs() < 1e-9));
+}
+
+/// A holder's reach round the axis. A 12 mm square shank 10 to 70 out from a tip at radius 10:
+/// from 20 to √(80² + 6²) = 80.2247 (its corner across the plane). The Ø6 boring bar 7 to 1 in
+/// from a tip at radius 4 (in a Ø8 hole): centred on the axis, out to 3. The drill's Ø30 chuck
+/// across the axis: 0 to 15.
+#[test]
+fn holders_cover_what_they_reach_round_the_axis() {
+    use super::job::Holder;
+    let shank = Holder { z: [0.0, 12.0], x: [10.0, 70.0], height: 12.0, round: false };
+    let [a, b] = shank.radii(10.0);
+    assert!((a - 20.0).abs() < 1e-12 && (b - 80.0f64.hypot(6.0)).abs() < 1e-12 && (b - 80.2247).abs() < 1e-4);
+    let bar = Holder { z: [0.5, 70.0], x: [-7.0, -1.0], height: 6.0, round: true };
+    assert_eq!(bar.radii(4.0), [0.0, 3.0]);
+    assert_eq!(bar.radii(8.0), [1.0, 7.0]);
+    let chuck = Holder { z: [45.0, 95.0], x: [-15.0, 15.0], height: 30.0, round: true };
+    assert_eq!(chuck.radii(0.0), [0.0, 15.0]);
+    let j = job(22.0, "");
+    assert_eq!(j.tool(1).unwrap().holder, Some(Holder { z: [1.0, 13.0], x: [10.0, 70.0], height: 12.0, round: false }), "the library's T1");
+    assert!(LatheJob::from_json(r#"{"stock": {"diameter": 22}, "part": {"body": "P"}, "tools": [{"number": 9, "kind": "drill", "diameter": 3, "feed": 0.05, "depth": 3, "surface_speed": {"steel": 20}, "holder": {"z": [5, 1], "x": [-5, 5], "round": true}}]}"#).is_err());
+}
+
+/// A Ø20 × 30 shaft with a Ø36 × 5 flange in front (work Z −5 to 0), from a Ø38 bar. Finishing
+/// the Ø20 behind the flange, T2's holder stands over 1 to 13 mm in front of its tip: given a
+/// head only 4 deep (the holder from 4 out, never under 10 + 4 = 14 on the Ø20, Ø28), it runs
+/// into the flange (Z −5 to 0, out to Ø36) and what roughing (T1, falling 3° at most) leaves
+/// behind it. With the library's holder (12 out: Ø44 at the least, over the flange) nothing is
+/// hit.
+#[test]
+fn a_holder_running_into_a_flange_is_reported() {
+    let b = union(cyl(10.0, 0.0, 30.0), cyl(18.0, 30.0, 35.0));
+    let t2 = |x0: f64| {
+        format!(
+            r#", "tools": [{{"number": 2, "kind": "turning", "insert_angle_deg": 35, "approach_deg": 93, "nose_radius": 0.2, "feed": 0.05, "depth": 0.5, "surface_speed": {{"aluminium": 180}}, "holder": {{"z": [1, 13], "x": [{x0}, 70], "height": 12}}}}]"#
+        )
+    };
+    let short = job(38.0, &t2(4.0));
+    let pl = plan(&short, read(&b, super::job::Front::PlusZ).unwrap()).unwrap();
+    let (r, _) = simulate(&short, &pl).unwrap();
+    assert!(!r.holder_hits.is_empty(), "the short head hits the flange");
+    for h in &r.holder_hits {
+        assert_eq!((h.tool, h.operation.as_str()), (2, "finishing"));
+        assert!(h.diameter[0] >= 28.0 - 0.01, "the holder's lowest is 4 over the Ø20: {h:?}");
+    }
+    assert!(r.holder_hits.iter().any(|h| h.z[0] <= -4.9 && h.z[1] >= -0.1 && h.diameter[1] >= 36.0 - 0.01), "the flange: {:?}", r.holder_hits);
+    let long = job(38.0, &t2(12.0));
+    let pl = plan(&long, read(&b, super::job::Front::PlusZ).unwrap()).unwrap();
+    let (r, _) = simulate(&long, &pl).unwrap();
+    assert!(r.holder_hits.is_empty() && r.gouges.is_empty() && r.jaw_hits == 0, "{:?}", r.holder_hits);
+}
+
+/// A Ø20 × 50 tube with a Ø12 bore through, from a Ø22 bar: T5 (Ø8) stands 45 out of its chuck,
+/// so with 1 mm clearance its point goes no deeper than Z −44, the full Ø8 to −44 + 2.403 =
+/// −41.597: the bore's last 8.4 mm (Z −50 to −41.597) is left solid and warned of; the bar
+/// stays out of it (it bores no deeper), the blade parts off to the axis, and the drill's chuck
+/// meets nothing.
+#[test]
+fn a_drill_goes_no_deeper_than_its_holder_lets_it() {
+    let b = cut(cyl(10.0, 0.0, 50.0), cyl(6.0, -1.0, 51.0));
+    let j = job(22.0, "");
+    let pl = plan(&j, read(&b, super::job::Front::PlusZ).unwrap()).unwrap();
+    let tip = 4.0 / 59f64.to_radians().tan();
+    let d = feeds(&pl.ops, LatheOpKind::Drilling);
+    let deepest = d.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+    assert!((deepest + 44.0).abs() < 1e-9, "{deepest}");
+    let w = pl.warnings.iter().find(|w| w.contains("out of its holder")).unwrap_or_else(|| panic!("{:?}", pl.warnings));
+    assert!(w.starts_with(&format!("Z -50.000 to {:.3}:", -44.0 + tip)), "{w}");
+    assert!(feeds(&pl.ops, LatheOpKind::Boring).iter().all(|p| p[1] >= -44.0 + tip - 1e-6), "the bar stays in the drilled hole");
+    assert!(feeds(&pl.ops, LatheOpKind::Parting).iter().any(|p| (p[0] + 0.2).abs() < 1e-9), "parted to the axis");
+    let (r, _) = simulate(&j, &pl).unwrap();
+    assert!(r.holder_hits.is_empty() && r.gouges.is_empty(), "{:?} {:?}", r.holder_hits, r.gouges);
 }

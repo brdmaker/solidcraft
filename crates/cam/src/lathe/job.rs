@@ -27,7 +27,8 @@ pub struct LatheJob {
     pub machine: LatheMachine,
     pub stock: Bar,
     pub part: TurnedPart,
-    /// A tool library file (relative to the job); empty with no tools listed: the Emco Compact 5's.
+    /// A tool library file (relative to the job) filling in the tools the job doesn't list; empty:
+    /// the Emco Compact 5's; `none`: only the job's own tools.
     #[serde(default)]
     pub library: String,
     #[serde(default)]
@@ -205,6 +206,43 @@ pub struct LatheTool {
     pub depth: f64,
     /// Surface speed by material, m/min.
     pub surface_speed: BTreeMap<String, f64>,
+    /// What holds the insert, blade or drill: checked against the bar and the jaws as the tool
+    /// moves (none: not checked).
+    #[serde(default)]
+    pub holder: Option<Holder>,
+}
+
+/// A tool's holder: a block (a square shank, a blade's clamp) or a round bar (a boring bar's
+/// shank, a drill's collet chuck), placed from the tool's touch-off point. In the plane the tool
+/// cuts in (the axis and X): along Z (+ toward the front) from `z[0]` to `z[1]`, out from the
+/// axis along X from `x[0]` to `x[1]` (negative: across the touch-off point toward and past the
+/// axis), `height` across that plane (Y). A round bar is `x[1] − x[0]` across.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Holder {
+    pub z: [f64; 2],
+    pub x: [f64; 2],
+    /// Across the cutting plane, mm (a round bar: its diameter).
+    #[serde(default)]
+    pub height: f64,
+    #[serde(default)]
+    pub round: bool,
+}
+
+impl Holder {
+    /// The radii the holder covers round the axis with the touch-off point at radius `r`: the
+    /// nearest and farthest of its points from the axis (it reaches across the axis where its X
+    /// span does).
+    pub fn radii(&self, r: f64) -> [f64; 2] {
+        let (x0, x1) = (r + self.x[0], r + self.x[1]);
+        if self.round {
+            let (c, half) = ((x0 + x1) / 2.0, (x1 - x0) / 2.0);
+            [(c.abs() - half).max(0.0), c.abs() + half]
+        } else {
+            let near = if x0 <= 0.0 && x1 >= 0.0 { 0.0 } else { x0.abs().min(x1.abs()) };
+            [near, x0.abs().max(x1.abs()).hypot(self.height / 2.0)]
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -456,6 +494,19 @@ fn validate_tools(tools: &[LatheTool], what: &str) -> Result<()> {
             }
             LatheToolKind::Threading | LatheToolKind::Turning => {}
         }
+        if let Some(h) = &t.holder {
+            let span = |v: [f64; 2], f: &str| -> Result<()> {
+                if !(v.iter().all(|x| x.is_finite() && x.abs() <= 1000.0) && v[1] - v[0] > 1e-6) {
+                    return Err(CamError::Invalid(format!("{}: give it as [from, to], from below to, within 1000 mm", at(f))));
+                }
+                Ok(())
+            };
+            span(h.z, "holder.z")?;
+            span(h.x, "holder.x")?;
+            if !h.round {
+                positive(&at("holder.height"), h.height, 1000.0)?;
+            }
+        }
         if let Some(a) = t.tip_angle_deg
             && !(a.is_finite() && a > 20.0 && a < 179.0)
         {
@@ -481,12 +532,12 @@ impl LatheJob {
     pub fn from_json_with(text: &str, load: &dyn Fn(&str) -> Result<String>) -> Result<LatheJob> {
         let mut job: LatheJob = serde_json::from_str(text).map_err(|e| CamError::Invalid(format!("lathe job: {e}")))?;
         validate_tools(&job.tools, "tools")?;
-        let lib = if !job.library.is_empty() {
-            Some(load(&job.library)?)
-        } else if job.tools.is_empty() {
-            Some(EMCO_COMPACT5_LIBRARY.to_string())
-        } else {
-            None
+        // the library named, or the Emco Compact 5's: it fills in the tools the job doesn't list
+        // (`none`: only the job's own)
+        let lib = match job.library.trim() {
+            "" => Some(EMCO_COMPACT5_LIBRARY.to_string()),
+            "none" => None,
+            name => Some(load(name)?),
         };
         if let Some(text) = lib {
             let lib: LatheLibrary = serde_json::from_str(&text).map_err(|e| CamError::Invalid(format!("lathe tool library: {e}")))?;

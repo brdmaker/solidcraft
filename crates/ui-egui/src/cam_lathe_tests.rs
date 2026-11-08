@@ -61,6 +61,8 @@ fn simulate_on_the_lathe_shows_the_turned_part() {
     assert_eq!(s.scene["stock"]["material"], json!("brass"));
     assert!(s.scene["simulation"]["gouges"].as_array().unwrap().is_empty());
     assert!(h.widget("The exact faces").is_some() && h.widget("Operations").is_some() && h.widget("T5 drilling Ø8").is_some());
+    assert!(h.widget("Holder collisions").is_some() && s.scene["simulation"]["holder_hits"].as_array().unwrap().is_empty());
+    assert!(s.scene["tools"].as_array().unwrap().iter().all(|t| t["holder"].is_object()), "each tool's holder in the scene");
     assert!(s.texture.is_some(), "the half section is shown");
 }
 

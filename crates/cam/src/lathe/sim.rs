@@ -49,8 +49,22 @@ pub struct LatheSimReport {
     /// reach).
     pub left: Vec<Piece>,
     pub rapid_hits: Vec<RapidHit>,
-    /// Moves reaching behind the jaws' face.
+    /// Moves reaching behind the jaws' face (a tool's or its holder's).
     pub jaw_hits: usize,
+    /// Where a tool's holder runs into the bar (what is left of it after the cuts of the same
+    /// moves): a crash.
+    pub holder_hits: Vec<HolderHit>,
+}
+
+/// A holder running into the bar, in work coordinates: the operation, the tool, the material it
+/// meets (its Z span, its diameter span) and how much of it (mm² of the half section).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct HolderHit {
+    pub operation: String,
+    pub tool: u32,
+    pub z: [f64; 2],
+    pub diameter: [f64; 2],
+    pub area: f64,
 }
 
 /// A unit vector `deg` degrees round from +z toward +r.
@@ -219,6 +233,21 @@ pub fn part_area(plan: &LathePlan) -> Result<Area> {
     Ok(area)
 }
 
+/// Where the holder of `t` is with the tool's touch-off point at `p` ([x radius, z]), as [z, r]
+/// points of the half section: what it covers round the axis.
+pub fn holder_shape(t: &LatheTool, p: [f64; 2]) -> Option<Vec<[f64; 2]>> {
+    let h = t.holder.as_ref()?;
+    let [r0, r1] = h.radii(p[0]);
+    let (z0, z1) = (p[1] + h.z[0], p[1] + h.z[1]);
+    Some(vec![[z0, r0], [z1, r0], [z1, r1], [z0, r1]])
+}
+
+/// Holders meeting less material than this, or a layer thinner on average than
+/// [`HOLDER_THICKNESS`], are only touching it (a holder's face passing level with a face of the
+/// bar), mm².
+const HOLDER_TOL: f64 = 1e-3;
+const HOLDER_THICKNESS: f64 = 0.005;
+
 /// Simulate `plan`.
 pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Area)> {
     let su = &plan.setup;
@@ -226,10 +255,27 @@ pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Are
     let start = left.area();
     let mut rapid_hits = Vec::new();
     let mut jaw_hits = 0usize;
+    let mut holder_hits: Vec<HolderHit> = Vec::new();
     for op in &plan.ops {
         let t = job.tool(op.tool).ok_or_else(|| CamError::Invalid(format!("simulation: no tool T{}", op.tool)))?;
         let mut batch: Vec<Ring> = Vec::new();
+        let mut held: Vec<Ring> = Vec::new();
         let mut at: Option<[f64; 2]> = None;
+        // the holder's sweeps against what the cuts before and with them leave
+        let mut check = |left: &Area, held: &mut Vec<Ring>| -> Result<()> {
+            if held.is_empty() {
+                return Ok(());
+            }
+            let met = left.intersection(&Area::union_of(held)?)?;
+            held.clear();
+            for p in pieces(&met, HOLDER_TOL, 0.0) {
+                let across = (p.z[1] - p.z[0]).max((p.diameter[1] - p.diameter[0]) / 2.0);
+                if p.area / across.max(1e-9) > HOLDER_THICKNESS && holder_hits.len() < 50 {
+                    holder_hits.push(HolderHit { operation: op.name.clone(), tool: op.tool, z: p.z, diameter: p.diameter, area: p.area });
+                }
+            }
+            Ok(())
+        };
         for m in &op.moves {
             let to = m.to();
             let from = at.unwrap_or(to);
@@ -240,6 +286,14 @@ pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Are
             if t.kind != LatheToolKind::Drill && swept.iter().any(|q| q[0] < su.jaws) {
                 jaw_hits += 1;
             }
+            if let (Some(mut a), Some(b)) = (holder_shape(t, from), holder_shape(t, to)) {
+                a.extend(b);
+                let h = hull(a);
+                if h.iter().any(|q| q[0] < su.jaws) {
+                    jaw_hits += 1;
+                }
+                held.push(h);
+            }
             match m {
                 TipMove::Feed(_) | TipMove::Thread { .. } => batch.push(swept),
                 TipMove::Rapid(_) => {
@@ -247,6 +301,7 @@ pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Are
                         left = left.difference(&Area::union_of(&batch)?)?;
                         batch.clear();
                     }
+                    check(&left, &mut held)?;
                     let hit = left.intersection(&Area::union_of(&[swept])?)?.area();
                     if hit > 1e-3 && rapid_hits.len() < 50 {
                         rapid_hits.push(RapidHit { operation: op.name.clone(), at: [2.0 * to[0], to[1]], area: hit });
@@ -258,6 +313,7 @@ pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Are
         if !batch.is_empty() {
             left = left.difference(&Area::union_of(&batch)?)?;
         }
+        check(&left, &mut held)?;
     }
     let mut part = part_area(plan)?;
     // the parting cut: the kerf behind the part is no gouge, nor what stays in the chuck behind it
@@ -279,7 +335,14 @@ pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Are
     // the paths are chords within PATH_TOL of the nose's path, the part's outline within the
     // mesh's tolerance of it: a cut thinner than both on average along it is no gouge
     let gouges = pieces(&cut, 1e-3, super::plan::PATH_TOL + super::profile::MESH_TOL);
-    let report = LatheSimReport { removed_area: start - left.area(), gouges, left: pieces(&extra, AREA_TOL, MIN_THICKNESS), rapid_hits, jaw_hits };
+    let report = LatheSimReport {
+        removed_area: start - left.area(),
+        gouges,
+        left: pieces(&extra, AREA_TOL, MIN_THICKNESS),
+        rapid_hits,
+        jaw_hits,
+        holder_hits,
+    };
     Ok((report, left))
 }
 

@@ -262,6 +262,7 @@ fn report_lines(scene: &Value) -> Vec<(String, String)> {
         (tr("cam_panel.left").to_string(), n(&sim["left"])),
         (tr("cam_panel.rapid_hits").to_string(), n(&sim["rapid_hits"])),
         (tr("cam_panel.jaw_hits").to_string(), sim["jaw_hits"].as_u64().unwrap_or(0).to_string()),
+        (tr("cam_panel.holder_hits").to_string(), n(&sim["holder_hits"])),
     ]
 }
 

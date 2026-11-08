@@ -329,6 +329,8 @@ struct Turn<'a> {
     clr: f64,
     /// Finish the front face from the middle out (outside only).
     face: bool,
+    /// No pass goes deeper than this (the part's own z): a boring bar's reach.
+    from: f64,
 }
 
 /// What turning left: the roughing and finishing moves, the surface the finishing tool leaves
@@ -356,7 +358,7 @@ fn turn(t: &Turn) -> Turned {
     {
         let rn = rough.nose_radius;
         let top = t.top + rn;
-        let g_lo = 0usize;
+        let g_lo = ((t.from - rl.z0) / rl.dz).ceil().max(0.0) as usize;
         let g_front = rl.c.len().saturating_sub(1);
         let low = (g_lo..=g_front).filter(|&g| rl.z(g) <= l).map(|g| rl.at(g)).filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min);
         let mut m = Moves { rn, length: l, out: Vec::new() };
@@ -431,7 +433,8 @@ fn turn(t: &Turn) -> Turned {
         };
         // where the bar's surface stands (a blind bore's end): no deeper
         let solid = |g: usize| fr.at(g) > t.top + rn + 1e-6;
-        let g_end = (0..=g_front).rev().find(|&g| solid(g)).map_or(0, |g| g + 1);
+        let g_from = ((t.from - fr.z0) / fr.dz).ceil().max(0.0) as usize;
+        let g_end = (0..=g_front).rev().find(|&g| solid(g)).map_or(0, |g| g + 1).max(g_from);
         let gap = (g_end..=g_front)
             .map(|g| {
                 let (a, b) = (rough_at(grid(g)), fr.at(g) - rn);
@@ -483,7 +486,7 @@ fn turn(t: &Turn) -> Turned {
 
 /// `p` mirrored across the axis about the bore: each sample's radius the bore's (at least
 /// `hole`, the drilled hole's) negated; solid to the axis where there is no bore, beyond `depth`
-/// from the front (the bar's reach) the hole as drilled.
+/// from the front (as far as the bar reaches and the hole is drilled) the hole as drilled.
 fn mirrored(p: &Profile, hole: f64, depth: f64) -> Profile {
     let l = p.length;
     let od =
@@ -597,6 +600,9 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
     let mut hole = 0.0;
     // the bore's radius at the part's chuck end once drilled and bored (parting stops short of it)
     let mut bore_end = 0.0;
+    // how deep from the front the hole is drilled full width, and whether through the part
+    let mut drilled = 0.0f64;
+    let mut drilled_through = false;
     let bore = runs(0, n_samples.saturating_sub(1), |i| profile.id.get(i).copied().unwrap_or(0.0) > 0.0);
     let open = bore.iter().find(|(_, b)| *b + 1 >= n_samples).copied();
     for (a, b) in &bore {
@@ -625,10 +631,29 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
                 let tip = hole / (d.point_angle().to_radians() / 2.0).tan();
                 let through = a == 0;
                 // the point's tip, in work Z
-                let bottom = if through { -l - back - tip - 0.5 } else { a as f64 * profile.dz - l };
+                let mut bottom = if through { -l - back - tip - 0.5 } else { a as f64 * profile.dz - l };
                 if !through {
                     warnings.push(format!("the blind bore's floor at Z{:.3} is left with the drill's {}° point", bottom, d.point_angle()));
                 }
+                // no deeper than its holder lets it: the holder keeps clear of the front face
+                if let Some(h) = &d.holder
+                    && bottom < clr - h.z[0]
+                {
+                    bottom = clr - h.z[0];
+                    let full = -bottom - tip;
+                    let want = if through { l } else { l - a as f64 * profile.dz };
+                    if full < want - 1e-6 {
+                        warnings.push(format!(
+                            "Z {:.3} to {:.3}: T{} stands {} out of its holder: drilled only to Z{bottom:.3}, the bore left solid beyond",
+                            -want,
+                            -full,
+                            d.number,
+                            crate::post::num(h.z[0], 3)
+                        ));
+                    }
+                }
+                drilled = (-bottom - tip).max(0.0);
+                drilled_through = through && drilled >= l - 1e-6;
                 let peck = d.peck.unwrap_or(dia);
                 let start = s.face_allowance + clr;
                 let mut mv = vec![TipMove::Rapid([0.0, start])];
@@ -666,6 +691,7 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         ahead,
         clr,
         face: true,
+        from: f64::NEG_INFINITY,
     });
     if !outside.rough.is_empty() {
         ops.push(LatheOp {
@@ -702,10 +728,10 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
                         bar.number,
                         crate::post::num(bar.reach(), 3)
                     ));
-                } else if open.is_some_and(|(a, _)| a == 0) {
+                } else if drilled_through {
                     bore_end = profile.id.first().copied().unwrap_or(hole).max(hole);
                 }
-                let m = mirrored(&profile, hole, bar.reach());
+                let m = mirrored(&profile, hole, bar.reach().min(drilled));
                 let inside = turn(&Turn {
                     profile: &m,
                     top: -hole,
@@ -717,6 +743,7 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
                     ahead,
                     clr: clr.min(hole * 0.5),
                     face: false,
+                    from: l - bar.reach().min(drilled),
                 });
                 let mut moves = unmirror(inside.rough);
                 moves.extend(unmirror(inside.finish));
@@ -944,7 +971,8 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         Some(bl) => {
             let w = bl.blade_width();
             let top = profile.od.first().copied().unwrap_or(r_bar);
-            let end = if bore_end > 0.0 && open.is_some_and(|(a, _)| a == 0) { bore_end - 0.5 } else { -0.2 };
+            // into the bore where the hole goes on past the kerf
+            let end = if bore_end > 0.0 && drilled_through && drilled >= l + w + 0.1 { bore_end - 0.5 } else { -0.2 };
             if w > back + 1e-9 {
                 warnings.push(format!("the part is not parted off: T{} is {w} wide, the parting allowance {back}", bl.number));
             } else if top - end > bl.reach() {
