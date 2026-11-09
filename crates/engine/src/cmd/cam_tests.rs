@@ -289,7 +289,7 @@ fn lathe_plan_turns_the_flanged_bushing_from_its_design() {
 }
 
 /// The same job (its STEP file) written out: the program on G18 G7, the drill (T5) at a fixed
-/// speed (G97), T1 at brass's 120 m/min under the machine's 3200 rpm (G96 S120 D3200); the
+/// speed (G97), T1 at brass's 120 m/min under the machine's 3000 rpm (G96 S120 D3000); the
 /// scene as a zip and as a folder with its five files, the folder's program the same.
 #[test]
 fn lathe_gcode_and_scene_are_written() {
@@ -304,13 +304,13 @@ fn lathe_gcode_and_scene_are_written() {
     assert_eq!(r["tools"], json!([1, 5, 6, 2, 3]));
     let prog = std::fs::read_to_string(&ngc).unwrap();
     assert_eq!(r["lines"].as_u64().unwrap() as usize, prog.lines().count());
-    for w in ["G18 G7 G21 G90 G40 G80 G95", "T5 M6 G43", "G96 S120 D3200 M3", "M30"] {
+    for w in ["G18 G7 G21 G90 G40 G80 G95", "T5 M6 G43", "G96 S120 D3000 M3", "M30"] {
         assert!(prog.lines().any(|l| l == w), "{w}");
     }
     assert!(prog.lines().any(|l| l.starts_with("G97 S") && l.ends_with(" M3")), "the drill at a fixed speed");
     let zip = out.join("bushing.zip");
     let r = run(&mut s, "cam.lathe.export_scene", json!({"job": job, "path": zip.to_string_lossy()}));
-    assert_eq!(r["files"], json!(["scene.json", "stock.stl", "part.stl", "turned.stl", "job.ngc"]));
+    assert_eq!(r["files"], json!(["scene.json", "stock.stl", "part.stl", "turned.stl", "job.ngc", "tool.tbl"]));
     assert_eq!(&std::fs::read(&zip).unwrap()[0..2], b"PK");
     let folder = out.join("scene");
     run(&mut s, "cam.lathe.export_scene", json!({"job": job, "path": folder.to_string_lossy()}));

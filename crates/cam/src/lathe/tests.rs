@@ -40,7 +40,7 @@ fn job(diameter: f64, extra: &str) -> LatheJob {
 /// The Emco Compact 5's library: T1 roughing, an 80° insert at 95°: its leading edge at 180 − 95
 /// = 85° from +Z, its trailing edge 80° round at 5°, so it falls at most 5 − 2 = 3° toward the
 /// chuck; T2 finishing, 35° at 93°: 87° and 52°, falling at most 50°. Roughing takes T1,
-/// finishing the tool reaching down the steepest, T2. The machine: 3200 rpm, stations T1–T6,
+/// finishing the tool reaching down the steepest, T2. The machine: 3000 rpm, stations T1–T6,
 /// 20 in the chuck. T3 a 1.0 blade reaching 12, T4 a 60° threading tool, T5 a Ø8 drill, T6 a
 /// boring bar from Ø7, and Ø5 and Ø10 drills (T7, T8) changed by hand. Threads: M12 is coarse,
 /// 1.75; M12x1.25 fine; M13 has no coarse pitch, and a pitch of half the diameter is no thread.
@@ -51,7 +51,7 @@ fn the_emco_library_and_its_tools_reach() {
     assert_eq!((t1.lead_angle(), t1.trail_angle(), t1.descent_deg()), (85.0, 5.0, 3.0));
     assert_eq!((t2.lead_angle(), t2.trail_angle(), t2.descent_deg()), (87.0, 52.0, 50.0));
     assert_eq!((j.rough_tool().unwrap().number, j.finish_tool().unwrap().number), (1, 2));
-    assert_eq!((j.machine.max_rpm, j.machine.turret.clone(), j.stock.in_chuck), (3200.0, vec![1, 2, 3, 4, 5, 6], 20.0));
+    assert_eq!((j.machine.max_rpm, j.machine.turret.clone(), j.stock.in_chuck), (3000.0, vec![1, 2, 3, 4, 5, 6], 20.0));
     use super::job::LatheToolKind::*;
     let kinds: Vec<_> = j.tools.iter().map(|t| (t.number, t.kind)).collect();
     assert_eq!(kinds, [(1, Turning), (2, Turning), (3, Grooving), (4, Threading), (5, Drill), (6, Boring), (7, Drill), (8, Drill)]);
@@ -124,13 +124,19 @@ fn a_stepped_shaft_is_faced_roughed_and_finished() {
     assert!(r.gouges.is_empty(), "{:?}", r.gouges);
     assert!(r.left.is_empty(), "{:?}", r.left);
     assert!(r.rapid_hits.is_empty() && r.jaw_hits == 0, "{:?} {}", r.rapid_hits, r.jaw_hits);
-    // the program: diameters, the tools on their tips, constant surface speed under 3200 rpm
+    // the program: diameters, the tools on their tips, constant surface speed under 3000 rpm
     let prog = super::post::linuxcnc(&j, &pl, "shaft").unwrap();
-    for w in ["G18 G7 G21 G90 G40 G80 G95", "T1 M6 G43", "T2 M6 G43", "G96 S150 D3200 M3", "G96 S180 D3200 M3", "F0.1", "F0.05", "M30"] {
+    for w in ["G18 G7 G21 G90 G40 G80 G95", "T1 M6 G43", "T2 M6 G43", "G96 S150 D3000 M3", "G96 S180 D3000 M3", "F0.1", "F0.05", "M30"] {
         assert!(prog.contains(w), "{w}");
     }
-    assert!(prog.lines().any(|l| l.contains("X20 ") || l.ends_with("X20") || l.contains("X20.0")), "Ø20 as a diameter");
-    assert!(prog.lines().any(|l| l.starts_with("X12 ") || l.contains(" X12 ") || l.contains("G1 X12 ")), "Ø12 as a diameter");
+    // as the programming manual asks: a decimal point in every coordinate
+    assert!(prog.lines().any(|l| l.split_whitespace().any(|w| w == "X20.")), "Ø20 as a diameter");
+    assert!(prog.lines().any(|l| l.split_whitespace().any(|w| w == "X12.")), "Ø12 as a diameter");
+    for w in prog.lines().filter(|l| !l.starts_with('(')).flat_map(str::split_whitespace) {
+        if w.starts_with(['X', 'Z', 'F', 'K']) {
+            assert!(w.contains('.'), "{w}: a decimal point");
+        }
+    }
     assert!(!prog.split_whitespace().any(|w| w == "G2" || w == "G3"), "lines only");
 }
 
@@ -219,7 +225,7 @@ fn a_bore_is_drilled_bored_and_parted_into() {
     assert!(r.left.is_empty(), "{:?}", r.left);
     assert!(r.rapid_hits.is_empty() && r.jaw_hits == 0, "{:?} {}", r.rapid_hits, r.jaw_hits);
     let prog = super::post::linuxcnc(&j, &pl, "tube").unwrap();
-    for w in ["T5 M6 G43", "G97 S1989 M3", "G0 X0 Z1.5", "G1 Z-4", "T6 M6 G43", "G96 S120 D3200 M3", "T3 M6 G43", "G96 S100 D3200 M3"] {
+    for w in ["T5 M6 G43", "G97 S1989 M3", "G0 X0. Z1.5", "G1 Z-4.", "T6 M6 G43", "G96 S120 D3000 M3", "T3 M6 G43", "G96 S100 D3000 M3"] {
         assert!(prog.lines().any(|l| l == w || l.starts_with(&format!("{w} "))), "{w}");
     }
 }
@@ -353,7 +359,7 @@ fn the_scene_holds_the_bar_the_part_the_tools_and_the_program() {
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
     let mut names: Vec<String> = z.file_names().map(|n| n.unwrap().to_string()).collect();
     names.sort();
-    assert_eq!(names, ["job.ngc", "part.stl", "scene.json", "stock.stl", "turned.stl"]);
+    assert_eq!(names, ["job.ngc", "part.stl", "scene.json", "stock.stl", "tool.tbl", "turned.stl"]);
     let mut read_file = |name: &str| {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut z.by_name(name).unwrap(), &mut out).unwrap();
@@ -381,6 +387,18 @@ fn the_scene_holds_the_bar_the_part_the_tools_and_the_program() {
     let bore = doc["part"]["bore"].as_array().unwrap();
     assert!(bore.iter().all(|q| (q[1].as_f64().unwrap() - 12.0).abs() < 0.003), "{bore:?}");
     let prog = String::from_utf8(read_file("job.ngc")).unwrap();
+    // the tool table in millweb's lathe format (the Emco programming manual, section 4): T1 an
+    // 80° insert in a 95° holder is Q2 I15 J95 with D the nose's diameter (R0.4: D0.8); the
+    // drill Q7 with its own diameter, the boring bar Q3, the blade Q2 by its corner and width
+    let tbl = String::from_utf8(read_file("tool.tbl")).unwrap();
+    let rows: Vec<&str> = tbl.lines().collect();
+    assert_eq!(rows.len(), 5);
+    assert!(rows[0].starts_with("T1 P1 X+0.0000 Q2 I15.0 J95.0 D0.8000 Z+0.0000 ;") && rows[0].ends_with("{ins=80}"), "{}", rows[0]);
+    assert!(rows[1].starts_with("T5 P5 X+0.0000 Q7 D8.0000 Z+0.0000 ;") && rows[1].ends_with("{ins=drill}"), "{}", rows[1]);
+    assert!(rows[2].starts_with("T6 P6 X+0.0000 Q3 D0.4000 Z+0.0000 ;") && rows[2].ends_with("{ins=55}"), "{}", rows[2]);
+    assert!(rows[3].starts_with("T2 P2 X+0.0000 Q2 I58.0 J93.0 D0.4000 Z+0.0000 ;") && rows[3].ends_with("{ins=35}"), "{}", rows[3]);
+    assert!(rows[4].starts_with("T3 P3 X+0.0000 Q2 D0.1000 Z+0.0000 ;") && rows[4].ends_with("{ins=groove w=1}"), "{}", rows[4]);
+    assert_eq!(doc["tool_table"], "tool.tbl");
     assert_eq!(prog, super::post::linuxcnc(&j, &pl, "P").unwrap());
 
     let poly = 60.0 * 3f64.to_radians().sin();

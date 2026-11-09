@@ -1003,7 +1003,13 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         for op in &ops {
             if !turret.contains(&op.tool) && !seen.contains(&op.tool) {
                 seen.push(op.tool);
-                warnings.push(format!("T{} is not one of the turret's stations: change it by hand", op.tool));
+                // the control turns the turret to station (T − 1) mod n + 1: the tool goes into
+                // that station by hand
+                let station = turret.get((op.tool.saturating_sub(1) as usize) % turret.len()).copied().unwrap_or(op.tool);
+                warnings.push(format!(
+                    "T{} is not one of the turret's stations: T{} M6 turns the turret to station {station}: put T{} there by hand first",
+                    op.tool, op.tool, op.tool
+                ));
             }
         }
     }

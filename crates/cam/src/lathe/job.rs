@@ -65,8 +65,8 @@ impl Default for LatheMachine {
     fn default() -> Self {
         LatheMachine {
             name: "Emco Compact 5".into(),
-            max_rpm: 3200.0,
-            z_travel: 300.0,
+            max_rpm: 3000.0,
+            z_travel: 260.0,
             turret: (1..=6).collect(),
             tool_side: ToolSide::Front,
             spindle: SpindleDirection::M3,

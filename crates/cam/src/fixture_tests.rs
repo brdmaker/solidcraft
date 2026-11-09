@@ -909,6 +909,11 @@ fn read_program(p: &str) -> (Vec<(Read, u32, f64)>, Vec<String>) {
             words.push((l, v.parse().unwrap_or_else(|_| panic!("bad number in {raw}"))));
         }
         let word = |l: char| words.iter().find(|w| w.0 == l).map(|w| w.1);
+        // a move in machine coordinates (the end's retract to the top of Z): not in the work's
+        if words.iter().any(|w| w.0 == 'G' && (w.1 - 53.0).abs() < 1e-9) {
+            facts.push("G53".into());
+            continue;
+        }
         let mut axes = false;
         for (l, v) in &words {
             match l {
@@ -1027,8 +1032,8 @@ fn the_linuxcnc_program_reads_back_as_planned() {
             want.push((r, op.tool, op.rpm));
         }
     }
-    // the program also goes straight up to clearance after each tool change, and over each hole
-    // before its cycle: rapids the plan has as part of its own moves
+    // the program also goes across, then down to clearance after each tool change, and over each
+    // hole before its cycle: rapids the plan has as part of its own moves
     let got: Vec<(Read, u32, f64)> = got.into_iter().filter(|(r, ..)| !matches!(r, Read::Rapid(p) if p[0].is_nan() || p[1].is_nan())).collect();
     let near = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 2e-4);
     let mut gi = 0;
@@ -1059,6 +1064,26 @@ fn the_linuxcnc_program_reads_back_as_planned() {
     }
     assert!(want.len() > 1000);
     assert!(got[gi..].iter().all(|(r, ..)| matches!(r, Read::Rapid(_))), "only the last move up after the plan's moves");
+    // as the Excitech's programming manual asks: after each change (the spindle up over the
+    // rack) across first, then down, the spindle started; at the end up to the top of Z's
+    // travel in machine coordinates; every coordinate with a decimal point
+    let lines: Vec<&str> = program.lines().collect();
+    let changes: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.ends_with(" M6")).map(|(i, _)| i).collect();
+    assert!(changes.len() >= 3);
+    for i in changes {
+        assert!(lines[i + 1].starts_with("G43 H"), "{}", lines[i + 1]);
+        let first = lines[i + 2..].iter().find(|l| ["G0", "G1", "G2", "G3", "G98", "X", "Y", "Z"].iter().any(|p| l.starts_with(p))).unwrap();
+        assert!(first.starts_with("G0 X") && first.contains(" Y") && !first.contains('Z'), "across first: {first}");
+        let next = lines[i + 2..].iter().skip_while(|l| *l != first).nth(1).unwrap();
+        assert!(next.starts_with('Z'), "then down: {next}");
+    }
+    let end: Vec<&str> = lines.iter().rev().take(4).rev().copied().collect();
+    assert_eq!(end, ["M5 M9", "G53 G0 Z0", "M30", "%"]);
+    for w in lines.iter().filter(|l| !l.starts_with('(') && !l.starts_with("G53")).flat_map(|l| l.split_whitespace()) {
+        if w.starts_with(['X', 'Y', 'Z', 'I', 'J', 'R', 'F']) {
+            assert!(w.contains('.'), "{w}: a decimal point");
+        }
+    }
 }
 
 /// Numbers: at most the decimals asked for, no trailing zeros, no negative zero.

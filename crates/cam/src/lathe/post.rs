@@ -5,6 +5,8 @@
 //! peck with plain feeds and rapids. The moves are the tools' touch-off points (turning tools'
 //! and boring bars' imaginary tips), so the program runs without nose radius compensation (G40).
 //! Moves are straight lines; curves are within the plan's path tolerance of their chords.
+//! Coordinates and feeds always carry a decimal point (`X20.`), as the Emco's programming manual
+//! asks.
 
 use super::job::{LatheJob, LatheToolKind, SpindleDirection, ToolSide};
 use super::plan::{LathePlan, Spindle, TipMove};
@@ -57,8 +59,9 @@ pub fn tool_line(job: &LatheJob, plan: &LathePlan, n: u32, decimals: u32) -> Str
 pub fn linuxcnc(job: &LatheJob, plan: &LathePlan, title: &str) -> Result<String> {
     use std::fmt::Write as _;
     let d = job.post.decimals;
-    let f = |x: f64| num(x, d);
-    let dia = |r: f64| num(2.0 * r, d);
+    let f = |x: f64| crate::post::word(x, d);
+    let dia = |r: f64| crate::post::word(2.0 * r, d);
+    let plain = |x: f64| num(x, d);
     let mut g = String::new();
     let mut out = |s: String| -> Result<()> { writeln!(g, "{s}").map_err(|e| CamError::Invalid(e.to_string())) };
     let su = &plan.setup;
@@ -69,17 +72,17 @@ pub fn linuxcnc(job: &LatheJob, plan: &LathePlan, title: &str) -> Result<String>
         "{}, {} tool lathe; bar D{} x {} ({}), {} in the chuck, {} out",
         m.name,
         if m.tool_side == ToolSide::Front { "front" } else { "back" },
-        f(job.stock.diameter),
-        f(su.length),
+        plain(job.stock.diameter),
+        plain(su.length),
         job.stock.material,
-        f(job.stock.in_chuck),
-        f(su.stick_out)
+        plain(job.stock.in_chuck),
+        plain(su.stick_out)
     )))?;
     out(crate::post::comment(&format!(
         "Z0 the finished front face; the part to Z{}, turned to Z{} for parting; jaws at Z{}; X is a diameter",
-        f(su.part_end),
-        f(su.turned_to),
-        f(su.jaws)
+        plain(su.part_end),
+        plain(su.turned_to),
+        plain(su.jaws)
     )))?;
     out(crate::post::comment("tools are driven on their imaginary tip: touch them off there, no nose radius compensation"))?;
     let mut order: Vec<u32> = Vec::new();
@@ -125,9 +128,9 @@ pub fn linuxcnc(job: &LatheJob, plan: &LathePlan, title: &str) -> Result<String>
         match op.spindle {
             Spindle::SurfaceSpeed(v) => {
                 let top = job.tool(op.tool).and_then(|t| t.max_rpm).map_or(m.max_rpm, |r| r.min(m.max_rpm));
-                out(format!("G96 S{} D{} {spindle}", f(v), f(top)))?
+                out(format!("G96 S{} D{} {spindle}", plain(v), plain(top)))?
             }
-            Spindle::Rpm(r) => out(format!("G97 S{} {spindle}", f(r.min(m.max_rpm).round())))?,
+            Spindle::Rpm(r) => out(format!("G97 S{} {spindle}", plain(r.min(m.max_rpm).round())))?,
         }
         if let Some(c) = coolant {
             out(c.into())?;

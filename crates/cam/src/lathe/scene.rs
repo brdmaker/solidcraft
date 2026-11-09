@@ -6,7 +6,9 @@
 //! revolution about the Z axis, X and Y radial: `stock.stl` the bar as set up (with its length in
 //! the chuck), `part.stl` the part as designed, placed where it is turned, `turned.stl` the bar
 //! as the simulation leaves it (what is still held in the chuck, and the part if it was not
-//! parted off; a thread shows as rings at its minor diameter). `job.ngc` is the program.
+//! parted off; a thread shows as rings at its minor diameter). `job.ngc` is the program, `tool.tbl`
+//! its tools as a LinuxCNC lathe tool table in millweb's format (orientation, angles, nose,
+//! insert), offsets left to touching off.
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -43,6 +45,9 @@ pub struct LatheSceneDoc {
     pub turned_model: String,
     /// The LinuxCNC program.
     pub program: String,
+    /// The program's tools as a LinuxCNC lathe tool table (`tool.tbl`, millweb's format: Q, I, J,
+    /// D and the insert's tag; X and Z 0, set them by touching off).
+    pub tool_table: String,
     /// The tools the program loads, in the order it first loads them: what a tool table needs.
     pub tools: Vec<SceneLatheTool>,
     pub operations: Vec<SceneLatheOp>,
@@ -283,9 +288,57 @@ pub fn export(job: &LatheJob, body: &Body, plan: &LathePlan, report: &LatheSimRe
     let turned = left.simplified(super::plan::PATH_TOL)?;
     files.push(("turned.stl".to_string(), crate::scene::stl("turned", &revolve(&turned))));
     files.push(("job.ngc".to_string(), super::post::linuxcnc(job, plan, &title)?.into_bytes()));
+    files.push(("tool.tbl".to_string(), tool_table(job, plan).into_bytes()));
     let doc = describe(job, plan, report);
     let json = serde_json::to_string_pretty(&doc).map_err(|e| CamError::Invalid(format!("scene: {e}")))?;
     Ok(LatheSceneFiles { doc, json, files })
+}
+
+/// LinuxCNC's lathe tool table line for `t`, as millweb's Tools page writes it: the orientation Q
+/// (where the nose's centre is from the touch-off point: 2 an outside tool or a grooving blade on
+/// its corner toward the chuck, 3 a boring bar, 6 a threading tool, 7 a drill), the front and
+/// back angles I and J of a turning insert (its holder's approach less the insert's angle, and the
+/// approach), D the nose's diameter (a drill's own), and the insert in millweb's tag (`{ins=80}`,
+/// `{ins=groove w=1}`) so its removal check sweeps the right shape. X and Z are left 0: the
+/// offsets come from touching each tool off.
+pub fn tool_table_line(t: &super::job::LatheTool) -> String {
+    let num = |x: f64| crate::post::num(x, 4);
+    let (q, angles, d, ins) = match t.kind {
+        LatheToolKind::Turning => {
+            let a = t.insert_angle_deg.round();
+            let tag = [80.0, 55.0, 35.0].contains(&a).then(|| format!("ins={a}"));
+            (2, Some((t.approach_deg - t.insert_angle_deg, t.approach_deg)), 2.0 * t.nose_radius, tag)
+        }
+        LatheToolKind::Boring => {
+            let a = t.insert_angle_deg.round();
+            (3, None, 2.0 * t.nose_radius, [80.0, 55.0, 35.0].contains(&a).then(|| format!("ins={a}")))
+        }
+        LatheToolKind::Grooving => (2, None, 2.0 * t.nose_radius, Some(format!("ins=groove w={}", num(t.blade_width())))),
+        LatheToolKind::Threading => (6, None, 2.0 * t.nose_radius, Some("ins=60".to_string())),
+        LatheToolKind::Drill => (7, None, t.diameter.unwrap_or(0.0), Some("ins=drill".to_string())),
+    };
+    let mut line = format!("T{} P{} X+0.0000 Q{q}", t.number, t.number);
+    if let Some((i, j)) = angles {
+        line.push_str(&format!(" I{:.1} J{:.1}", i, j));
+    }
+    line.push_str(&format!(" D{d:.4} Z+0.0000 ;"));
+    let name: String = t.name.chars().map(|c| if c == '{' || c == '}' || c == '\n' { ' ' } else { c }).collect();
+    line.push_str(if name.is_empty() { t.kind.name() } else { name.trim() });
+    if let Some(tag) = ins {
+        line.push_str(&format!(" {{{tag}}}"));
+    }
+    line
+}
+
+/// The tool table of the tools the program loads, in that order.
+pub fn tool_table(job: &LatheJob, plan: &LathePlan) -> String {
+    let mut order: Vec<u32> = Vec::new();
+    for op in &plan.ops {
+        if !order.contains(&op.tool) {
+            order.push(op.tool);
+        }
+    }
+    order.iter().filter_map(|n| job.tool(*n)).map(|t| tool_table_line(t) + "\n").collect()
 }
 
 /// The job's title: the part's name, else its body's.
@@ -430,6 +483,7 @@ pub fn describe(job: &LatheJob, plan: &LathePlan, report: &LatheSimReport) -> La
         },
         turned_model: "turned.stl".into(),
         program: "job.ngc".into(),
+        tool_table: "tool.tbl".into(),
         tools,
         operations,
         threads,

@@ -6,7 +6,10 @@
 //!
 //! Metric, absolute, XY plane, feed per minute, work offset G54 with work zero where
 //! `stock.origin` puts it (Z0 the sheet's top). Each tool is loaded with `T<n> M6` and its length
-//! taken from the tool table (`G43 H<n>`); the spindle runs `M3` at the operation's speed. Arcs are
+//! taken from the tool table (`G43 H<n>`); then, the spindle being up over the tool rack, the tool
+//! goes across to its first point and only then down to clearance; the spindle runs `M3` at the
+//! operation's speed. The program ends up at the top of Z's travel (`G53 G0 Z0`). Coordinates and
+//! feeds always carry a decimal point (`X10.`), as the machines' programming manuals ask. Arcs are
 //! `G2`/`G3` with I and J from their start (helices change Z on the way); drilling cycles are
 //! `G98 G81` or `G83` with pecks, back to the height the tool came from. Words that do not change
 //! (an axis, the feed) are left out, as the control keeps them.
@@ -26,6 +29,13 @@ pub fn num(x: f64, decimals: u32) -> String {
     let s = format!("{x:.d$}");
     let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
     if s == "-0" { "0".to_string() } else { s }
+}
+
+/// A number as a program's word takes it: as [`num`], with a decimal point always (`10.`), as the
+/// machines' programming manuals ask.
+pub fn word(x: f64, decimals: u32) -> String {
+    let s = num(x, decimals);
+    if s.contains('.') { s } else { format!("{s}.") }
 }
 
 /// A comment: LinuxCNC comments are in parentheses, may not hold any, and are kept to plain
@@ -90,7 +100,8 @@ pub fn tool_line(job: &Job, ops: &[Operation], n: u32, decimals: u32) -> String 
 pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) -> Result<String> {
     let post = &job.post;
     let dec = post.decimals;
-    let n = |x: f64| num(x, dec);
+    let n = |x: f64| word(x, dec);
+    let plain = |x: f64| num(x, dec);
     let clearance = job.strategy.clearance;
     let mut g = String::new();
     let mut lines = 0usize;
@@ -111,9 +122,9 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) 
         &mut g,
         comment(&format!(
             "stock {} x {} x {} mm {}; work zero: {} of the top face",
-            n(s.size[0]),
-            n(s.size[1]),
-            n(s.thickness),
+            plain(s.size[0]),
+            plain(s.size[1]),
+            plain(s.thickness),
             s.material,
             match s.origin {
                 crate::job::Origin::TopCenter => "centre",
@@ -161,6 +172,8 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) 
     let mut feed: Option<f64> = None;
     let mut motion: Option<&'static str> = None;
     let mut in_cycle = false;
+    // a tool just changed: its first move goes across at the change height, then down
+    let mut fresh = false;
     for op in ops {
         if tool != Some(op.tool) {
             if in_cycle {
@@ -175,14 +188,13 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) 
             out(&mut g, format!("G43 H{}", op.tool))?;
             tool = Some(op.tool);
             rpm = None;
-            // after a change only the height is set: straight up (or down) to clearance first,
-            // then across
-            out(&mut g, format!("G0 Z{}", n(clearance)))?;
-            at = [None, None, Some(clearance)];
-            motion = Some("G0");
+            // after a change the spindle is up over the rack: across first, then down
+            fresh = true;
+            at = [None, None, None];
+            motion = None;
         }
         if rpm != Some(op.rpm) {
-            out(&mut g, format!("S{} M3", n(op.rpm)))?;
+            out(&mut g, format!("S{} M3", plain(op.rpm)))?;
             if let Some(c) = coolant_on {
                 out(&mut g, c.into())?;
             }
@@ -200,6 +212,17 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) 
             &op.moves
         };
         for m in moves {
+            if fresh {
+                let xy = match m {
+                    Move::Rapid { to } | Move::Line { to, .. } | Move::Arc { to, .. } => [to[0], to[1]],
+                    Move::Drill { at: c, .. } => [c[0], c[1]],
+                };
+                out(&mut g, format!("G0 X{} Y{}", n(xy[0]), n(xy[1])))?;
+                out(&mut g, format!("Z{}", n(clearance)))?;
+                at = [Some(xy[0]), Some(xy[1]), Some(clearance)];
+                motion = Some("G0");
+                fresh = false;
+            }
             if !matches!(m, Move::Drill { .. }) && in_cycle {
                 out(&mut g, "G80".into())?;
                 in_cycle = false;
@@ -264,7 +287,8 @@ pub fn linuxcnc(job: &Job, ops: &[Operation], title: &str, warnings: &[String]) 
         out(&mut g, "G80".into())?;
     }
     out(&mut g, "M5 M9".into())?;
-    out(&mut g, format!("G0 Z{}", n(clearance)))?;
+    // up to the top of Z's travel
+    out(&mut g, "G53 G0 Z0".into())?;
     out(&mut g, "M30".into())?;
     out(&mut g, "%".into())?;
     Ok(g)
