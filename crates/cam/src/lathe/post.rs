@@ -9,7 +9,7 @@
 //! asks.
 
 use super::job::{LatheJob, LatheToolKind, SpindleDirection, ToolSide};
-use super::plan::{LathePlan, Spindle, TipMove};
+use super::plan::{LatheOp, LathePlan, Spindle, TipMove};
 use crate::job::Coolant;
 use crate::{CamError, Result};
 
@@ -53,6 +53,105 @@ pub fn tool_line(job: &LatheJob, plan: &LathePlan, n: u32, decimals: u32) -> Str
     let name = if t.name.is_empty() { kind.to_string() } else { t.name.clone() };
     line.push_str(&format!(" name={name}"));
     line
+}
+
+/// Writes operations' blocks, keeping what the program has set: the tool, the motion mode, the
+/// last point (unchanged axes are not repeated).
+pub struct OpWriter {
+    /// Where the turret indexes, [x radius, z].
+    pub change: [f64; 2],
+    pub tool: Option<u32>,
+    pub motion: &'static str,
+    pub last: Option<[f64; 2]>,
+}
+
+impl OpWriter {
+    pub fn new(change: [f64; 2]) -> OpWriter {
+        OpWriter { change, tool: None, motion: "", last: None }
+    }
+
+    /// Forget the motion mode and the position (after a subroutine moved the tool).
+    pub fn lost(&mut self) {
+        self.motion = "";
+        self.last = None;
+    }
+
+    /// The tool change to `tool` (at the change position) unless it is in place.
+    pub fn tool_change(&mut self, job: &LatheJob, tool: u32) -> Vec<String> {
+        let d = job.post.decimals;
+        let mut g = Vec::new();
+        if self.tool != Some(tool) {
+            g.push(format!("G0 X{} Z{}", crate::post::word(2.0 * self.change[0], d), crate::post::word(self.change[1], d)));
+            g.push(format!("T{tool} M6 G43"));
+            self.tool = Some(tool);
+            self.motion = "";
+            self.last = Some(self.change);
+        }
+        g
+    }
+
+    /// The spindle's block for `op`.
+    pub fn spindle(job: &LatheJob, op: &LatheOp) -> String {
+        let m = &job.machine;
+        let plain = |x: f64| num(x, job.post.decimals);
+        let spindle = match m.spindle {
+            SpindleDirection::M3 => "M3",
+            SpindleDirection::M4 => "M4",
+        };
+        match op.spindle {
+            Spindle::SurfaceSpeed(v) => {
+                let top = job.tool(op.tool).and_then(|t| t.max_rpm).map_or(m.max_rpm, |r| r.min(m.max_rpm));
+                format!("G96 S{} D{} {spindle}", plain(v), plain(top))
+            }
+            Spindle::Rpm(r) => format!("G97 S{} {spindle}", plain(r.min(m.max_rpm).round())),
+        }
+    }
+
+    /// The moves of `op` alone.
+    pub fn moves(&mut self, job: &LatheJob, op: &LatheOp) -> Vec<String> {
+        let d = job.post.decimals;
+        let f = |x: f64| crate::post::word(x, d);
+        let dia = |r: f64| crate::post::word(2.0 * r, d);
+        let mut g = Vec::new();
+        for mv in &op.moves {
+            let (code, p) = match mv {
+                TipMove::Rapid(p) => ("G0", p),
+                TipMove::Feed(p) => ("G1", p),
+                TipMove::Thread { to, pitch } => {
+                    // synchronised with the spindle, one pass along Z (X set by the move before)
+                    g.push(format!("G33 Z{} K{}", f(to[1]), f(*pitch)));
+                    self.motion = "G33";
+                    self.last = Some(*to);
+                    continue;
+                }
+            };
+            let word = if code == self.motion { String::new() } else { format!("{code} ") };
+            let x = if self.last.is_some_and(|q| (q[0] - p[0]).abs() < 1e-9) { String::new() } else { format!("X{} ", dia(p[0])) };
+            let z = if self.last.is_some_and(|q| (q[1] - p[1]).abs() < 1e-9) { String::new() } else { format!("Z{}", f(p[1])) };
+            self.last = Some(*p);
+            if x.is_empty() && z.is_empty() {
+                continue;
+            }
+            self.motion = code;
+            g.push(format!("{word}{x}{z}").trim_end().to_string());
+        }
+        g
+    }
+
+    /// An operation's blocks: its name, the tool change, spindle, coolant, feed and moves.
+    pub fn op(&mut self, job: &LatheJob, op: &LatheOp) -> Vec<String> {
+        let mut g = vec![crate::post::comment(&op.name)];
+        g.extend(self.tool_change(job, op.tool));
+        g.push(OpWriter::spindle(job, op));
+        match job.post.coolant {
+            Coolant::Off => {}
+            Coolant::Mist => g.push("M7".into()),
+            Coolant::Flood => g.push("M8".into()),
+        }
+        g.push(format!("F{}", crate::post::word(op.feed, job.post.decimals)));
+        g.extend(self.moves(job, op));
+        g
+    }
 }
 
 /// The program.
@@ -103,60 +202,10 @@ pub fn linuxcnc(job: &LatheJob, plan: &LathePlan, title: &str) -> Result<String>
     out("G54".into())?;
     out(format!("G64 P{}", f(job.post.blend_tolerance)))?;
     let change = [su.radius + job.strategy.change_clearance, su.front + job.strategy.change_clearance];
-    let spindle = match m.spindle {
-        SpindleDirection::M3 => "M3",
-        SpindleDirection::M4 => "M4",
-    };
-    let coolant = match job.post.coolant {
-        Coolant::Off => None,
-        Coolant::Mist => Some("M7"),
-        Coolant::Flood => Some("M8"),
-    };
-    let mut tool = None;
-    let mut motion = "";
-    // the last point written: unchanged axes are not repeated
-    let mut last: Option<[f64; 2]> = None;
+    let mut w = OpWriter::new(change);
     for op in &plan.ops {
-        out(crate::post::comment(&op.name))?;
-        if tool != Some(op.tool) {
-            out(format!("G0 X{} Z{}", dia(change[0]), f(change[1])))?;
-            out(format!("T{} M6 G43", op.tool))?;
-            tool = Some(op.tool);
-            motion = "";
-            last = Some(change);
-        }
-        match op.spindle {
-            Spindle::SurfaceSpeed(v) => {
-                let top = job.tool(op.tool).and_then(|t| t.max_rpm).map_or(m.max_rpm, |r| r.min(m.max_rpm));
-                out(format!("G96 S{} D{} {spindle}", plain(v), plain(top)))?
-            }
-            Spindle::Rpm(r) => out(format!("G97 S{} {spindle}", plain(r.min(m.max_rpm).round())))?,
-        }
-        if let Some(c) = coolant {
-            out(c.into())?;
-        }
-        out(format!("F{}", f(op.feed)))?;
-        for mv in &op.moves {
-            let (code, p) = match mv {
-                TipMove::Rapid(p) => ("G0", p),
-                TipMove::Feed(p) => ("G1", p),
-                TipMove::Thread { to, pitch } => {
-                    // synchronised with the spindle, one pass along Z (X set by the move before)
-                    out(format!("G33 Z{} K{}", f(to[1]), f(*pitch)))?;
-                    motion = "G33";
-                    last = Some(*to);
-                    continue;
-                }
-            };
-            let word = if code == motion { String::new() } else { format!("{code} ") };
-            let x = if last.is_some_and(|q| (q[0] - p[0]).abs() < 1e-9) { String::new() } else { format!("X{} ", dia(p[0])) };
-            let z = if last.is_some_and(|q| (q[1] - p[1]).abs() < 1e-9) { String::new() } else { format!("Z{}", f(p[1])) };
-            last = Some(*p);
-            if x.is_empty() && z.is_empty() {
-                continue;
-            }
-            motion = code;
-            out(format!("{word}{x}{z}").trim_end().to_string())?;
+        for line in w.op(job, op) {
+            out(line)?;
         }
     }
     out(format!("G0 X{} Z{}", dia(change[0]), f(change[1])))?;

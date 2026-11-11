@@ -525,8 +525,36 @@ fn left_runs(n: usize, left: impl Fn(usize) -> f64) -> Vec<(usize, usize, f64)> 
     runs(0, n.saturating_sub(1), |i| left(i) > 0.01).into_iter().map(|(a, b)| (a, b, (a..=b).map(&left).fold(0.0, f64::max))).collect()
 }
 
+/// What a plan covers: all of it on a single lathe; one side's share on a twin-spindle lathe.
+#[derive(Clone, Copy, Debug)]
+pub struct Scope {
+    /// Turn the outside (roughing, finishing, grooving, threading).
+    pub outside: bool,
+    /// Drill and bore the bore open to the front; say what bores it leaves.
+    pub bore: bool,
+    /// Part off; the blade's face this far behind the part's end (left for the other side to
+    /// face), mm.
+    pub part_off: bool,
+    pub back_extra: f64,
+    /// The second side: the part, cut off with `stock.face_allowance` on its front, held by
+    /// this much of its far end (`stock.in_chuck`, from the part's chuck end): no bar, no
+    /// stick-out check.
+    pub second_side: bool,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Scope { outside: true, bore: true, part_off: true, back_extra: 0.0, second_side: false }
+    }
+}
+
 /// Plan turning `profile` from `job`'s bar.
 pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
+    plan_with(job, profile, &Scope::default())
+}
+
+/// Plan the part of turning `profile` that `scope` covers.
+pub fn plan_with(job: &LatheJob, profile: Profile, scope: &Scope) -> Result<LathePlan> {
     let s = &job.stock;
     let st = &job.strategy;
     let l = profile.length;
@@ -537,9 +565,13 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         return Err(CamError::Invalid(format!("the part is Ø{:.3}; the bar is Ø{:.3}", 2.0 * max_od, s.diameter)));
     }
     let need = l + s.face_allowance + s.parting_allowance + s.chuck_clearance;
-    let length = s.length.unwrap_or_else(|| (need + s.in_chuck).ceil());
+    let length = if scope.second_side { l + s.face_allowance } else { s.length.unwrap_or_else(|| (need + s.in_chuck).ceil()) };
     let stick_out = length - s.in_chuck;
-    if stick_out < need - 1e-9 {
+    if scope.second_side {
+        if !(stick_out > s.face_allowance + 1e-9) {
+            return Err(CamError::Invalid(format!("the second chuck holds {:.3} of a part {l:.3} long", s.in_chuck)));
+        }
+    } else if stick_out < need - 1e-9 {
         return Err(CamError::Invalid(format!(
             "the bar stands {stick_out:.3} out of the chuck; turning the part ({l:.3}), facing ({}), parting ({}) and clearing the jaws ({}) need {need:.3}",
             s.face_allowance, s.parting_allowance, s.chuck_clearance
@@ -555,7 +587,7 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         front: s.face_allowance,
         jaws: s.face_allowance - stick_out,
         part_end: -l,
-        turned_to: -l - s.parting_allowance,
+        turned_to: if scope.second_side { -l } else { -l - s.parting_allowance },
     };
     let rough = job.rough_tool().ok_or_else(|| CamError::Invalid("the job has no turning tool".into()))?;
     let finish = job.finish_tool().unwrap_or(rough);
@@ -604,9 +636,9 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
     let mut drilled = 0.0f64;
     let mut drilled_through = false;
     let bore = runs(0, n_samples.saturating_sub(1), |i| profile.id.get(i).copied().unwrap_or(0.0) > 0.0);
-    let open = bore.iter().find(|(_, b)| *b + 1 >= n_samples).copied();
+    let open = bore.iter().find(|(_, b)| *b + 1 >= n_samples).copied().filter(|_| scope.bore);
     for (a, b) in &bore {
-        if Some((*a, *b)) != open {
+        if scope.bore && Some((*a, *b)) != open {
             warnings.push(format!("Z {:.3} to {:.3}: a bore not open to the front face is not machined", zw(*a), zw(*b)));
         }
     }
@@ -693,7 +725,7 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         face: true,
         from: f64::NEG_INFINITY,
     });
-    if !outside.rough.is_empty() {
+    if scope.outside && !outside.rough.is_empty() {
         ops.push(LatheOp {
             kind: LatheOpKind::Roughing,
             name: "roughing".into(),
@@ -769,7 +801,7 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         }
     }
 
-    if !outside.finish.is_empty() {
+    if scope.outside && !outside.finish.is_empty() {
         ops.push(LatheOp {
             kind: LatheOpKind::Finishing,
             name: "finishing".into(),
@@ -782,7 +814,11 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
 
     // Grooving what the finishing tool can't reach, with the blade; what is left after it
     let mut surface_now = outside.cut.clone();
-    let unreached = left_runs(n_samples, |i| outside.cut.get(i).copied().unwrap_or(0.0) - outside.best.get(i).copied().unwrap_or(0.0));
+    let unreached = if scope.outside {
+        left_runs(n_samples, |i| outside.cut.get(i).copied().unwrap_or(0.0) - outside.best.get(i).copied().unwrap_or(0.0))
+    } else {
+        Vec::new()
+    };
     let blade = job.first_of(LatheToolKind::Grooving);
     if let Some(bl) = blade
         && !unreached.is_empty()
@@ -850,7 +886,8 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         }
     }
     let after = if blade.is_some() { "the grooving blade" } else { "a grooving tool (none in the job)" };
-    for (a, b, most) in left_runs(n_samples, |i| surface_now.get(i).copied().unwrap_or(0.0) - outside.best.get(i).copied().unwrap_or(0.0)) {
+    let reported = if scope.outside { n_samples } else { 0 };
+    for (a, b, most) in left_runs(reported, |i| surface_now.get(i).copied().unwrap_or(0.0) - outside.best.get(i).copied().unwrap_or(0.0)) {
         warnings.push(format!(
             "Z {:.3} to {:.3}: up to {most:.2} mm is left that neither T{} nor {after} reaches (a V or slope steeper than they follow, or narrower than the blade)",
             zw(a),
@@ -861,7 +898,7 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
 
     // Threading: radial passes in G33, degressive, and a spring pass
     let mut threads = Vec::new();
-    if !job.part.threads.is_empty() {
+    if scope.outside && !job.part.threads.is_empty() {
         match job.first_of(LatheToolKind::Threading) {
             None => warnings.push("the threads are not cut: no threading tool in the job".into()),
             Some(th) => {
@@ -965,20 +1002,26 @@ pub fn plan(job: &LatheJob, profile: Profile) -> Result<LathePlan> {
         }
     }
 
-    // Parting off behind the part, the blade's face toward the front at the part's end
-    match blade {
+    // Parting off behind the part, the blade's face toward the front at the part's end (or
+    // `back_extra` behind it)
+    match blade.filter(|_| scope.part_off) {
+        None if !scope.part_off => {}
         None => warnings.push("the part is not parted off: no grooving or parting blade in the job".into()),
         Some(bl) => {
             let w = bl.blade_width();
             let top = profile.od.first().copied().unwrap_or(r_bar);
             // into the bore where the hole goes on past the kerf
-            let end = if bore_end > 0.0 && drilled_through && drilled >= l + w + 0.1 { bore_end - 0.5 } else { -0.2 };
-            if w > back + 1e-9 {
-                warnings.push(format!("the part is not parted off: T{} is {w} wide, the parting allowance {back}", bl.number));
+            let end = if bore_end > 0.0 && drilled_through && drilled >= l + scope.back_extra + w + 0.1 { bore_end - 0.5 } else { -0.2 };
+            if w + scope.back_extra > back + 1e-9 {
+                warnings.push(format!(
+                    "the part is not parted off: T{} is {w} wide, the parting allowance {back}{}",
+                    bl.number,
+                    if scope.back_extra > 0.0 { format!(" with {} left on the back", scope.back_extra) } else { String::new() }
+                ));
             } else if top - end > bl.reach() {
                 warnings.push(format!("the part is not parted off: Ø{:.1} is deeper than T{} reaches; part it off by hand", 2.0 * top, bl.number));
             } else {
-                let zt = -l - w;
+                let zt = -l - scope.back_extra - w;
                 let start = top + clr;
                 let mut mv = vec![TipMove::Rapid([r_bar + clr, zt]), TipMove::Rapid([start, zt])];
                 let mut r = top;

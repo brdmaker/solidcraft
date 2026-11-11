@@ -1,4 +1,5 @@
-//! SolidCraft CAM for 3-axis routers machining from the top, and for lathes ([`lathe`]).
+//! SolidCraft CAM for 3-axis routers machining from the top, for lathes ([`lathe`]) and for a
+//! twin-spindle turn-mill lathe ([`ctx`]).
 //!
 //! Toolpaths come from the exact solid: machining features are read from the B-rep faces
 //! (planes, vertical cylinders and cones), so holes keep their true diameters and arcs stay arcs.
@@ -6,6 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod adaptive;
+pub mod ctx;
 pub mod job;
 pub mod lathe;
 pub mod nest;

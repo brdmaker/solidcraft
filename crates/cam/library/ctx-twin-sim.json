@@ -1,0 +1,21 @@
+{
+ "version": 1,
+ "name": "CTX twin (simulation), 12-station VDI 40 turret",
+ "note": "The tools of the twin's simulation (brdmot linuxcnc/ctxtwin/sim/tool.tbl), the same stations on both sides; starting values for aluminium, brass and steel at up to 3000 rpm on the live tools: check them against the tool maker's data and your machine. Touch turning tools off on their imaginary tip, boring bars on theirs, grooving blades on their corner toward the chuck, threading tools and drills on their point, live tools on their end (axial) or their axis at the end (radial). Holders are typical VDI 40 sizes (20 mm shanks, Ø40 collet chucks): measure yours.",
+ "tools": [
+  {"number": 1, "name": "Roughing: CNMG 12 80° insert, 95° holder, R0.4", "kind": "turning", "insert_angle_deg": 80, "approach_deg": 95, "nose_radius": 0.4, "feed": 0.15, "depth": 1.5, "surface_speed": {"aluminium": 250, "brass": 180, "steel": 150}, "holder": {"z": [1, 21], "x": [12, 80], "height": 20}},
+  {"number": 2, "name": "Finishing: VBMT 16 35° insert, 93° holder, R0.2", "kind": "turning", "insert_angle_deg": 35, "approach_deg": 93, "nose_radius": 0.2, "feed": 0.06, "depth": 0.5, "surface_speed": {"aluminium": 300, "brass": 220, "steel": 180}, "holder": {"z": [1, 21], "x": [14, 80], "height": 20}},
+  {"number": 3, "name": "Threading 60° external, ISO metric", "kind": "threading", "tip_angle_deg": 60, "nose_radius": 0.1, "max_rpm": 1200, "feed": 1.0, "depth": 0.3, "surface_speed": {"aluminium": 120, "brass": 100, "steel": 80}, "holder": {"z": [-2, 18], "x": [12, 80], "height": 20}},
+  {"number": 4, "name": "Drill Ø8 HSS-Co", "kind": "drill", "diameter": 8, "tip_angle_deg": 118, "peck": 8, "max_rpm": 3000, "feed": 0.12, "depth": 8, "surface_speed": {"aluminium": 70, "brass": 50, "steel": 25}, "holder": {"z": [55, 115], "x": [-20, 20], "round": true}},
+  {"number": 9, "name": "Grooving and parting blade 3 wide", "kind": "grooving", "width": 3, "max_depth": 26, "nose_radius": 0.1, "feed": 0.05, "depth": 3, "surface_speed": {"aluminium": 150, "brass": 120, "steel": 80}, "holder": {"z": [1, 25], "x": [28, 80], "height": 20}},
+  {"number": 11, "name": "Drill Ø12 HSS-Co", "kind": "drill", "diameter": 12, "tip_angle_deg": 118, "peck": 12, "max_rpm": 2000, "feed": 0.15, "depth": 12, "surface_speed": {"aluminium": 70, "brass": 50, "steel": 25}, "holder": {"z": [60, 120], "x": [-20, 20], "round": true}},
+  {"number": 12, "name": "Boring bar Ø6, 55° insert, 93°, R0.2, bores from Ø7", "kind": "boring", "insert_angle_deg": 55, "approach_deg": 93, "nose_radius": 0.2, "min_bore": 7, "max_depth": 30, "feed": 0.06, "depth": 0.5, "surface_speed": {"aluminium": 200, "brass": 150, "steel": 100}, "holder": {"z": [0.5, 90], "x": [-7, -1], "round": true}}
+ ],
+ "live_tools": [
+  {"number": 5, "name": "Live drill Ø6, radial", "kind": "drill", "mount": "radial", "diameter": 6, "flute_length": 40, "rpm": 3000, "feed": 240, "plunge": 240, "peck": 6, "reach": 50, "holder_diameter": 40},
+  {"number": 6, "name": "Live end mill Ø4, 2 flutes, radial", "kind": "flat", "mount": "radial", "diameter": 4, "flute_length": 10, "flutes": 2, "rpm": 3000, "feed": 300, "plunge": 100, "stepdown": 1.0, "reach": 25, "holder_diameter": 40},
+  {"number": 7, "name": "Live end mill Ø6, 3 flutes, axial", "kind": "flat", "mount": "axial", "diameter": 6, "flute_length": 16, "flutes": 3, "rpm": 3000, "feed": 450, "plunge": 120, "stepdown": 2.0, "reach": 30, "holder_diameter": 40},
+  {"number": 8, "name": "Live drill Ø5, axial", "kind": "drill", "mount": "axial", "diameter": 5, "flute_length": 30, "rpm": 3000, "feed": 240, "plunge": 240, "peck": 5, "reach": 40, "holder_diameter": 40},
+  {"number": 10, "name": "Live drill Ø6.6 (M6 clearance), axial", "kind": "drill", "mount": "axial", "diameter": 6.6, "flute_length": 35, "rpm": 3000, "feed": 260, "plunge": 260, "peck": 6, "reach": 45, "holder_diameter": 40}
+ ]
+}

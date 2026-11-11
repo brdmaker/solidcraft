@@ -72,6 +72,55 @@ pub fn read(body: &Body, front: Front) -> Result<Profile> {
     }
 }
 
+/// The profile a turn-mill part is turned to before its milled features are cut (flats, slots,
+/// cross holes, holes off the axis): from its exact faces where they are all of revolution about
+/// Z; else its outer radius from the mesh (the farthest point at each sample: what the milling
+/// leaves standing), and a bore only where a face of revolution about Z bounds it (the nearest
+/// point of the cut on such a face): a slot or cross hole through the axis is milled, not bored.
+pub fn read_envelope(body: &Body, front: Front) -> Result<Profile> {
+    if let Some(p) = exact(body, front)? {
+        return Ok(p);
+    }
+    let mut p = from_mesh(body, front)?;
+    let faces = turned_faces(body, front, true)?.map(|f| f.0).unwrap_or_default();
+    let tol = 2.0 * MESH_TOL + 1e-6;
+    let n = p.id.len();
+    // on a face of revolution: a turned bore
+    let turned: Vec<bool> = (0..n)
+        .map(|i| {
+            let (z, d) = (i as f64 * p.dz, p.id.get(i).copied().unwrap_or(0.0));
+            d > 0.0
+                && faces.iter().any(|t| match *t {
+                    Turned::Round { z0, z1, shape } => z >= z0 - 1e-9 && z <= z1 + 1e-9 && (shape.radius(z) - d).abs() <= tol,
+                    Turned::Face { .. } => false,
+                })
+        })
+        .collect();
+    // a stretch where the axis is open but no turned face bounds it: milled. A bore goes on
+    // through it where it is at least as wide as the bore at its ends (a pocket opening the bore
+    // to the face); else it is solid as turned.
+    let mut i = 0;
+    while i < n {
+        if turned.get(i).copied().unwrap_or(false) || p.id.get(i).copied().unwrap_or(0.0) <= 0.0 {
+            i += 1;
+            continue;
+        }
+        let a = i;
+        while i < n && !turned.get(i).copied().unwrap_or(false) && p.id.get(i).copied().unwrap_or(0.0) > 0.0 {
+            i += 1;
+        }
+        let ends = [a.checked_sub(1), Some(i).filter(|j| *j < n)];
+        let bore =
+            ends.iter().flatten().filter(|j| turned.get(**j).copied().unwrap_or(false)).filter_map(|j| p.id.get(*j)).copied().fold(0.0, f64::max);
+        for k in a..i {
+            if let Some(d) = p.id.get_mut(k) {
+                *d = if bore > 0.0 && *d >= bore - tol { bore } else { 0.0 };
+            }
+        }
+    }
+    Ok(p)
+}
+
 /// How far off the axis a face's axis or centre may lie, and how far from square to Z a plane may
 /// turn (as a sine), and still count as turned about Z.
 const AXIS_TOL: f64 = 1e-6;
@@ -121,8 +170,9 @@ impl Shape {
     }
 }
 
-/// The profile from the exact faces, or `None` where a face is not of revolution about Z.
-fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
+/// The part's faces of revolution about Z in its own z, and its length; `None` where a face is
+/// not one (with `skip_others`: such faces are left out instead).
+fn turned_faces(body: &Body, front: Front, skip_others: bool) -> Result<Option<(Vec<Turned>, f64)>> {
     if body.is_mesh() {
         return Ok(None);
     }
@@ -172,12 +222,20 @@ fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
         let z0 = zs.iter().copied().fold(f64::INFINITY, f64::min);
         let z1 = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let r_of = |p: &[f64; 3]| p[0].hypot(p[1]);
-        let Some(surface) = face_surface(body, f) else { return Ok(None) };
+        let Some(surface) = face_surface(body, f) else {
+            if skip_others {
+                continue;
+            }
+            return Ok(None);
+        };
         let round = |shape: Shape| (z0.is_finite() && z1 >= z0).then_some(Turned::Round { z0, z1, shape });
         let t = match surface {
             FaceSurface::Plane { normal, point } => {
                 let n = normal.vec();
                 if n.z.abs() < 1.0 - AXIS_TOL {
+                    if skip_others {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 let r = pts.iter().map(r_of).fold(0.0, f64::max);
@@ -185,6 +243,9 @@ fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
             }
             FaceSurface::Cylinder { origin, axis, radius } => {
                 if axis.vec().z.abs() < 1.0 - AXIS_TOL || !on_axis(origin.x, origin.y) {
+                    if skip_others {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 round(Shape::Cylinder { r: radius })
@@ -192,6 +253,9 @@ fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
             FaceSurface::Cone { apex, axis, half_angle } => {
                 let a = axis.vec();
                 if a.z.abs() < 1.0 - AXIS_TOL || !on_axis(apex.x, apex.y) {
+                    if skip_others {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 // r = (z − apex) along the axis · tan(half angle), in the part's z
@@ -200,12 +264,18 @@ fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
             }
             FaceSurface::Sphere { center, radius } => {
                 if !on_axis(center.x, center.y) {
+                    if skip_others {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 round(Shape::Ring { zc: zp(center.z), ring: 0.0, r: radius, outer: true })
             }
             FaceSurface::Torus { center, axis, major, minor } => {
                 if axis.vec().z.abs() < 1.0 - AXIS_TOL || !on_axis(center.x, center.y) {
+                    if skip_others {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 // its side of the tube: where its corners lie off the ring
@@ -218,7 +288,12 @@ fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
             None => return Ok(None),
         }
     }
-    let length = hi - lo;
+    Ok(Some((faces, hi - lo)))
+}
+
+/// The profile from the exact faces, or `None` where a face is not of revolution about Z.
+fn exact(body: &Body, front: Front) -> Result<Option<Profile>> {
+    let Some((faces, length)) = turned_faces(body, front, false)? else { return Ok(None) };
     let n = ((length / STEP).ceil() as usize + 1).clamp(2, MAX_SAMPLES);
     let dz = length / (n - 1) as f64;
     let tol = EPS.max(1e-9 * length);

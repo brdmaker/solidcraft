@@ -250,8 +250,17 @@ const HOLDER_THICKNESS: f64 = 0.005;
 
 /// Simulate `plan`.
 pub fn simulate(job: &LatheJob, plan: &LathePlan) -> Result<(LatheSimReport, Area)> {
+    simulate_from(job, plan, None)
+}
+
+/// Simulate `plan` on `start` (the half section of the work as it comes to this lathe, in its
+/// work coordinates), or on the bar.
+pub fn simulate_from(job: &LatheJob, plan: &LathePlan, start: Option<Area>) -> Result<(LatheSimReport, Area)> {
     let su = &plan.setup;
-    let mut left = Area::rect(su.jaws, 0.0, su.front, su.radius)?;
+    let mut left = match start {
+        Some(a) => a,
+        None => Area::rect(su.jaws, 0.0, su.front, su.radius)?,
+    };
     let start = left.area();
     let mut rapid_hits = Vec::new();
     let mut jaw_hits = 0usize;
