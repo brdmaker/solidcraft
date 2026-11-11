@@ -1,0 +1,207 @@
+{
+ "units": "mm",
+ "note": "Parts for a twin-spindle turn-mill lathe, bar fed through spindle 1: each lies along Z, z 0 the back (cut off, then finished in spindle 2), z = length the front (finished in spindle 1). turned: what a lathe cuts (od as [diameter, z0, z1]). features: what needs live tools: side front/back (axial, from that end) or radial; angles about Z from +X. volume_mm3 worked out by hand from the design. *.build.json: the solidcraft-cli scripts that built them.",
+ "parts": [
+  {
+   "design": "cross-pin.sc",
+   "body": "CrossPin",
+   "material": "aluminium",
+   "diameter": 20,
+   "length": 50.0,
+   "stock_bar_diameter": 22,
+   "volume_mm3": 14942.235,
+   "turned": {
+    "od": [
+     [
+      20,
+      0,
+      50
+     ]
+    ],
+    "bore": null,
+    "chamfers": [
+     {
+      "side": "front",
+      "size": 0.5
+     },
+     {
+      "side": "back",
+      "size": 0.5
+     }
+    ]
+   },
+   "features": [
+    {
+     "kind": "cross_hole",
+     "side": "radial",
+     "diameter": 6,
+     "z": 35,
+     "axis_angle_deg": 0,
+     "through": true
+    },
+    {
+     "kind": "keyway",
+     "side": "radial",
+     "width": 5,
+     "z": [
+      7.5,
+      24.5
+     ],
+     "floor_radius": 7.5,
+     "angle_deg": 0,
+     "note": "a slot milled from the +X side with a radial end mill: centres z 10..22, floor the plane x = 7.5"
+    }
+   ]
+  },
+  {
+   "design": "hex-flange.sc",
+   "body": "HexFlange",
+   "material": "aluminium",
+   "diameter": 45,
+   "length": 30.0,
+   "stock_bar_diameter": 50,
+   "volume_mm3": 31099.911,
+   "turned": {
+    "od": [
+     [
+      45,
+      0,
+      20
+     ]
+    ],
+    "bore": {
+     "diameter": 12,
+     "through": true
+    }
+   },
+   "features": [
+    {
+     "kind": "hex",
+     "side": "front",
+     "across_flats": 28,
+     "z": [
+      20,
+      30
+     ],
+     "flat_angles_deg": [
+      0,
+      60,
+      120,
+      180,
+      240,
+      300
+     ],
+     "note": "face milled from the front in polar (G12.1) down to the flange's face z 20"
+    },
+    {
+     "kind": "axial_holes",
+     "side": "front",
+     "diameter": 6.6,
+     "count": 6,
+     "pcd": 38,
+     "start_angle_deg": 0,
+     "z": [
+      0,
+      20
+     ],
+     "through": true
+    }
+   ]
+  },
+  {
+   "design": "slotted-cap.sc",
+   "body": "SlottedCap",
+   "material": "aluminium",
+   "diameter": 30,
+   "length": 25.0,
+   "stock_bar_diameter": 32,
+   "volume_mm3": 16367.684,
+   "turned": {
+    "od": [
+     [
+      30,
+      0,
+      25
+     ]
+    ],
+    "bore": null
+   },
+   "features": [
+    {
+     "kind": "slot",
+     "side": "front",
+     "width": 6,
+     "along_deg": 0,
+     "depth": 4,
+     "floor_z": 21,
+     "through": true,
+     "note": "across the whole face along X"
+    },
+    {
+     "kind": "flats",
+     "side": "back",
+     "planes_y": [
+      12,
+      -12
+     ],
+     "z": [
+      0,
+      8
+     ],
+     "note": "two parallel flats, 24 across, from the back face 8 long"
+    }
+   ]
+  },
+  {
+   "design": "face-pattern.sc",
+   "body": "FacePattern",
+   "material": "aluminium",
+   "diameter": 40,
+   "length": 20.0,
+   "stock_bar_diameter": 45,
+   "volume_mm3": 22303.89,
+   "turned": {
+    "od": [
+     [
+      40,
+      0,
+      20
+     ]
+    ],
+    "bore": {
+     "diameter": 10,
+     "through": true
+    },
+    "chamfers": [
+     {
+      "side": "front",
+      "size": 0.5
+     }
+    ]
+   },
+   "features": [
+    {
+     "kind": "axial_holes",
+     "side": "front",
+     "diameter": 5,
+     "count": 6,
+     "pcd": 28,
+     "start_angle_deg": 0,
+     "depth": 8,
+     "floor_z": 12,
+     "through": false
+    },
+    {
+     "kind": "pocket",
+     "side": "back",
+     "shape": "stadium",
+     "length": 20,
+     "width": 10,
+     "along_deg": 0,
+     "depth": 3,
+     "floor_z": 3
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,10 @@
+{"commands":[
+{"command":"solid.cylinder","params":{"diameter":45,"height":20,"operation":"new","body_name":"HexFlange","name":"Flange"}},
+{"command":"sketch.create","params":{"plane":"XY","offset":20,"name":"HexSketch"}},
+{"command":"sketch.polygon.circumscribed","params":{"center":[0,0],"radius":14,"sides":6,"angle":0}},
+{"command":"sketch.finish","params":{}},
+{"command":"solid.extrude","params":{"distance":10,"operation":"join","name":"Hex"}},
+{"command":"solid.cylinder","params":{"diameter":12,"height":32,"base":[0,0,-1],"operation":"cut","name":"Bore"}},
+{"command":"solid.cylinder","params":{"diameter":6.6,"height":22,"base":[19,0,-1],"operation":"cut","name":"BoltHole"}},
+{"command":"solid.pattern.circular","params":{"features":["BoltHole"],"axis":"Z","count":6,"name":"BoltHoles"}}
+]}

@@ -33,3 +33,8 @@
 | tests/cam/lathe/taper-arbor.step | SolidCraft contributors | original turned test part (taper arbor), exported by SolidCraft from tests/cam/lathe/taper-arbor.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/lathe/v-pulley.step | SolidCraft contributors | original turned test part (V-belt pulley), exported by SolidCraft from tests/cam/lathe/v-pulley.sc; no external CAD geometry | MIT OR Apache-2.0 |
 | tests/cam/lathe/knob.step | SolidCraft contributors | original turned test part (knob), exported by SolidCraft from tests/cam/lathe/knob.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/ctx/parts.png | SolidCraft contributors | original renders of the turn-mill test parts, drawn by solidcraft-cli from tests/cam/ctx/*.sc | MIT OR Apache-2.0 |
+| tests/cam/ctx/cross-pin.step | SolidCraft contributors | original turn-mill test part (cross pin), exported by SolidCraft from tests/cam/ctx/cross-pin.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/ctx/hex-flange.step | SolidCraft contributors | original turn-mill test part (hex flange), exported by SolidCraft from tests/cam/ctx/hex-flange.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/ctx/slotted-cap.step | SolidCraft contributors | original turn-mill test part (slotted cap), exported by SolidCraft from tests/cam/ctx/slotted-cap.sc; no external CAD geometry | MIT OR Apache-2.0 |
+| tests/cam/ctx/face-pattern.step | SolidCraft contributors | original turn-mill test part (face pattern), exported by SolidCraft from tests/cam/ctx/face-pattern.sc; no external CAD geometry | MIT OR Apache-2.0 |

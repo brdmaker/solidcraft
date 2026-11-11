@@ -340,6 +340,96 @@ fn the_lathe_parts_are_turned_about_z_as_designed() {
     }
 }
 
+/// The twin-spindle turn-mill parts (tests/cam/ctx, parts.json): each STEP file reads back as one
+/// solid along Z with the volume worked out from its design and its finished diameter and
+/// length, and every milled feature written down for it is there as exact faces: holes and slot
+/// ends as cylinders of their radius on their axis, flats and floors as planes where they were
+/// designed.
+#[test]
+fn the_turn_mill_parts_carry_their_milled_features() {
+    use solidcraft_geom::Vec3Geom;
+    use solidcraft_kernel::{FaceSurface, face_surface};
+    let dir = fixtures().join("ctx");
+    let parts: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("parts.json")).unwrap()).unwrap();
+    let parts = parts["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 4);
+    for p in parts {
+        let name = p["design"].as_str().unwrap();
+        let read = solidcraft_kernel::step_import(&std::fs::read_to_string(dir.join(name.replace(".sc", ".step"))).unwrap()).unwrap();
+        assert_eq!(read.bodies.len(), 1, "{name}");
+        let b = &read.bodies[0].body;
+        let (d, length, want) = (f(&p["diameter"]), f(&p["length"]), f(&p["volume_mm3"]));
+        let v = b.volume_at(0.002).unwrap();
+        assert!((v - want).abs() <= 2e-4 * want, "{name}: volume {v:.2}, worked out {want:.2}");
+        let bounds = b.mesh(&solidcraft_kernel::MeshTolerance::chord(0.002)).unwrap().bounds();
+        assert!(bounds.min.z.abs() < 0.01 && (bounds.max.z - length).abs() < 0.01, "{name}: z {:?} {:?}", bounds.min, bounds.max);
+        assert!(bounds.max.x <= d / 2.0 + 0.01 && bounds.min.x >= -d / 2.0 - 0.01, "{name}: wider than Ø{d}");
+        assert!(f(&p["stock_bar_diameter"]) > d, "{name}: a bar to turn it from");
+        let faces: Vec<FaceSurface> = (0..b.face_count()).filter_map(|i| face_surface(b, i)).collect();
+        // a plane with outward normal n at n·p = off
+        let plane = |n: [f64; 3], off: f64| {
+            faces.iter().any(|s| match s {
+                FaceSurface::Plane { normal, point } => {
+                    (normal.x - n[0]).abs() + (normal.y - n[1]).abs() + (normal.z - n[2]).abs() < 1e-6
+                        && (normal.x * point.x + normal.y * point.y + normal.z * point.z - off).abs() < 1e-6
+                }
+                _ => false,
+            })
+        };
+        // the centres (in the plane square to the axis) of the cylinders of radius r along axis a
+        let cylinders = |a: [f64; 3], r: f64| -> Vec<solidcore_record::Vec3> {
+            let mut c: Vec<solidcore_record::Vec3> = Vec::new();
+            for s in &faces {
+                if let FaceSurface::Cylinder { origin, axis, radius } = s {
+                    let dot = axis.x * a[0] + axis.y * a[1] + axis.z * a[2];
+                    if (radius - r).abs() < 1e-6 && dot.abs() > 1.0 - 1e-9 {
+                        let o = *origin - solidcore_record::Vec3::new(a[0], a[1], a[2]) * (origin.x * a[0] + origin.y * a[1] + origin.z * a[2]);
+                        if !c.iter().any(|q| (*q - o).len() < 1e-6) {
+                            c.push(o);
+                        }
+                    }
+                }
+            }
+            c
+        };
+        for feat in p["features"].as_array().unwrap() {
+            let kind = feat["kind"].as_str().unwrap();
+            let ok = match kind {
+                "cross_hole" => {
+                    let c = cylinders([1.0, 0.0, 0.0], f(&feat["diameter"]) / 2.0);
+                    c.len() == 1 && (c[0].z - f(&feat["z"])).abs() < 1e-6 && c[0].y.abs() < 1e-6
+                }
+                "keyway" => plane([1.0, 0.0, 0.0], f(&feat["floor_radius"])) && cylinders([1.0, 0.0, 0.0], f(&feat["width"]) / 2.0).len() == 2,
+                "hex" => feat["flat_angles_deg"].as_array().unwrap().iter().all(|a| {
+                    let t = f(a).to_radians();
+                    plane([t.cos(), t.sin(), 0.0], f(&feat["across_flats"]) / 2.0)
+                }),
+                "axial_holes" => {
+                    let c = cylinders([0.0, 0.0, 1.0], f(&feat["diameter"]) / 2.0);
+                    c.len() == feat["count"].as_u64().unwrap() as usize
+                        && c.iter().all(|q| (q.x.hypot(q.y) - f(&feat["pcd"]) / 2.0).abs() < 1e-6)
+                        && (feat["through"].as_bool().unwrap() || plane([0.0, 0.0, 1.0], f(&feat["floor_z"])))
+                }
+                "slot" => {
+                    let w = f(&feat["width"]) / 2.0;
+                    plane([0.0, 1.0, 0.0], -w) && plane([0.0, -1.0, 0.0], -w) && plane([0.0, 0.0, 1.0], f(&feat["floor_z"]))
+                }
+                "flats" => feat["planes_y"].as_array().unwrap().iter().all(|y| plane([0.0, f(y).signum(), 0.0], f(y).abs())),
+                "pocket" => {
+                    // (not the bore, on the axis)
+                    let c: Vec<_> = cylinders([0.0, 0.0, 1.0], f(&feat["width"]) / 2.0).into_iter().filter(|q| q.x.hypot(q.y) > 1e-6).collect();
+                    let off = (f(&feat["length"]) - f(&feat["width"])) / 2.0;
+                    plane([0.0, 0.0, -1.0], -f(&feat["floor_z"]))
+                        && c.len() == 2
+                        && c.iter().all(|q| (q.x.abs() - off).abs() < 1e-6 && q.y.abs() < 1e-6)
+                }
+                other => panic!("{name}: unknown feature {other}"),
+            };
+            assert!(ok, "{name}: {kind} not found as designed: {feat}");
+        }
+    }
+}
+
 /// The STEP file exported from the part's design.
 fn with_step(part: &Value) -> Value {
     let mut p = part.clone();

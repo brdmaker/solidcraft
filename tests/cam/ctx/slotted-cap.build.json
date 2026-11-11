@@ -1,0 +1,12 @@
+{"commands":[
+{"command":"solid.cylinder","params":{"diameter":30,"height":25,"operation":"new","body_name":"SlottedCap","name":"Bar"}},
+{"command":"sketch.create","params":{"plane":"XY","offset":25,"name":"SlotSketch"}},
+{"command":"sketch.rectangle.center","params":{"center":[0,0],"corner":[20,3]}},
+{"command":"sketch.finish","params":{}},
+{"command":"solid.extrude","params":{"distance":4,"operation":"cut","direction":"negative","name":"FrontSlot"}},
+{"command":"sketch.create","params":{"plane":"XY","name":"FlatSketch"}},
+{"command":"sketch.rectangle.center","params":{"center":[0,16],"corner":[20,20]}},
+{"command":"sketch.rectangle.center","params":{"center":[0,-16],"corner":[20,-12]}},
+{"command":"sketch.finish","params":{}},
+{"command":"solid.extrude","params":{"distance":8,"operation":"cut","name":"BackFlats"}}
+]}

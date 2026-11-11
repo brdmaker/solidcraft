@@ -1,0 +1,11 @@
+{"commands":[
+{"command":"solid.cylinder","params":{"diameter":40,"height":20,"operation":"new","body_name":"FacePattern","name":"Disc"}},
+{"command":"solid.chamfer","params":{"edges":[[20,0,20]],"distance":0.5,"name":"FrontChamfer"}},
+{"command":"solid.cylinder","params":{"diameter":10,"height":22,"base":[0,0,-1],"operation":"cut","name":"Bore"}},
+{"command":"solid.cylinder","params":{"diameter":5,"height":9,"base":[14,0,12],"operation":"cut","name":"BlindHole"}},
+{"command":"solid.pattern.circular","params":{"features":["BlindHole"],"axis":"Z","count":6,"name":"BlindHoles"}},
+{"command":"sketch.create","params":{"plane":"XY","name":"PocketSketch"}},
+{"command":"sketch.slot.overall","params":{"p0":[-10,0],"p1":[10,0],"width":10}},
+{"command":"sketch.finish","params":{}},
+{"command":"solid.extrude","params":{"distance":3,"operation":"cut","name":"BackPocket"}}
+]}

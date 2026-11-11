@@ -1,0 +1,10 @@
+{"commands":[
+{"command":"solid.cylinder","params":{"diameter":20,"height":50,"operation":"new","body_name":"CrossPin","name":"Bar"}},
+{"command":"solid.chamfer","params":{"edges":[[10,0,50]],"distance":0.5,"name":"FrontChamfer"}},
+{"command":"solid.chamfer","params":{"edges":[[10,0,0]],"distance":0.5,"name":"BackChamfer"}},
+{"command":"solid.cylinder","params":{"diameter":6,"height":30,"base":[-15,0,35],"axis":"X","operation":"cut","name":"CrossHole"}},
+{"command":"sketch.create","params":{"plane":"YZ","offset":10,"name":"KeySketch"}},
+{"command":"sketch.slot.center_to_center","params":{"p0":[0,10],"p1":[0,22],"width":5}},
+{"command":"sketch.finish","params":{}},
+{"command":"solid.extrude","params":{"distance":2.5,"operation":"cut","direction":"negative","name":"Keyway"}}
+]}
