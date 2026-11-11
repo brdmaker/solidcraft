@@ -366,3 +366,49 @@ fn lathe_plan_reads_the_knob_design_with_its_grip_groove_cut_in() {
     assert!((at(22.5 - l) - 21.0).abs() < 0.01, "{}", at(22.5 - l));
     assert!(r["scene"]["operations"].as_array().unwrap().iter().any(|o| o["kind"] == "threading" && o["tool"] == 4));
 }
+
+/// The cross pin (tests/cam/ctx: Ø20 × 50, a Ø6 cross hole, a keyway 5 wide) from a Ø22 bar on
+/// the twin: side 1 faces, roughs and finishes it, drills the cross hole from both sides (T5) and
+/// mills the keyway (T6) with live tools, then parts it off (T9) last; side 2 faces the back.
+/// Nothing is cut from the part; the two programs are written beside each other, side 1's with
+/// the transfer's calls in order.
+#[test]
+fn ctx_plans_and_writes_the_cross_pin() {
+    let out = lathe_out("ctx");
+    let job = json!({
+        "machine": {"x_min": -5},
+        "stock": {"diameter": 22, "material": "aluminium"},
+        "part": {"design": fixtures().join("ctx/cross-pin.step").to_string_lossy(), "body": "CrossPin"}
+    });
+    let mut s = Session::default();
+    let r = run(&mut s, "cam.ctx.plan", json!({"job": job}));
+    assert!(r["warnings"].as_array().unwrap().is_empty(), "{:#}", r["warnings"]);
+    let ops1: Vec<&str> = r["side1"]["operations"].as_array().unwrap().iter().map(|o| o.as_str().unwrap()).collect();
+    assert_eq!(ops1.first(), Some(&"facing"));
+    assert_eq!(ops1.last(), Some(&"parting"));
+    assert!(ops1.iter().any(|o| o.starts_with("cross hole")) && ops1.iter().any(|o| o.starts_with("keyway")), "{ops1:?}");
+    for t in [5, 6, 9] {
+        assert!(r["side1"]["tools"].as_array().unwrap().contains(&json!(t)), "{:#}", r["side1"]);
+    }
+    assert_eq!(r["side2"]["operations"], json!(["facing"]));
+    let sim = &r["simulation"];
+    for side in ["side1", "side2"] {
+        assert!(sim[side]["gouges"].as_array().unwrap().is_empty() && sim[side]["left"].as_array().unwrap().is_empty(), "{:#}", sim[side]);
+    }
+    assert!(sim["live_gouges"].as_array().unwrap().is_empty(), "{:#}", sim["live_gouges"]);
+    let ngc = out.join("pin.ngc");
+    let w = run(&mut s, "cam.ctx.gcode", json!({"job": job, "path": ngc.to_string_lossy()}));
+    let files: Vec<String> = w["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+    assert!(files[0].ends_with("pin_1.ngc") && files[1].ends_with("pin_2.ngc"), "{files:?}");
+    let one = std::fs::read_to_string(&files[0]).unwrap();
+    let two = std::fs::read_to_string(&files[1]).unwrap();
+    let at = |g: &str, s: &str| g.find(s).unwrap_or_else(|| panic!("no {s}"));
+    assert!(
+        at(&one, "o<twin_init>") < at(&one, "M14")
+            && at(&one, "M14") < at(&one, "o<twin_grip>")
+            && at(&one, "o<twin_grip>") < at(&one, "o<twin_cut_done>")
+    );
+    assert!(at(&two, "o<twin_catch>") > at(&two, "o<twin_sync> call [3]"));
+    assert_eq!(w["lines"][0].as_u64().unwrap() as usize, one.lines().count());
+    std::fs::remove_dir_all(&out).ok();
+}

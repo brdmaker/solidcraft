@@ -10,8 +10,9 @@ use solidcraft_cam::part::{PartFeatures, oriented};
 use super::CommandSpec;
 use crate::params::bad;
 use crate::schema::cam::{
-    JobExportSceneParams, JobExportSceneResult, JobGcodeParams, JobGcodeResult, JobNestParams, JobNestResult, JobSimulateParams, JobSimulateResult,
-    LathePlanParams, LathePlanResult, LatheWriteParams, LatheWriteResult, NestedPart, PartInspectParams,
+    CtxPlanParams, CtxPlanResult, CtxSide, CtxWriteParams, CtxWriteResult, JobExportSceneParams, JobExportSceneResult, JobGcodeParams,
+    JobGcodeResult, JobNestParams, JobNestResult, JobSimulateParams, JobSimulateResult, LathePlanParams, LathePlanResult, LatheWriteParams,
+    LatheWriteResult, NestedPart, PartInspectParams,
 };
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
@@ -23,11 +24,46 @@ const JOB_GCODE_CONTRACT: TypedContract<JobGcodeParams> = TypedContract::new();
 const JOB_SIMULATE_CONTRACT: TypedContract<JobSimulateParams> = TypedContract::new();
 const LATHE_PLAN_CONTRACT: TypedContract<LathePlanParams> = TypedContract::new();
 const LATHE_WRITE_CONTRACT: TypedContract<LatheWriteParams> = TypedContract::new();
+const CTX_PLAN_CONTRACT: TypedContract<CtxPlanParams> = TypedContract::new();
+const CTX_WRITE_CONTRACT: TypedContract<CtxWriteParams> = TypedContract::new();
 
 /// Largest job file read (bytes).
 const MAX_JOB_BYTES: usize = 4 << 20;
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("cam.ctx.gcode", "Write Turn-Mill G-code", crate::checked!("cam.ctx.gcode", ctx_gcode))
+        .icon("export")
+        .noundo()
+        .contract(&CTX_WRITE_CONTRACT)
+        .output(output_schema_for::<CtxWriteResult>)
+        .params(
+            "job: as for cam.ctx.plan; path: <name>.ngc → plans the job and writes its two LinuxCNC programs, <name>_1.ngc for \
+             side 1 and <name>_2.ngc for side 2, to the twin's programming manual: o<twin_init>, G18 G7 G21 G90 G40 G80 G95, \
+             T<n> M6 G43 on turret stations, G96 S D; live tools between M14 M16 M3 $1 and M17 M15 (G17 or G8 G19 drilling \
+             cycles at C, polar interpolation G12.1 for face milling); side 1 meets side 2 at sync point 3, grips with \
+             o<twin_grip>, parts off at G97 under the transfer's speed and calls o<twin_cut_done>; side 2 catches with \
+             o<twin_catch>. Returns the files, their line counts, each side's operations and tools, and the warnings",
+        ),
+    CommandSpec::new("cam.ctx.plan", "Simulate Turn-Mill Job", crate::checked!("cam.ctx.plan", ctx_plan))
+        .icon("play")
+        .noundo()
+        .contract(&CTX_PLAN_CONTRACT)
+        .output(output_schema_for::<CtxPlanResult>)
+        .params(
+            "job: a turn-mill job object or the path of a job file, for a twin-spindle lathe with live tools, bar fed through \
+             spindle 1: {stock: {diameter, material? (aluminium | brass | steel), stick_out?, face_allowance? (0.5), \
+             parting_allowance? (4), back_allowance? (0.3, faced off on side 2), chuck_clearance? (2)}, part: {body, design?, name?, \
+             front? (+z | -z: the end finished on side 1), threads?}, library? (default the twin simulation's: turning tools and \
+             live tools), tools?, live_tools? [{number, kind (flat | drill), mount (axial | radial), diameter, flute_length, rpm, \
+             feed, plunge, flutes?, stepdown?, stepover?, peck?, reach?, holder_diameter?}], machine? {name?, max_rpm?, \
+             live_max_rpm?, sync_max_rpm?, stations?, z_travel?, x_min?, polar_c_rpm?}, transfer? {grip?, pickoff_z?}, strategy?, \
+             post? {decimals?, blend_tolerance?, coolant?, work_z_1?, work_z_2?, transfer_wait?}} → side 1 turns the part from \
+             the bar (facing, drilling, roughing, boring, finishing, grooving, threading), machines its front and radial features \
+             with live tools (axial holes off the axis, cross holes, keyways, faces milled in polar interpolation) and parts it \
+             off while spindle 2 grips it and follows; side 2 faces the back to length, bores it and machines the back's \
+             features. Returns chuck 2's grip, each side's operations and tools, the simulation (both sides' turning in the \
+             half section; live tool points inside the part) and the warnings. Read-only",
+        ),
     CommandSpec::new("cam.lathe.plan", "Simulate Lathe Job", crate::checked!("cam.lathe.plan", lathe_plan))
         .icon("play")
         .noundo()
@@ -374,6 +410,110 @@ fn lathe_export_scene(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let lines = out.files.iter().find(|(n, _)| n == "job.ngc").map_or(0, |(_, b)| b.iter().filter(|c| **c == b'\n').count());
     lathe_written(&run, dir, files, lines)
+}
+
+/// A turn-mill job read, its part's body, its plan and simulation.
+struct CtxRun {
+    job: solidcraft_cam::ctx::job::CtxJob,
+    plan: solidcraft_cam::ctx::plan::CtxPlan,
+    report: solidcraft_cam::ctx::sim::CtxSimReport,
+}
+
+fn ctx_run(s: &Session, cmd: &str, p: &Value) -> Result<CtxRun> {
+    let what = "job: a turn-mill job object or the path of a job file";
+    let v = p.get("job").ok_or_else(|| bad(cmd, what))?;
+    let (text, base) = match v {
+        Value::String(path) => {
+            let bytes = solidcraft_io::vfs::read(path, MAX_JOB_BYTES).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            let text = String::from_utf8(bytes).map_err(|_| EngineError::Other(format!("{path}: not UTF-8 text")))?;
+            (text, Path::new(path).parent().map(Path::to_path_buf))
+        }
+        Value::Object(_) => (v.to_string(), s.path.as_deref().and_then(|p| Path::new(p).parent()).map(Path::to_path_buf)),
+        _ => return Err(bad(cmd, what)),
+    };
+    let load = |lib: &str| -> solidcraft_cam::Result<String> {
+        let path = match &base {
+            Some(dir) if Path::new(lib).is_relative() => dir.join(lib),
+            _ => PathBuf::from(lib),
+        };
+        let shown = path.display().to_string();
+        let bytes = solidcraft_io::vfs::read(&shown, MAX_JOB_BYTES).map_err(|e| solidcraft_cam::CamError::Invalid(format!("{shown}: {e}")))?;
+        String::from_utf8(bytes).map_err(|_| solidcraft_cam::CamError::Invalid(format!("{shown}: not UTF-8 text")))
+    };
+    let job = solidcraft_cam::ctx::job::CtxJob::from_json_with(&text, &load).map_err(|e| match v {
+        Value::String(path) => EngineError::Other(format!("{path}: {e}")),
+        _ => bad(cmd, e.to_string()),
+    })?;
+    let part = PartRef {
+        name: job.part.name.clone(),
+        design: job.part.design.clone(),
+        body: job.part.body.clone(),
+        quantity: 1,
+        orient: Default::default(),
+    };
+    let body = part_body(s, base.as_deref(), &part)?;
+    let other = |e: solidcraft_cam::CamError| EngineError::Other(format!("{}: {e}", part.label()));
+    let plan = solidcraft_cam::ctx::plan::plan(&job, &body).map_err(other)?;
+    let (report, _, _) = solidcraft_cam::ctx::sim::simulate(&job, &plan, &body).map_err(other)?;
+    Ok(CtxRun { job, plan, report })
+}
+
+/// Each side's operations and tools, in program order.
+fn ctx_sides(run: &CtxRun) -> (CtxSide, CtxSide) {
+    use solidcraft_cam::lathe::plan::LatheOpKind;
+    let side = |turn: Vec<(&str, u32)>, live: &[solidcraft_cam::ctx::live::LiveOp], last: Vec<(&str, u32)>| {
+        let all: Vec<(String, u32)> = turn
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t))
+            .chain(live.iter().map(|o| (o.name.clone(), o.tool)))
+            .chain(last.into_iter().map(|(n, t)| (n.to_string(), t)))
+            .collect();
+        let mut tools: Vec<u32> = Vec::new();
+        for (_, t) in &all {
+            if !tools.contains(t) {
+                tools.push(*t);
+            }
+        }
+        CtxSide { operations: all.into_iter().map(|(n, _)| n).collect(), tools }
+    };
+    let p1 = &run.plan.side1.ops;
+    let one = side(
+        p1.iter().filter(|o| o.kind != LatheOpKind::Parting).map(|o| (o.name.as_str(), o.tool)).collect(),
+        &run.plan.live1,
+        p1.iter().filter(|o| o.kind == LatheOpKind::Parting).map(|o| (o.name.as_str(), o.tool)).collect(),
+    );
+    let two = side(run.plan.side2.ops.iter().map(|o| (o.name.as_str(), o.tool)).collect(), &run.plan.live2, Vec::new());
+    (one, two)
+}
+
+fn ctx_plan(s: &mut Session, p: &Value) -> Result<Value> {
+    let run = ctx_run(s, "cam.ctx.plan", p)?;
+    let (side1, side2) = ctx_sides(&run);
+    let result = CtxPlanResult { grip: run.plan.grip, side1, side2, simulation: run.report.clone(), warnings: run.plan.warnings.clone() };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+fn ctx_gcode(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.ctx.gcode";
+    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad(cmd, "path: <name>.ngc: the programs' path"))?.to_string();
+    let run = ctx_run(s, cmd, p)?;
+    let stem = path.strip_suffix(".ngc").unwrap_or(&path).to_string();
+    let title = if run.job.part.name.is_empty() { run.job.part.body.clone() } else { run.job.part.name.clone() };
+    let programs = [
+        solidcraft_cam::ctx::post::side1(&run.job, &run.plan, &title).map_err(|e| EngineError::Other(e.to_string()))?,
+        solidcraft_cam::ctx::post::side2(&run.job, &run.plan, &title).map_err(|e| EngineError::Other(e.to_string()))?,
+    ];
+    let mut files = Vec::new();
+    let mut lines = Vec::new();
+    for (i, program) in programs.iter().enumerate() {
+        let f = format!("{stem}_{}.ngc", i + 1);
+        solidcraft_io::vfs::write(&f, program.as_bytes()).map_err(|e| EngineError::Other(format!("{f}: {e}")))?;
+        files.push(f);
+        lines.push(program.lines().count());
+    }
+    let (side1, side2) = ctx_sides(&run);
+    let result = CtxWriteResult { files, lines, side1, side2, warnings: run.plan.warnings.clone() };
+    serde_json::to_value(result).map_err(|e| EngineError::Other(e.to_string()))
 }
 
 /// The job from the parameter, and the folder its parts' designs are relative to.

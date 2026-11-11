@@ -4,6 +4,7 @@
 //! meet at the transfer subroutines the machine provides.
 
 pub mod job;
+pub mod live;
 pub mod plan;
 pub mod post;
 pub mod sim;

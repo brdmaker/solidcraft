@@ -5,6 +5,7 @@
 use solidcraft_kernel::Body;
 
 use super::job::CtxJob;
+use super::live::LiveOp;
 use crate::lathe::job::Front;
 use crate::lathe::plan::{LatheOpKind, LathePlan, Scope, Spindle, TipMove};
 use crate::lathe::profile::{Profile, read_envelope};
@@ -23,6 +24,9 @@ pub struct CtxPlan {
     /// Side 2: the back, the part held by `grip` of its front in chuck 2.
     pub side2: LathePlan,
     pub grip: f64,
+    /// The live tools' work on each side: side 1's after its turning, before the parting.
+    pub live1: Vec<LiveOp>,
+    pub live2: Vec<LiveOp>,
     pub warnings: Vec<String>,
 }
 
@@ -73,6 +77,10 @@ pub fn plan(job: &CtxJob, body: &Body) -> Result<CtxPlan> {
         warnings.push(format!("chuck 2 grips {grip:.1} of the part, {l:.1} long: its back is not clear of the jaws"));
     }
     let job1 = job.side_job(1, 0.0)?;
+    let (live1, done1, w1) = super::live::plan_side(job, body, &p1, 1, &[])?;
+    // side 2 sees side 1's holes turned end for end
+    let taken: Vec<[f64; 2]> = done1.iter().map(|c| [-c[0], c[1]]).collect();
+    let (live2, _, w2) = super::live::plan_side(job, body, &p2, 2, &taken)?;
     let mut side1 = crate::lathe::plan::plan_with(
         &job1,
         p1.clone(),
@@ -106,7 +114,9 @@ pub fn plan(job: &CtxJob, body: &Body) -> Result<CtxPlan> {
     for w in &side2.warnings {
         warnings.push(format!("side 2: {w}"));
     }
-    Ok(CtxPlan { side1, side2, grip, warnings })
+    warnings.extend(w1.into_iter().map(|w| format!("side 1: {w}")));
+    warnings.extend(w2.into_iter().map(|w| format!("side 2: {w}")));
+    Ok(CtxPlan { side1, side2, grip, live1, live2, warnings })
 }
 
 /// Roughly how long `ops` take on `job`'s lathe, s: feeds at their spindle's speed at each

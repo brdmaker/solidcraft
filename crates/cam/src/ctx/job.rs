@@ -69,11 +69,26 @@ pub struct CtxMachine {
     pub stations: u32,
     /// Z travel of side 1, mm: the bar's free length is checked against it.
     pub z_travel: f64,
+    /// How far past the centre X goes, mm (a radius, negative): radial drilling stops there.
+    pub x_min: f64,
+    /// The fastest C turns in polar interpolation, rpm: moves near the centre slow down for it
+    /// (C's position loop follows its command within its following error only well under its
+    /// top speed, and a move's speed starts at once).
+    pub polar_c_rpm: f64,
 }
 
 impl Default for CtxMachine {
     fn default() -> Self {
-        CtxMachine { name: "CTX twin".into(), max_rpm: 4000.0, live_max_rpm: 3000.0, sync_max_rpm: 2000.0, stations: 12, z_travel: 300.0 }
+        CtxMachine {
+            name: "CTX twin".into(),
+            max_rpm: 4000.0,
+            live_max_rpm: 3000.0,
+            sync_max_rpm: 2000.0,
+            stations: 12,
+            z_travel: 300.0,
+            x_min: -1.0,
+            polar_c_rpm: 10.0,
+        }
     }
 }
 
@@ -350,6 +365,10 @@ impl CtxJob {
         positive("machine.live_max_rpm", m.live_max_rpm, 100_000.0)?;
         positive("machine.sync_max_rpm", m.sync_max_rpm, 100_000.0)?;
         positive("machine.z_travel", m.z_travel, 10_000.0)?;
+        positive("machine.polar_c_rpm", m.polar_c_rpm, 10_000.0)?;
+        if !(m.x_min.is_finite() && (-1000.0..=0.0).contains(&m.x_min)) {
+            return Err(CamError::Invalid(format!("machine.x_min must be from -1000 to 0; it is {}", m.x_min)));
+        }
         if !(1..=64).contains(&m.stations) {
             return Err(CamError::Invalid(format!("machine.stations must be 1 to 64; it is {}", m.stations)));
         }

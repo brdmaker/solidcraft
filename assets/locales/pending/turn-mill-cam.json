@@ -1,0 +1,10 @@
+{
+  "en": {"cmd.cam_ctx_gcode": "Write Turn-Mill G-code", "cmd.cam_ctx_plan": "Simulate Turn-Mill Job"},
+  "de": {"cmd.cam_ctx_gcode": "G-Code des Dreh-Fräs-Auftrags schreiben", "cmd.cam_ctx_plan": "Dreh-Fräs-Auftrag simulieren"},
+  "ja": {"cmd.cam_ctx_gcode": "旋削・フライス加工のGコードを書き出し", "cmd.cam_ctx_plan": "旋削・フライス加工ジョブをシミュレーション"},
+  "ko": {"cmd.cam_ctx_gcode": "선삭·밀링 G 코드 쓰기", "cmd.cam_ctx_plan": "선삭·밀링 작업 시뮬레이션"},
+  "zh": {"cmd.cam_ctx_gcode": "写出车铣 G 代码", "cmd.cam_ctx_plan": "模拟车铣作业"},
+  "ar": {"cmd.cam_ctx_gcode": "كتابة G-code للخراطة والتفريز", "cmd.cam_ctx_plan": "محاكاة مهمة الخراطة والتفريز"},
+  "he": {"cmd.cam_ctx_gcode": "כתיבת G-code לחריטה וכרסום", "cmd.cam_ctx_plan": "הדמיית עבודת חריטה וכרסום"},
+  "vi": {"cmd.cam_ctx_gcode": "Ghi G-code tiện phay", "cmd.cam_ctx_plan": "Mô phỏng công việc tiện phay"}
+}

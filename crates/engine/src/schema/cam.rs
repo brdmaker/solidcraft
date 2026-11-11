@@ -174,3 +174,62 @@ pub struct LatheWriteResult {
     /// The plan's warnings.
     pub warnings: Vec<String>,
 }
+
+/// A turn-mill job for the twin-spindle lathe to plan and check.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct CtxPlanParams {
+    /// The turn-mill job as an object, or the path of a job file: {machine?, stock: {diameter,
+    /// material?, stick_out?, face_allowance?, parting_allowance?, back_allowance?,
+    /// chuck_clearance?}, part: {body, design?, name?, front?, threads?}, library?, tools?,
+    /// live_tools?, transfer?, strategy?, post?}. The part's `design` is relative to the job file
+    /// (an object: to the open design's folder); an empty `design` takes the body from the open
+    /// design.
+    pub job: serde_json::Value,
+}
+
+/// One side's work in a turn-mill plan.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CtxSide {
+    /// Operations in the order the side's program runs them (turning, then the live tools; side
+    /// 1's parting last).
+    pub operations: Vec<String>,
+    /// The tools the program loads, in order of first use.
+    pub tools: Vec<u32>,
+}
+
+/// What `cam.ctx.plan` returns.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CtxPlanResult {
+    /// How much of the part's front chuck 2 grips, mm.
+    pub grip: f64,
+    pub side1: CtxSide,
+    pub side2: CtxSide,
+    /// Both sides' turning simulated in the half section (side 2's on what side 1 cut off), and
+    /// the live tools' points found inside the finished part.
+    pub simulation: solidcraft_cam::ctx::sim::CtxSimReport,
+    pub warnings: Vec<String>,
+}
+
+/// A turn-mill job to write out as its two programs.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct CtxWriteParams {
+    /// The turn-mill job (as for `cam.ctx.plan`): an object or the path of a job file.
+    pub job: serde_json::Value,
+    /// The programs' path: `<name>.ngc` writes `<name>_1.ngc` (side 1) and `<name>_2.ngc` (side
+    /// 2) beside it.
+    pub path: String,
+}
+
+/// What `cam.ctx.gcode` returns.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CtxWriteResult {
+    /// The two programs written, side 1's then side 2's.
+    pub files: Vec<String>,
+    /// Lines in each.
+    pub lines: Vec<usize>,
+    pub side1: CtxSide,
+    pub side2: CtxSide,
+    pub warnings: Vec<String>,
+}

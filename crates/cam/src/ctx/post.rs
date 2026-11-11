@@ -8,6 +8,7 @@
 //! `o<twin_catch>` and machines the back.
 
 use super::job::CtxJob;
+use super::live::{LiveKind, LiveMove, LiveOp, R_MIN};
 use super::plan::{CtxPlan, estimate};
 use crate::lathe::job::LatheJob;
 use crate::lathe::plan::{LatheOpKind, LathePlan, TipMove};
@@ -24,11 +25,11 @@ pub fn transfer_wait(job: &CtxJob, plan: &CtxPlan) -> f64 {
         return w;
     }
     let job1 = job.side_job(1, 0.0).ok();
-    let t = job1.map_or(0.0, |j| estimate(&j, &plan.side1.ops));
+    let t = job1.map_or(0.0, |j| estimate(&j, &plan.side1.ops)) + plan.live1.iter().map(super::live::estimate).sum::<f64>();
     (2.0 * t + 120.0).max(600.0).ceil()
 }
 
-fn header(job: &CtxJob, lathe: &LatheJob, plan: &LathePlan, side: u8, title: &str, warnings: &[String]) -> Vec<String> {
+fn header(job: &CtxJob, lathe: &LatheJob, plan: &LathePlan, live: &[LiveOp], side: u8, title: &str, warnings: &[String]) -> Vec<String> {
     let d = job.post.lathe.decimals;
     let plain = |x: f64| num(x, d);
     let su = &plan.setup;
@@ -64,6 +65,40 @@ fn header(job: &CtxJob, lathe: &LatheJob, plan: &LathePlan, side: u8, title: &st
     for n in &order {
         g.push(comment(&tool_line(lathe, plan, *n, d)));
     }
+    let mut seen: Vec<u32> = Vec::new();
+    for op in live {
+        if seen.contains(&op.tool) {
+            continue;
+        }
+        seen.push(op.tool);
+        if let Some(t) = job.live(op.tool) {
+            let mount = match t.mount {
+                super::job::Mount::Axial => "axial",
+                super::job::Mount::Radial => "radial",
+            };
+            let kind = match t.kind {
+                crate::job::ToolKind::Drill => "drill",
+                _ => "end_mill",
+            };
+            let name = if t.name.is_empty() { kind.to_string() } else { t.name.clone() };
+            g.push(comment(&format!(
+                "TOOL T{} live {kind} {mount} diameter={} flutes={} rpm={} feed={} plunge={} name={name}",
+                t.number,
+                plain(t.diameter),
+                t.flutes,
+                plain(op.rpm),
+                plain(t.feed),
+                plain(t.plunge)
+            )));
+        }
+    }
+    if !live.is_empty() {
+        g.push(comment(if side == 1 {
+            "live tools: C0 puts the part's +X at the tool; in polar interpolation X Y are the part's own on its front face"
+        } else {
+            "live tools: the part turned end for end about its Y axis: X Y on the back face are the part's -X and Y; check C's zero against side 1's"
+        }));
+    }
     for w in warnings {
         for chunk in w.as_bytes().chunks(200) {
             g.push(comment(&format!("WARNING: {}", String::from_utf8_lossy(chunk))));
@@ -90,6 +125,111 @@ fn station_check(job: &CtxJob, plan: &LathePlan, warnings: &mut Vec<String>) {
     }
 }
 
+/// The blocks of a live tool's operation: the tool, C on, milling mode, the live tool turning,
+/// its moves, then all off again and feed per revolution back.
+fn live_blocks(job: &CtxJob, lathe: &LatheJob, op: &LiveOp, w: &mut OpWriter) -> Vec<String> {
+    let d = job.post.lathe.decimals;
+    let f = |x: f64| word(x, d);
+    let mut g = vec![comment(&op.name)];
+    g.extend(w.tool_change(lathe, op.tool));
+    let change = w.change;
+    g.push("M14".into());
+    g.push("G94".into());
+    g.push("M16".into());
+    g.push(format!("M3 $1 S{}", num(op.rpm.round(), 0)));
+    let clear = CLEAR_Z;
+    match op.kind {
+        LiveKind::AxialDrill => {
+            g.push(format!("G0 Z{}", f(clear)));
+            g.push("G17".into());
+            for h in &op.holes {
+                g.push(format!("G0 C{}", f(h.c)));
+                g.push(format!("G0 X{}", f(2.0 * h.r)));
+                let cycle = match op.peck {
+                    Some(q) => format!("G98 G83 X{} Z{} R{} Q{} F{}", f(2.0 * h.r), f(h.to), f(h.z + 1.0), f(q), f(op.plunge)),
+                    None => format!("G98 G81 X{} Z{} R{} F{}", f(2.0 * h.r), f(h.to), f(h.z + 1.0), f(op.plunge)),
+                };
+                g.push(cycle);
+                g.push("G80".into());
+            }
+            g.push("G18".into());
+            g.push(format!("G0 X{}", f(2.0 * change[0])));
+        }
+        LiveKind::RadialDrill => {
+            let out = op.holes.iter().map(|h| h.r).fold(0.0, f64::max) + 2.0;
+            g.push("G8".into());
+            g.push(format!("G0 X{}", f(out.max(change[0]))));
+            if let Some(h) = op.holes.first() {
+                g.push(format!("G0 Z{}", f(h.z)));
+            }
+            g.push("G19".into());
+            for h in &op.holes {
+                g.push(format!("G0 C{}", f(h.c)));
+                let cycle = match op.peck {
+                    Some(q) => format!("G98 G83 X{} R{} Q{} F{}", f(h.to), f(h.r + 1.0), f(q), f(op.plunge)),
+                    None => format!("G98 G81 X{} R{} F{}", f(h.to), f(h.r + 1.0), f(op.plunge)),
+                };
+                g.push(cycle);
+                g.push("G80".into());
+            }
+            g.push("G18 G7".into());
+            g.push(format!("G0 X{}", f(2.0 * change[0])));
+        }
+        LiveKind::Keyway => {
+            g.push(format!("G0 C{}", f(op.c)));
+            if let Some(first) = op.moves.first().map(LiveMove::to) {
+                g.push(format!("G0 Z{}", f(first[2])));
+                g.push(format!("G0 X{}", f(2.0 * first[0])));
+            }
+            for m in &op.moves {
+                match m {
+                    LiveMove::Rapid(p) => g.push(format!("G0 X{} Z{}", f(2.0 * p[0]), f(p[2]))),
+                    LiveMove::Feed(p, fr) => g.push(format!("G1 X{} Z{} F{}", f(2.0 * p[0]), f(p[2]), f(*fr))),
+                }
+            }
+            g.push(format!("G0 X{}", f(2.0 * change[0])));
+        }
+        LiveKind::FaceMill => {
+            g.push(format!("G0 Z{}", f(clear)));
+            // the first move is where polar interpolation comes on: off the centre, on X (lathe
+            // coordinates, a diameter)
+            let skip = match op.moves.first() {
+                Some(LiveMove::Rapid(p)) => {
+                    g.push(format!("G0 X{} Z{}", f(2.0 * p[0].hypot(p[1]).max(R_MIN + 1.0)), f(p[2])));
+                    1
+                }
+                _ => 0,
+            };
+            g.push("G12.1".into());
+            let mut last_f: Option<f64> = None;
+            for m in op.moves.iter().skip(skip) {
+                match m {
+                    LiveMove::Rapid(p) => g.push(format!("G0 X{} Y{} Z{}", f(p[0]), f(p[1]), f(p[2]))),
+                    LiveMove::Feed(p, fr) => {
+                        let fr = fr.max(1.0).round();
+                        if last_f.is_none_or(|l| (fr - l).abs() > 0.5) {
+                            g.push(format!("G1 X{} Y{} Z{} F{}", f(p[0]), f(p[1]), f(p[2]), f(fr)));
+                            last_f = Some(fr);
+                        } else {
+                            g.push(format!("G1 X{} Y{} Z{}", f(p[0]), f(p[1]), f(p[2])));
+                        }
+                    }
+                }
+            }
+            g.push("G13.1".into());
+            g.push(format!("G0 X{}", f(2.0 * change[0])));
+        }
+    }
+    g.push("M17".into());
+    g.push("M15".into());
+    g.push("G95".into());
+    w.lost();
+    g
+}
+
+/// Live tools move between cuts this far in front of the face, mm.
+const CLEAR_Z: f64 = 2.0;
+
 /// Side 1's program.
 pub fn side1(job: &CtxJob, plan: &CtxPlan, title: &str) -> Result<String> {
     let lathe = job.side_job(1, 0.0)?;
@@ -98,7 +238,7 @@ pub fn side1(job: &CtxJob, plan: &CtxPlan, title: &str) -> Result<String> {
     let f = |x: f64| word(x, d);
     let mut warnings: Vec<String> = plan.warnings.clone();
     station_check(job, p, &mut warnings);
-    let mut g = header(job, &lathe, p, 1, title, &warnings);
+    let mut g = header(job, &lathe, p, &plan.live1, 1, title, &warnings);
     g.push("M10".into());
     let su = &p.setup;
     let change = [su.radius + job.strategy.change_clearance, su.front + job.strategy.change_clearance];
@@ -106,6 +246,9 @@ pub fn side1(job: &CtxJob, plan: &CtxPlan, title: &str) -> Result<String> {
     let parting = p.ops.iter().find(|o| o.kind == LatheOpKind::Parting).ok_or_else(|| CamError::Invalid("side 1 doesn't part off".into()))?;
     for op in p.ops.iter().filter(|o| o.kind != LatheOpKind::Parting) {
         g.extend(w.op(&lathe, op));
+    }
+    for op in &plan.live1 {
+        g.extend(live_blocks(job, &lathe, op, &mut w));
     }
     // the blade to the cut, out at the bar's radius, before chuck 2 comes
     g.push(comment(&format!("{}: spindle 2 grips the part and follows", parting.name)));
@@ -137,7 +280,7 @@ pub fn side2(job: &CtxJob, plan: &CtxPlan, title: &str) -> Result<String> {
     let f = |x: f64| word(x, d);
     let mut warnings: Vec<String> = Vec::new();
     station_check(job, p, &mut warnings);
-    let mut g = header(job, &lathe, p, 2, title, &warnings);
+    let mut g = header(job, &lathe, p, &plan.live2, 2, title, &warnings);
     g.push(comment("waits here while side 1 machines the front"));
     g.push(format!("o<twin_sync> call [{TRANSFER_SYNC}] [{}]", word(transfer_wait(job, plan), 0)));
     match job.transfer.pickoff_z {
@@ -150,6 +293,9 @@ pub fn side2(job: &CtxJob, plan: &CtxPlan, title: &str) -> Result<String> {
     g.push("G95".into());
     for op in &p.ops {
         g.extend(w.op(&lathe, op));
+    }
+    for op in &plan.live2 {
+        g.extend(live_blocks(job, &lathe, op, &mut w));
     }
     g.push(format!("G0 X{} Z{}", f(2.0 * change[0]), f(change[1])));
     g.push("M5".into());
